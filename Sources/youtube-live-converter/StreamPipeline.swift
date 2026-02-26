@@ -634,6 +634,8 @@ final class StreamPipeline: ObservableObject {
         ]
         args += inputArgs
         args += ["-i", "pipe:0"]
+        // Keep stream selection deterministic to avoid stream switching side-effects.
+        args += ["-map", "0:v:0", "-map", "0:a:0?"]
 
         let useVideoToolbox = toolPaths?.supportsVideoToolboxH264 == true
         switch config.encodeMode {
@@ -647,11 +649,21 @@ final class StreamPipeline: ObservableObject {
             ]
         case .transcode:
             // Keep audio timeline aligned to stream PTS to reduce long-run A/V drift.
-            audioFilters.append("aresample=async=1000:min_hard_comp=0.100:first_pts=0")
+            audioFilters.append("aresample=async=1000:min_hard_comp=0.050:first_pts=0")
+            // Re-stamp audio to a monotonic timeline to reduce long freezes caused by discontinuous source PTS.
+            audioFilters.append("asetpts=N/SR/TB")
+            let targetFps = 30
+            var videoSetptsExpr = "N/(\(targetFps)*TB)"
+            if totalVideoDelaySeconds > 0 {
+                let delay = String(format: "%.3f", totalVideoDelaySeconds)
+                videoSetptsExpr += "+\(delay)/TB"
+            }
+            let videoFilter = "settb=AVTB,setpts=\(videoSetptsExpr)"
             if useVideoToolbox {
                 // Prefer hardware encoding on macOS for stable real-time throughput.
                 args += [
-                    "-fps_mode", "passthrough",
+                    "-fps_mode", "cfr",
+                    "-r", "\(targetFps)",
                     "-c:v", "h264_videotoolbox",
                     "-allow_sw", "1",
                     "-realtime", "1",
@@ -661,6 +673,7 @@ final class StreamPipeline: ObservableObject {
                     "-b:v", "3500k",
                     "-maxrate", "4500k",
                     "-bufsize", "9000k",
+                    "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
                     "-ac", "2",
@@ -668,7 +681,8 @@ final class StreamPipeline: ObservableObject {
                 ]
             } else {
                 args += [
-                    "-fps_mode", "passthrough",
+                    "-fps_mode", "cfr",
+                    "-r", "\(targetFps)",
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
                     "-tune", "zerolatency",
@@ -678,15 +692,12 @@ final class StreamPipeline: ObservableObject {
                     "-keyint_min", "60",
                     "-sc_threshold", "0",
                     "-profile:v", "main",
+                    "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
                     "-ac", "2",
                     "-b:a", "128k"
                 ]
-            }
-            if totalVideoDelaySeconds > 0 {
-                let delay = String(format: "%.3f", totalVideoDelaySeconds)
-                args += ["-vf", "setpts=PTS+\(delay)/TB"]
             }
             if totalAudioDelayMs > 0 {
                 audioFilters.append("adelay=\(totalAudioDelayMs)|\(totalAudioDelayMs)")
@@ -704,10 +715,13 @@ final class StreamPipeline: ObservableObject {
             }
         }
 
-        if config.outputType == .rtmp && (config.encodeMode == .copy || config.encodeMode == .copyPaced) {
-            // Improve RTMP receiver compatibility when remuxing bursty MPEG-TS input.
+        if config.outputType == .rtmp {
+            if config.encodeMode == .copy || config.encodeMode == .copyPaced {
+                // Improve RTMP receiver compatibility when remuxing bursty MPEG-TS input.
+                args += ["-bsf:v", "extract_extradata"]
+            }
+            // Keep muxing latency/interleave tight so audio/video stay closer under jitter.
             args += [
-                "-bsf:v", "extract_extradata",
                 "-flvflags", "no_duration_filesize",
                 "-muxdelay", "0",
                 "-muxpreload", "0",
