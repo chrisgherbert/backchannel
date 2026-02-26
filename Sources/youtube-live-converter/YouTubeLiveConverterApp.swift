@@ -14,6 +14,10 @@ struct YouTubeLiveConverterApp: App {
                     appDelegate.pipeline = pipeline
                 }
         }
+
+        Settings {
+            SettingsView()
+        }
     }
 }
 

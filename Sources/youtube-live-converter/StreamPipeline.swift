@@ -47,6 +47,7 @@ final class StreamPipeline: ObservableObject {
     private var lastDuplicationAlertAt = Date.distantPast
     private var lastHighDupAt = Date.distantPast
     private var stallRecoveryTriggered = false
+    private var freezeRecoveryTriggered = false
     private var pendingRestartAfterDrain = false
     private var bufferExhausted = false
     private var lastBufferUiUpdate = Date.distantPast
@@ -90,6 +91,7 @@ final class StreamPipeline: ObservableObject {
         parsedStatus.bufferState = "Stopped"
         parsedStatus.bufferProgress = 0
         stallRecoveryTriggered = false
+        freezeRecoveryTriggered = false
         hasSeenFfmpegProgress = false
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
@@ -136,6 +138,7 @@ final class StreamPipeline: ObservableObject {
         lastDuplicationAlertAt = Date.distantPast
         lastHighDupAt = Date.distantPast
         stallRecoveryTriggered = false
+        freezeRecoveryTriggered = false
         pendingRestartAfterDrain = false
         bufferExhausted = false
         lastBufferUiUpdate = Date.distantPast
@@ -648,31 +651,33 @@ final class StreamPipeline: ObservableObject {
                 "-c:a", "copy"
             ]
         case .transcode:
-            // Keep audio timeline aligned to stream PTS to reduce long-run A/V drift.
-            audioFilters.append("aresample=async=1000:min_hard_comp=0.050:first_pts=0")
-            // Re-stamp audio to a monotonic timeline to reduce long freezes caused by discontinuous source PTS.
-            audioFilters.append("asetpts=N/SR/TB")
+            // Rebuild a stable monotonic A/V timeline in compatibility mode.
+            audioFilters.append("aresample=48000:async=1000:min_hard_comp=0.050:first_pts=0")
+            audioFilters.append("asetpts=PTS-STARTPTS")
             let targetFps = 30
-            var videoSetptsExpr = "N/(\(targetFps)*TB)"
+            var videoSetptsExpr = "PTS-STARTPTS"
             if totalVideoDelaySeconds > 0 {
                 let delay = String(format: "%.3f", totalVideoDelaySeconds)
                 videoSetptsExpr += "+\(delay)/TB"
             }
-            let videoFilter = "settb=AVTB,setpts=\(videoSetptsExpr)"
+            let videoFilter = "fps=\(targetFps),settb=AVTB,setpts=\(videoSetptsExpr)"
             if useVideoToolbox {
                 // Prefer hardware encoding on macOS for stable real-time throughput.
                 args += [
                     "-fps_mode", "cfr",
+                    "-vsync", "cfr",
                     "-r", "\(targetFps)",
                     "-c:v", "h264_videotoolbox",
                     "-allow_sw", "1",
                     "-realtime", "1",
                     "-pix_fmt", "yuv420p",
                     "-g", "60",
+                    "-keyint_min", "60",
                     "-bf", "0",
                     "-b:v", "3500k",
                     "-maxrate", "4500k",
                     "-bufsize", "9000k",
+                    "-force_key_frames", "expr:gte(t,n_forced*2)",
                     "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
@@ -682,6 +687,7 @@ final class StreamPipeline: ObservableObject {
             } else {
                 args += [
                     "-fps_mode", "cfr",
+                    "-vsync", "cfr",
                     "-r", "\(targetFps)",
                     "-c:v", "libx264",
                     "-preset", "ultrafast",
@@ -692,6 +698,7 @@ final class StreamPipeline: ObservableObject {
                     "-keyint_min", "60",
                     "-sc_threshold", "0",
                     "-profile:v", "main",
+                    "-force_key_frames", "expr:gte(t,n_forced*2)",
                     "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
@@ -723,6 +730,9 @@ final class StreamPipeline: ObservableObject {
             // Keep muxing latency/interleave tight so audio/video stay closer under jitter.
             args += [
                 "-flvflags", "no_duration_filesize",
+                "-fflags", "+flush_packets",
+                "-flush_packets", "1",
+                "-max_muxing_queue_size", "4096",
                 "-muxdelay", "0",
                 "-muxpreload", "0",
                 "-max_interleave_delta", "0",
@@ -1005,6 +1015,7 @@ final class StreamPipeline: ObservableObject {
                         appendLog("[app] Output freeze recovered after \(Int(freezeDuration.rounded()))s.")
                     }
                     stallRecoveryTriggered = false
+                    freezeRecoveryTriggered = false
                 } else if !stallRecoveryTriggered &&
                     shouldKeepRunning &&
                     isRunning &&
@@ -1106,6 +1117,16 @@ final class StreamPipeline: ObservableObject {
                 lastDuplicationAlertAt = now
                 appendLog("[app] Visual freeze ongoing: duplicate-frame rate ~\(Int(dupPerSecond.rounded())) fps.")
             }
+            let freezeDuration = now.timeIntervalSince(duplicationFreezeStartedAt)
+            if !freezeRecoveryTriggered &&
+                shouldKeepRunning &&
+                isRunning &&
+                freezeDuration >= Self.duplicationFreezeRestartThreshold {
+                freezeRecoveryTriggered = true
+                appendLog("[app] Visual freeze persisted for \(Int(freezeDuration.rounded()))s. Restarting pipeline.")
+                terminatePipeline()
+                scheduleRestart(generation: generation)
+            }
             return
         }
 
@@ -1113,6 +1134,7 @@ final class StreamPipeline: ObservableObject {
             duplicationFreezeActive = false
             let freezeDuration = max(0, now.timeIntervalSince(duplicationFreezeStartedAt))
             appendLog("[app] Visual freeze recovered after \(Int(freezeDuration.rounded()))s.")
+            freezeRecoveryTriggered = false
         }
     }
 
@@ -1219,10 +1241,12 @@ final class StreamPipeline: ObservableObject {
     private static let outputStallThreshold: TimeInterval = 12.0
     private static let outputFreezeLogThreshold: TimeInterval = 6.0
     private static let outputFreezeHeartbeatInterval: TimeInterval = 10.0
+    private static let outputFreezeRestartThreshold: TimeInterval = 14.0
     private static let outputFreezeMonitorPollInterval: TimeInterval = 1.0
     private static let duplicationFreezeDupPerSecondThreshold: Double = 10.0
     private static let duplicationFreezeHeartbeatInterval: TimeInterval = 10.0
     private static let duplicationFreezeRecoveryWindow: TimeInterval = 3.0
+    private static let duplicationFreezeRestartThreshold: TimeInterval = 15.0
     private static let metadataSummaryInterval: TimeInterval = 2.0
     private static let progressSummaryInterval: TimeInterval = 2.0
     private static let logFlushInterval: TimeInterval = 0.2
@@ -1310,7 +1334,6 @@ final class StreamPipeline: ObservableObject {
                     nanoseconds: UInt64(Self.outputFreezeMonitorPollInterval * 1_000_000_000)
                 )
                 guard self.shouldKeepRunning, self.isRunning else { continue }
-                guard self.logMonitoringEnabled else { continue }
                 guard self.ffmpegProcess?.isRunning == true else { continue }
                 guard self.hasSeenFfmpegProgress else { continue }
 
@@ -1338,6 +1361,15 @@ final class StreamPipeline: ObservableObject {
                     self.appendLog(
                         "[app] Output freeze ongoing: ffmpeg output time stagnant for \(Int(stalledFor.rounded()))s."
                     )
+                }
+                if !self.freezeRecoveryTriggered &&
+                    stalledFor >= Self.outputFreezeRestartThreshold {
+                    self.freezeRecoveryTriggered = true
+                    self.appendLog(
+                        "[app] Output freeze persisted for \(Int(stalledFor.rounded()))s. Restarting pipeline."
+                    )
+                    self.terminatePipeline()
+                    self.scheduleRestart(generation: self.generation)
                 }
             }
         }

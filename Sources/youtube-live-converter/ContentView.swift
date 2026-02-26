@@ -3,13 +3,15 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var pipeline: StreamPipeline
-    @State private var config = StreamConfig()
+    @State private var config = ContentView.makeInitialConfig()
     @State private var copyModePacingEnabled = false
     @State private var autoLoadInfoTask: Task<Void, Never>?
     @State private var lastAutoLoadedSourceURL = ""
+    @State private var selectedRtmpPresetID = ""
     @State private var selectedPanel: PanelTab = .status
     @AppStorage("show_inspector") private var showInspector = true
     @AppStorage("log_monitoring_enabled") private var logMonitoringEnabled = true
+    @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     private let bufferOptions = [0, 5, 15, 30, 60, 120]
     private let audioBoostOptions = [0, 5, 10, 20]
     private let autoLoadDebounceNs: UInt64 = 900_000_000
@@ -45,6 +47,7 @@ struct ContentView: View {
         .onAppear {
             pipeline.setLogMonitoringEnabled(logMonitoringEnabled)
             copyModePacingEnabled = config.encodeMode == .copyPaced
+            syncSelectedRtmpPreset()
         }
         .onDisappear {
             autoLoadInfoTask?.cancel()
@@ -60,6 +63,24 @@ struct ContentView: View {
             if newValue != .transcode {
                 copyModePacingEnabled = (newValue == .copyPaced)
             }
+        }
+        .onChange(of: config.outputType) { _ in
+            syncSelectedRtmpPreset()
+        }
+        .onChange(of: config.rtmpServerURL) { _ in
+            syncSelectedRtmpPreset()
+        }
+        .onChange(of: config.rtmpStreamKey) { _ in
+            syncSelectedRtmpPreset()
+        }
+        .onChange(of: config.rtmpFullURLOverride) { _ in
+            syncSelectedRtmpPreset()
+        }
+        .onChange(of: selectedRtmpPresetID) { newValue in
+            applyRtmpPresetSelection(newValue)
+        }
+        .onChange(of: rtmpPresetsJSON) { _ in
+            syncSelectedRtmpPreset()
         }
     }
 
@@ -142,8 +163,8 @@ struct ContentView: View {
                 subtitle: "Choose passthrough vs compatibility processing",
                 headerAccessory: {
                     Picker("Mode", selection: outputModeBinding) {
-                        Text("Copy").tag(OutputModeSelection.streamCopy)
                         Text("Compat").tag(OutputModeSelection.highCompatibility)
+                        Text("Copy").tag(OutputModeSelection.streamCopy)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 210)
@@ -282,6 +303,18 @@ struct ContentView: View {
     private var transportSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
             if config.outputType == .rtmp {
+                if !rtmpPresets.isEmpty {
+                    labeled("Preset") {
+                        Picker("RTMP Preset", selection: $selectedRtmpPresetID) {
+                            Text("Custom").tag("")
+                            ForEach(rtmpPresets) { preset in
+                                Text(preset.name).tag(preset.id)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 260, alignment: .leading)
+                    }
+                }
                 labeled("Server URL") {
                     TextField("rtmp://server/app/", text: $config.rtmpServerURL)
                         .textFieldStyle(.roundedBorder)
@@ -615,6 +648,10 @@ struct ContentView: View {
         config.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    private var rtmpPresets: [RtmpPreset] {
+        AppPreferencesCodec.decodePresets(from: rtmpPresetsJSON)
+    }
+
     private var transportContextText: String {
         switch config.outputType {
         case .rtmp:
@@ -816,6 +853,39 @@ struct ContentView: View {
 
     private var selectedOutputMode: OutputModeSelection {
         config.encodeMode == .transcode ? .highCompatibility : .streamCopy
+    }
+
+    private func applyRtmpPresetSelection(_ id: String) {
+        guard !id.isEmpty else { return }
+        guard let preset = rtmpPresets.first(where: { $0.id == id }) else { return }
+        config.rtmpServerURL = preset.serverURL
+        config.rtmpStreamKey = preset.streamKey
+        config.rtmpFullURLOverride = preset.fullURLOverride
+    }
+
+    private func syncSelectedRtmpPreset() {
+        guard config.outputType == .rtmp else {
+            selectedRtmpPresetID = ""
+            return
+        }
+        if let matching = rtmpPresets.first(where: {
+            $0.serverURL == config.rtmpServerURL &&
+            $0.streamKey == config.rtmpStreamKey &&
+            $0.fullURLOverride == config.rtmpFullURLOverride
+        }) {
+            selectedRtmpPresetID = matching.id
+        } else {
+            selectedRtmpPresetID = ""
+        }
+    }
+
+    private static func makeInitialConfig() -> StreamConfig {
+        var config = StreamConfig()
+        let raw = UserDefaults.standard.string(forKey: AppPreferenceKeys.defaultEncodeMode) ?? ""
+        if let mode = EncodeMode(rawValue: raw) {
+            config.encodeMode = mode
+        }
+        return config
     }
 
     private func copyAllLogs() {

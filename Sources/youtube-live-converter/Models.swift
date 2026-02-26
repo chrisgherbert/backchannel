@@ -23,7 +23,7 @@ struct StreamConfig {
     var rtmpStreamKey: String = ""
     var rtmpFullURLOverride: String = ""
     var outputType: OutputType = .rtmp
-    var encodeMode: EncodeMode = .copy
+    var encodeMode: EncodeMode = .transcode
     var bufferSeconds: Int = 30
     var useDiskBackedBuffer: Bool = false
     var autoAVSync: Bool = true
