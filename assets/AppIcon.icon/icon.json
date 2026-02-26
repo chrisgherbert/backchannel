@@ -7,14 +7,8 @@
       "layers" : [
         {
           "glass" : false,
-          "hidden-specializations" : [
-            {
-              "idiom" : "square",
-              "value" : false
-            }
-          ],
-          "image-name" : "Frame 5 Copy 3.png",
-          "name" : "Frame 5 Copy 3"
+          "image-name" : "Frame 5 Copy 7 2.png",
+          "name" : "Frame 5 Copy 7 2"
         },
         {
           "glass" : false,
