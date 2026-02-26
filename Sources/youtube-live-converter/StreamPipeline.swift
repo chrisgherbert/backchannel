@@ -21,6 +21,7 @@ final class StreamPipeline: ObservableObject {
     private var relayDrainTask: Task<Void, Never>?
     private var relayReadTask: Task<Void, Never>?
     private var outputFreezeMonitorTask: Task<Void, Never>?
+    private var diagnosticHeartbeatTask: Task<Void, Never>?
     private var currentConfig: StreamConfig?
 
     private var shouldKeepRunning = false
@@ -29,6 +30,8 @@ final class StreamPipeline: ObservableObject {
     private var restartAttempts = 0
     private var toolPaths: ToolPaths?
     private var logMonitoringEnabled = true
+    private var forceSoftwareEncoderForSession = false
+    private var freezeRestartTimestamps: [Date] = []
     private var bufferCountdownTask: Task<Void, Never>?
     private var previewRequestID = 0
     private var lastStatsParseUpdate = Date.distantPast
@@ -37,6 +40,7 @@ final class StreamPipeline: ObservableObject {
     private var lastFfmpegProgressSeconds: Double = 0
     private var lastFfmpegProgressAt = Date.distantPast
     private var hasSeenFfmpegProgress = false
+    private var lowSpeedSince = Date.distantPast
     private var outputFreezeActive = false
     private var outputFreezeStartedAt = Date.distantPast
     private var lastOutputFreezeHeartbeatAt = Date.distantPast
@@ -59,6 +63,13 @@ final class StreamPipeline: ObservableObject {
     private var lastSuppressedProgressFlushAt = Date.distantPast
     private var pendingUiLogLines: [String] = []
     private var logFlushTask: Task<Void, Never>?
+    private var ffmpegDiagnosticCounters: [String: Int] = [:]
+    private var recentFfmpegDiagnosticLines: [String] = []
+    private var lastDiagnosticSnapshotAt = Date.distantPast
+    private var lastSpeedDriftLogAt = Date.distantPast
+    private var lastFfmpegProgressLogAt = Date.distantPast
+    private var lastRelayReport: RelayBufferReport?
+    private var lastRelayReportAt = Date.distantPast
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
@@ -71,6 +82,8 @@ final class StreamPipeline: ObservableObject {
             return
         }
 
+        forceSoftwareEncoderForSession = false
+        freezeRestartTimestamps = []
         startPipeline(config: config, paths: paths)
     }
 
@@ -93,6 +106,7 @@ final class StreamPipeline: ObservableObject {
         stallRecoveryTriggered = false
         freezeRecoveryTriggered = false
         hasSeenFfmpegProgress = false
+        lowSpeedSince = Date.distantPast
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
         lastOutputFreezeHeartbeatAt = Date.distantPast
@@ -111,6 +125,13 @@ final class StreamPipeline: ObservableObject {
         lastSuppressedMetadataFlushAt = Date.distantPast
         suppressedProgressLineCount = 0
         lastSuppressedProgressFlushAt = Date.distantPast
+        ffmpegDiagnosticCounters = [:]
+        recentFfmpegDiagnosticLines = []
+        lastDiagnosticSnapshotAt = Date.distantPast
+        lastSpeedDriftLogAt = Date.distantPast
+        lastFfmpegProgressLogAt = Date.distantPast
+        lastRelayReport = nil
+        lastRelayReportAt = Date.distantPast
     }
 
     private func startPipeline(config: StreamConfig, paths: ToolPaths) {
@@ -128,6 +149,7 @@ final class StreamPipeline: ObservableObject {
         lastFfmpegProgressSeconds = 0
         lastFfmpegProgressAt = Date()
         hasSeenFfmpegProgress = false
+        lowSpeedSince = Date.distantPast
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
         lastOutputFreezeHeartbeatAt = Date.distantPast
@@ -151,6 +173,13 @@ final class StreamPipeline: ObservableObject {
         pendingUiLogLines = []
         logFlushTask?.cancel()
         logFlushTask = nil
+        ffmpegDiagnosticCounters = [:]
+        recentFfmpegDiagnosticLines = []
+        lastDiagnosticSnapshotAt = Date.distantPast
+        lastSpeedDriftLogAt = Date.distantPast
+        lastFfmpegProgressLogAt = Date.distantPast
+        lastRelayReport = nil
+        lastRelayReportAt = Date.distantPast
 
         launchPipeline()
     }
@@ -281,11 +310,13 @@ final class StreamPipeline: ObservableObject {
         ytDlpErrorPipe = ytError
         ffmpegErrorPipe = ffError
 
+        resetPerLaunchState(config: config)
+
         if let ytError {
-            observe(pipe: ytError, source: "yt-dlp")
+            observe(pipe: ytError, source: "yt-dlp", generation: currentGeneration)
         }
         if let ffError {
-            observe(pipe: ffError, source: "ffmpeg")
+            observe(pipe: ffError, source: "ffmpeg", generation: currentGeneration)
         }
 
         ytDlp.terminationHandler = { [weak self] proc in
@@ -411,6 +442,7 @@ final class StreamPipeline: ObservableObject {
             }
             startBufferCountdownIfNeeded(config: config, generation: currentGeneration)
             startOutputFreezeMonitorIfNeeded()
+            startDiagnosticHeartbeatIfNeeded()
         } catch {
             appendLog("[app] Failed to start pipeline: \(error.localizedDescription)")
             terminatePipeline()
@@ -476,7 +508,7 @@ final class StreamPipeline: ObservableObject {
                         if let config = self.currentConfig {
                             self.applyBufferReport(report, config: config)
                         }
-                        try? await Task.sleep(nanoseconds: 50_000_000)
+                        try? await Task.sleep(nanoseconds: 20_000_000)
                         if !self.shouldKeepRunning {
                             return
                         }
@@ -500,6 +532,8 @@ final class StreamPipeline: ObservableObject {
         relayReadTask = nil
         outputFreezeMonitorTask?.cancel()
         outputFreezeMonitorTask = nil
+        diagnosticHeartbeatTask?.cancel()
+        diagnosticHeartbeatTask = nil
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
 
@@ -633,14 +667,18 @@ final class StreamPipeline: ObservableObject {
         var args = [
             "-hide_banner",
             "-loglevel",
-            "info"
+            "info",
+            "-stats_period",
+            "1",
+            "-progress",
+            "pipe:2"
         ]
         args += inputArgs
         args += ["-i", "pipe:0"]
         // Keep stream selection deterministic to avoid stream switching side-effects.
         args += ["-map", "0:v:0", "-map", "0:a:0?"]
 
-        let useVideoToolbox = toolPaths?.supportsVideoToolboxH264 == true
+        let useVideoToolbox = (toolPaths?.supportsVideoToolboxH264 == true) && !forceSoftwareEncoderForSession
         switch config.encodeMode {
         case .copy:
             args += ["-c:v", "copy", "-c:a", "copy"]
@@ -671,13 +709,14 @@ final class StreamPipeline: ObservableObject {
                     "-allow_sw", "1",
                     "-realtime", "1",
                     "-pix_fmt", "yuv420p",
-                    "-g", "60",
-                    "-keyint_min", "60",
+                    "-g", "30",
+                    "-keyint_min", "30",
                     "-bf", "0",
                     "-b:v", "3500k",
                     "-maxrate", "4500k",
                     "-bufsize", "9000k",
-                    "-force_key_frames", "expr:gte(t,n_forced*2)",
+                    "-profile:v", "baseline",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)",
                     "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
@@ -693,12 +732,13 @@ final class StreamPipeline: ObservableObject {
                     "-preset", "ultrafast",
                     "-tune", "zerolatency",
                     "-crf", "27",
+                    "-x264-params", "force-cfr=1:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1",
                     "-pix_fmt", "yuv420p",
-                    "-g", "60",
-                    "-keyint_min", "60",
+                    "-g", "30",
+                    "-keyint_min", "30",
                     "-sc_threshold", "0",
-                    "-profile:v", "main",
-                    "-force_key_frames", "expr:gte(t,n_forced*2)",
+                    "-profile:v", "baseline",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)",
                     "-vf", videoFilter,
                     "-c:a", "aac",
                     "-ar", "48000",
@@ -816,37 +856,40 @@ final class StreamPipeline: ObservableObject {
         return "\(scheme)://\(host)\(portSuffix)/\(appPart)/<redacted>"
     }
 
-    private func observe(pipe: Pipe, source: String) {
+    private func observe(pipe: Pipe, source: String, generation: Int) {
+        let chunkKey = "\(generation):\(source)"
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else {
                 handle.readabilityHandler = nil
                 Task { @MainActor [weak self] in
-                    self?.flushPendingLogChunk(for: source)
-                    self?.flushSuppressedMetadataIfNeeded(force: true)
-                    self?.flushSuppressedProgressIfNeeded(force: true)
-                    self?.flushPendingUiLogs()
+                    guard let self, generation == self.generation else { return }
+                    self.flushPendingLogChunk(for: source, key: chunkKey)
+                    self.flushSuppressedMetadataIfNeeded(force: true)
+                    self.flushSuppressedProgressIfNeeded(force: true)
+                    self.flushPendingUiLogs()
                 }
                 return
             }
             let chunk = String(decoding: data, as: UTF8.self)
             Task { @MainActor [weak self] in
-                self?.ingestLogChunk(chunk, source: source)
+                guard let self, generation == self.generation else { return }
+                self.ingestLogChunk(chunk, source: source, key: chunkKey)
             }
         }
     }
 
-    private func ingestLogChunk(_ chunk: String, source: String) {
-        let existing = pendingLogChunkBySource[source] ?? ""
+    private func ingestLogChunk(_ chunk: String, source: String, key: String) {
+        let existing = pendingLogChunkBySource[key] ?? ""
         let combined = existing + chunk
         let parts = combined.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
         let endsWithNewline = combined.last?.isNewline == true
         let completeCount = endsWithNewline ? parts.count : max(0, parts.count - 1)
 
         if endsWithNewline {
-            pendingLogChunkBySource[source] = ""
+            pendingLogChunkBySource[key] = ""
         } else {
-            pendingLogChunkBySource[source] = String(parts.last ?? "")
+            pendingLogChunkBySource[key] = String(parts.last ?? "")
         }
 
         if completeCount == 0 { return }
@@ -857,15 +900,62 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func flushPendingLogChunk(for source: String) {
-        let remainder = (pendingLogChunkBySource[source] ?? "")
+    private func flushPendingLogChunk(for source: String, key: String) {
+        let remainder = (pendingLogChunkBySource[key] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !remainder.isEmpty else {
-            pendingLogChunkBySource[source] = ""
+            pendingLogChunkBySource[key] = ""
             return
         }
-        pendingLogChunkBySource[source] = ""
+        pendingLogChunkBySource[key] = ""
         appendLog("[\(source)] \(normalizedLogPayload(remainder))")
+    }
+
+    private func resetPerLaunchState(config: StreamConfig) {
+        parsedStatus.sourceState = "Starting"
+        parsedStatus.outputState = "Starting"
+        parsedStatus.bufferState = bufferStateText(for: config)
+        parsedStatus.bufferProgress = initialBufferProgress(for: config)
+        parsedStatus.avSyncState = avSyncStateText(for: config)
+        parsedStatus.reconnectDelay = "None"
+        parsedStatus.ffmpegTime = ""
+        parsedStatus.ffmpegBitrate = ""
+        parsedStatus.ffmpegSpeed = ""
+        parsedStatus.lastAppEvent = "Session started"
+        parsedStatus.lastFFmpegEvent = "No activity yet"
+        parsedStatus.lastYtDlpEvent = "No activity yet"
+        parsedStatus.lastError = "None"
+
+        lastFfmpegProgressSeconds = 0
+        lastFfmpegProgressAt = Date()
+        hasSeenFfmpegProgress = false
+        lowSpeedSince = Date.distantPast
+        outputFreezeActive = false
+        outputFreezeStartedAt = Date.distantPast
+        lastOutputFreezeHeartbeatAt = Date.distantPast
+        lastFfmpegDupCount = nil
+        lastFfmpegDupSampleAt = Date.distantPast
+        duplicationFreezeActive = false
+        duplicationFreezeStartedAt = Date.distantPast
+        lastDuplicationAlertAt = Date.distantPast
+        lastHighDupAt = Date.distantPast
+        stallRecoveryTriggered = false
+        freezeRecoveryTriggered = false
+        bufferExhausted = false
+        lastBufferUiUpdate = Date.distantPast
+        estimatedOutputBitrateBps = 0
+        ffmpegDiagnosticCounters = [:]
+        recentFfmpegDiagnosticLines = []
+        lastDiagnosticSnapshotAt = Date.distantPast
+        lastSpeedDriftLogAt = Date.distantPast
+        lastFfmpegProgressLogAt = Date.distantPast
+        lastRelayReport = nil
+        lastRelayReportAt = Date.distantPast
+        pendingLogChunkBySource = [:]
+        suppressedMetadataLineCount = 0
+        lastSuppressedMetadataFlushAt = Date.distantPast
+        suppressedProgressLineCount = 0
+        lastSuppressedProgressFlushAt = Date.distantPast
     }
 
     private func normalizedLogPayload(_ payload: String) -> String {
@@ -969,6 +1059,7 @@ final class StreamPipeline: ObservableObject {
         let isFrameStatsLine = message.contains("frame=") &&
             (message.contains("[ffmpeg]") || message.contains("[yt-dlp]"))
         let now = Date()
+        updateDiagnosticSignals(from: message, now: now)
         if !isFrameStatsLine {
             updateSourceEvent(source: source, message: message, now: now, throttleFrameLines: false)
         } else {
@@ -977,6 +1068,35 @@ final class StreamPipeline: ObservableObject {
 
         if message.contains("ERROR:") || message.lowercased().contains(" error") {
             parsedStatus.lastError = message
+        }
+
+        if message.contains("[ffmpeg] out_time_us=") || message.contains("[ffmpeg] out_time_ms=") {
+            let micros = progressMicros(from: message)
+            if micros > 0 {
+                let progressSeconds = micros / 1_000_000.0
+                parsedStatus.ffmpegTime = formatClock(seconds: progressSeconds)
+                if progressSeconds > lastFfmpegProgressSeconds + 0.2 {
+                    lastFfmpegProgressSeconds = progressSeconds
+                    lastFfmpegProgressAt = now
+                    hasSeenFfmpegProgress = true
+                    stallRecoveryTriggered = false
+                    freezeRecoveryTriggered = false
+                }
+                if now.timeIntervalSince(lastFfmpegProgressLogAt) >= Self.ffmpegProgressLogInterval {
+                    lastFfmpegProgressLogAt = now
+                    appendLogCore("[app] ffmpeg progress: t=\(parsedStatus.ffmpegTime)")
+                }
+            }
+        } else if message.contains("[ffmpeg] speed=") {
+            let speedValue = progressValue(from: message, key: "speed")
+            if !speedValue.isEmpty {
+                parsedStatus.ffmpegSpeed = speedValue
+            }
+        } else if message.contains("[ffmpeg] bitrate=") {
+            let bitrateValue = progressValue(from: message, key: "bitrate")
+            if !bitrateValue.isEmpty {
+                parsedStatus.ffmpegBitrate = bitrateValue
+            }
         }
 
         if message.contains("[yt-dlp] [youtube] Extracting URL") {
@@ -999,6 +1119,44 @@ final class StreamPipeline: ObservableObject {
             parsedStatus.ffmpegTime = capture(regex: Self.ffmpegTimeRegex, in: message)
             parsedStatus.ffmpegBitrate = capture(regex: Self.ffmpegBitrateRegex, in: message)
             parsedStatus.ffmpegSpeed = capture(regex: Self.ffmpegSpeedRegex, in: message)
+            if let speed = parseSpeedFactor(parsedStatus.ffmpegSpeed) {
+                if speed > Self.speedDriftThreshold,
+                   now.timeIntervalSince(lastSpeedDriftLogAt) >= Self.speedDriftLogInterval {
+                    lastSpeedDriftLogAt = now
+                    ffmpegDiagnosticCounters["speed_drift", default: 0] += 1
+                    let speedText = String(format: "%.2f", speed)
+                    appendLog(
+                        "[app] Output speed drift detected (\(speedText)x). Receiver-side jitter/freezes are more likely when publishing faster than realtime."
+                    )
+                    appendDiagnosticSnapshot(reason: "speed-drift")
+                }
+
+                if speed < Self.lowSpeedThreshold {
+                    if lowSpeedSince == Date.distantPast {
+                        lowSpeedSince = now
+                    }
+                    let lowSpeedDuration = now.timeIntervalSince(lowSpeedSince)
+                    let relayHealthy = (lastRelayReport?.bufferedDelaySeconds ?? 0) >= Self.lowSpeedMinBufferSeconds
+                    if relayHealthy &&
+                        lowSpeedDuration >= Self.lowSpeedRestartThreshold &&
+                        !freezeRecoveryTriggered &&
+                        shouldKeepRunning &&
+                        isRunning {
+                        freezeRecoveryTriggered = true
+                        ffmpegDiagnosticCounters["speed_low_restart", default: 0] += 1
+                        let lowSpeedText = String(format: "%.2f", speed)
+                        appendLog(
+                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with healthy buffer. Restarting pipeline."
+                        )
+                        appendDiagnosticSnapshot(reason: "low-speed-restart")
+                        terminatePipeline()
+                        scheduleRestart(generation: generation)
+                        return
+                    }
+                } else {
+                    lowSpeedSince = Date.distantPast
+                }
+            }
             if let bps = parseBitrateToBps(parsedStatus.ffmpegBitrate) {
                 estimatedOutputBitrateBps = bps
             }
@@ -1006,6 +1164,17 @@ final class StreamPipeline: ObservableObject {
 
             if let progressSeconds = parseClockToSeconds(parsedStatus.ffmpegTime) {
                 if progressSeconds > lastFfmpegProgressSeconds + 0.2 {
+                    let progressGap = now.timeIntervalSince(lastFfmpegProgressAt)
+                    let wasPublishing = parsedStatus.outputState.lowercased().contains("publish")
+                    if hasSeenFfmpegProgress &&
+                        wasPublishing &&
+                        progressGap >= Self.transientStallLogThreshold &&
+                        progressGap < Self.outputFreezeLogThreshold {
+                        ffmpegDiagnosticCounters["transient_stall", default: 0] += 1
+                        appendLog(
+                            "[app] Short output stall recovered after \(Int(progressGap.rounded()))s (no restart needed)."
+                        )
+                    }
                     lastFfmpegProgressSeconds = progressSeconds
                     lastFfmpegProgressAt = now
                     hasSeenFfmpegProgress = true
@@ -1013,6 +1182,7 @@ final class StreamPipeline: ObservableObject {
                         outputFreezeActive = false
                         let freezeDuration = max(0, now.timeIntervalSince(outputFreezeStartedAt))
                         appendLog("[app] Output freeze recovered after \(Int(freezeDuration.rounded()))s.")
+                        appendDiagnosticSnapshot(reason: "freeze-recovered")
                     }
                     stallRecoveryTriggered = false
                     freezeRecoveryTriggered = false
@@ -1024,6 +1194,7 @@ final class StreamPipeline: ObservableObject {
                     now.timeIntervalSince(lastFfmpegProgressAt) >= Self.outputStallThreshold {
                     stallRecoveryTriggered = true
                     appendLog("[app] Output appears stalled (no ffmpeg time advance for \(Int(Self.outputStallThreshold))s). Restarting pipeline.")
+                    appendDiagnosticSnapshot(reason: "stall-restart")
                     terminatePipeline()
                     scheduleRestart(generation: generation)
                     return
@@ -1081,6 +1252,43 @@ final class StreamPipeline: ObservableObject {
         return nil
     }
 
+    private func parseSpeedFactor(_ text: String) -> Double? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return nil }
+        let value = trimmed.hasSuffix("x") ? String(trimmed.dropLast()) : trimmed
+        return Double(value)
+    }
+
+    private func progressValue(from message: String, key: String) -> String {
+        guard let range = message.range(of: "[ffmpeg] \(key)=") else { return "" }
+        let raw = String(message[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw
+    }
+
+    private func progressMicros(from message: String) -> Double {
+        let us = progressValue(from: message, key: "out_time_us")
+        if let value = Double(us), value > 0 {
+            return value
+        }
+
+        let ms = progressValue(from: message, key: "out_time_ms")
+        if let value = Double(ms), value > 0 {
+            // ffmpeg exposes out_time_ms but value is in microseconds.
+            return value
+        }
+        return 0
+    }
+
+    private func formatClock(seconds: Double) -> String {
+        let clamped = max(0, seconds)
+        let total = Int(clamped)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let wholeSeconds = total % 60
+        let fractional = Int(((clamped - floor(clamped)) * 100).rounded())
+        return String(format: "%02d:%02d:%02d.%02d", hours, minutes, wholeSeconds, fractional)
+    }
+
     private func captureInt(regex: NSRegularExpression, in text: String) -> Int? {
         let captured = capture(regex: regex, in: text)
         guard !captured.isEmpty else { return nil }
@@ -1113,9 +1321,11 @@ final class StreamPipeline: ObservableObject {
                 duplicationFreezeStartedAt = now
                 lastDuplicationAlertAt = now
                 appendLog("[app] Possible visual freeze: ffmpeg duplicated frames at ~\(Int(dupPerSecond.rounded())) fps.")
+                appendDiagnosticSnapshot(reason: "dup-freeze-detected")
             } else if now.timeIntervalSince(lastDuplicationAlertAt) >= Self.duplicationFreezeHeartbeatInterval {
                 lastDuplicationAlertAt = now
                 appendLog("[app] Visual freeze ongoing: duplicate-frame rate ~\(Int(dupPerSecond.rounded())) fps.")
+                appendDiagnosticSnapshot(reason: "dup-freeze-ongoing")
             }
             let freezeDuration = now.timeIntervalSince(duplicationFreezeStartedAt)
             if !freezeRecoveryTriggered &&
@@ -1124,6 +1334,7 @@ final class StreamPipeline: ObservableObject {
                 freezeDuration >= Self.duplicationFreezeRestartThreshold {
                 freezeRecoveryTriggered = true
                 appendLog("[app] Visual freeze persisted for \(Int(freezeDuration.rounded()))s. Restarting pipeline.")
+                appendDiagnosticSnapshot(reason: "dup-freeze-restart")
                 terminatePipeline()
                 scheduleRestart(generation: generation)
             }
@@ -1135,6 +1346,7 @@ final class StreamPipeline: ObservableObject {
             let freezeDuration = max(0, now.timeIntervalSince(duplicationFreezeStartedAt))
             appendLog("[app] Visual freeze recovered after \(Int(freezeDuration.rounded()))s.")
             freezeRecoveryTriggered = false
+            appendDiagnosticSnapshot(reason: "dup-freeze-recovered")
         }
     }
 
@@ -1159,6 +1371,8 @@ final class StreamPipeline: ObservableObject {
         guard supportsStartupBuffer(config.encodeMode), config.bufferSeconds > 0 else { return }
 
         let now = Date()
+        lastRelayReport = report
+        lastRelayReportAt = now
         let target = max(1.0, Double(config.bufferSeconds))
         let bufferedSecondsFromBitrate: Double? = {
             guard estimatedOutputBitrateBps > 32_000 else { return nil }
@@ -1239,17 +1453,27 @@ final class StreamPipeline: ObservableObject {
     private static let statsParseInterval: TimeInterval = 0.5
     private static let statsEventInterval: TimeInterval = 0.5
     private static let outputStallThreshold: TimeInterval = 12.0
+    private static let transientStallLogThreshold: TimeInterval = 2.5
     private static let outputFreezeLogThreshold: TimeInterval = 6.0
     private static let outputFreezeHeartbeatInterval: TimeInterval = 10.0
-    private static let outputFreezeRestartThreshold: TimeInterval = 14.0
+    private static let outputFreezeRestartThreshold: TimeInterval = 8.0
     private static let outputFreezeMonitorPollInterval: TimeInterval = 1.0
     private static let duplicationFreezeDupPerSecondThreshold: Double = 10.0
     private static let duplicationFreezeHeartbeatInterval: TimeInterval = 10.0
     private static let duplicationFreezeRecoveryWindow: TimeInterval = 3.0
-    private static let duplicationFreezeRestartThreshold: TimeInterval = 15.0
+    private static let duplicationFreezeRestartThreshold: TimeInterval = 8.0
     private static let metadataSummaryInterval: TimeInterval = 2.0
     private static let progressSummaryInterval: TimeInterval = 2.0
+    private static let ffmpegProgressLogInterval: TimeInterval = 10.0
+    private static let speedDriftThreshold: Double = 1.15
+    private static let speedDriftLogInterval: TimeInterval = 8.0
+    private static let lowSpeedThreshold: Double = 0.92
+    private static let lowSpeedRestartThreshold: TimeInterval = 12.0
+    private static let lowSpeedMinBufferSeconds: TimeInterval = 8.0
     private static let logFlushInterval: TimeInterval = 0.2
+    private static let diagnosticSnapshotInterval: TimeInterval = 20.0
+    private static let diagnosticSnapshotMinGap: TimeInterval = 4.0
+    private static let maxDiagnosticLines: Int = 24
     private static let relayReadChunkSize: Int = 262_144
     private static let maxToolLogPayloadLength: Int = 800
     private static let processTimeoutExitCode: Int32 = -999
@@ -1353,6 +1577,7 @@ final class StreamPipeline: ObservableObject {
                     self.appendLog(
                         "[app] Output freeze detected: ffmpeg output time has not advanced for \(Int(stalledFor.rounded()))s."
                     )
+                    self.appendDiagnosticSnapshot(reason: "output-freeze-detected")
                     continue
                 }
 
@@ -1361,6 +1586,7 @@ final class StreamPipeline: ObservableObject {
                     self.appendLog(
                         "[app] Output freeze ongoing: ffmpeg output time stagnant for \(Int(stalledFor.rounded()))s."
                     )
+                    self.appendDiagnosticSnapshot(reason: "output-freeze-ongoing")
                 }
                 if !self.freezeRecoveryTriggered &&
                     stalledFor >= Self.outputFreezeRestartThreshold {
@@ -1368,11 +1594,95 @@ final class StreamPipeline: ObservableObject {
                     self.appendLog(
                         "[app] Output freeze persisted for \(Int(stalledFor.rounded()))s. Restarting pipeline."
                     )
+                    self.appendDiagnosticSnapshot(reason: "output-freeze-restart")
                     self.terminatePipeline()
                     self.scheduleRestart(generation: self.generation)
                 }
             }
         }
+    }
+
+    private func startDiagnosticHeartbeatIfNeeded() {
+        diagnosticHeartbeatTask?.cancel()
+        diagnosticHeartbeatTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.diagnosticSnapshotInterval * 1_000_000_000)
+                )
+                guard self.shouldKeepRunning, self.isRunning else { continue }
+                self.appendDiagnosticSnapshot(reason: "periodic")
+            }
+        }
+    }
+
+    private func updateDiagnosticSignals(from message: String, now: Date) {
+        guard message.contains("[ffmpeg]") else { return }
+        let lower = message.lowercased()
+        func bump(_ key: String) {
+            ffmpegDiagnosticCounters[key, default: 0] += 1
+            if recentFfmpegDiagnosticLines.count >= Self.maxDiagnosticLines {
+                recentFfmpegDiagnosticLines.removeFirst(recentFfmpegDiagnosticLines.count - Self.maxDiagnosticLines + 1)
+            }
+            recentFfmpegDiagnosticLines.append(message)
+        }
+
+        if lower.contains("non-monotonous dts") || lower.contains("non monotonically increasing dts") {
+            bump("dts_non_monotonic")
+        }
+        if lower.contains("backward in time") || lower.contains("queue input is backward") {
+            bump("timestamp_backward")
+        }
+        if lower.contains("past duration") {
+            bump("past_duration")
+        }
+        if lower.contains("error while decoding") || lower.contains("invalid nal") || lower.contains("corrupt") {
+            bump("decode_corrupt")
+        }
+        if lower.contains("rtmp") && (lower.contains("broken pipe") || lower.contains("connection reset") || lower.contains("io error") || lower.contains("failed")) {
+            bump("rtmp_io")
+        }
+        if lower.contains("delay between the first packet and last packet") || lower.contains("max delay reached") {
+            bump("mux_delay")
+        }
+
+        if now.timeIntervalSince(lastDiagnosticSnapshotAt) >= Self.diagnosticSnapshotInterval &&
+            !ffmpegDiagnosticCounters.isEmpty &&
+            logMonitoringEnabled {
+            appendDiagnosticSnapshot(reason: "signal")
+        }
+    }
+
+    private func appendDiagnosticSnapshot(reason: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastDiagnosticSnapshotAt) >= Self.diagnosticSnapshotMinGap else { return }
+        lastDiagnosticSnapshotAt = now
+
+        let stalledFor = hasSeenFfmpegProgress ? max(0, now.timeIntervalSince(lastFfmpegProgressAt)) : 0
+        let relay = lastRelayReport
+        let relayAge = relay == nil ? -1.0 : now.timeIntervalSince(lastRelayReportAt)
+        let counters = ffmpegDiagnosticCounters
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: ",")
+        let lastDiagLine = recentFfmpegDiagnosticLines.last?.replacingOccurrences(of: "\n", with: " ") ?? "-"
+        let countersText = counters.isEmpty ? "none" : counters
+        let relayText: String
+        if let relay {
+            relayText = String(
+                format: "delay=%.1fs unread=%d hasSink=%@ ended=%@ age=%.1fs",
+                relay.bufferedDelaySeconds,
+                relay.unreadBytes,
+                relay.hasSink ? "1" : "0",
+                relay.isInputEnded ? "1" : "0",
+                max(0, relayAge)
+            )
+        } else {
+            relayText = "n/a"
+        }
+
+        appendLogCore(
+            "[app] diag(\(reason)): output=\(parsedStatus.outputState), ffmpegTime=\(parsedStatus.ffmpegTime.isEmpty ? "-" : parsedStatus.ffmpegTime), speed=\(parsedStatus.ffmpegSpeed.isEmpty ? "-" : parsedStatus.ffmpegSpeed), bitrate=\(parsedStatus.ffmpegBitrate.isEmpty ? "-" : parsedStatus.ffmpegBitrate), stalled=\(Int(stalledFor.rounded()))s, buffer=\(parsedStatus.bufferState), relay={\(relayText)}, counters={\(countersText)}, lastFFmpegDiag=\(lastDiagLine)"
+        )
     }
 
     private func fetchPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
@@ -1591,8 +1901,8 @@ private actor DiskBackedStartupRelay {
 
         var remaining = releasableBytes
         var writes = 0
-        while remaining > 0 && writeBudgetBytes >= 1 && writes < 8 {
-            let batchCap = max(32_768, Int(estimatedBytesPerSecond * 0.2))
+        while remaining > 0 && writeBudgetBytes >= 1 && writes < 16 {
+            let batchCap = max(8_192, Int(estimatedBytesPerSecond * 0.05))
             let count = min(remaining, min(Int(writeBudgetBytes), batchCap))
             if count <= 0 { break }
 
