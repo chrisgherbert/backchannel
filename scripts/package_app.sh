@@ -17,7 +17,7 @@ DEFAULT_ICON_ICNS="$ROOT_DIR/assets/$APP_ICON_ICNS_NAME"
 DEFAULT_ICON_PNG="$ROOT_DIR/assets/AppIcon.png"
 PRODUCT_BIN="$ROOT_DIR/.build/arm64-apple-macosx/release/youtube-live-converter"
 APP_BIN="$BIN_DIR/$APP_DISPLAY_NAME"
-APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.herbert.backchannel}"
+APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.chrisgherbert.backchannel}"
 APP_BUILD_VERSION="${APP_BUILD_VERSION:-$(date +%Y%m%d%H%M%S)}"
 APP_SHORT_VERSION="${APP_SHORT_VERSION:-1.0}"
 ICON_ALPHA_TRIM_THRESHOLD="${APP_ICON_ALPHA_TRIM_THRESHOLD:-0}"
@@ -46,6 +46,13 @@ is_python_wrapper() {
   local first_line
   first_line="$(head -n 1 "$file" || true)"
   [[ "$first_line" == "#!"*python* ]]
+}
+
+is_macho_binary() {
+  local file="$1"
+  local file_desc
+  file_desc="$(file -b "$file" 2>/dev/null || true)"
+  [[ "$file_desc" == *"Mach-O"* ]]
 }
 
 create_icns_from_png() {
@@ -534,8 +541,16 @@ if [[ -n "$DENO_PATH" ]] && [[ ! -x "$DENO_PATH" ]]; then
 fi
 
 if is_python_wrapper "$YTDLP_PATH"; then
-  echo "Warning: yt-dlp appears to be a Python wrapper script."
-  echo "Warning: for portable distribution, set YTDLP_BINARY to a standalone yt-dlp binary."
+  echo "Error: yt-dlp appears to be a Python wrapper script: $YTDLP_PATH" >&2
+  echo "Use a standalone yt-dlp binary (Mach-O) for portable distribution." >&2
+  echo "Set YTDLP_BINARY to that file path and rerun package_app.sh." >&2
+  exit 1
+fi
+
+if ! is_macho_binary "$YTDLP_PATH"; then
+  echo "Error: yt-dlp is not a standalone macOS binary (Mach-O): $YTDLP_PATH" >&2
+  echo "Use a standalone yt-dlp binary and set YTDLP_BINARY to its path." >&2
+  exit 1
 fi
 
 rm -f "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe" "$RES_BIN_DIR/deno"
