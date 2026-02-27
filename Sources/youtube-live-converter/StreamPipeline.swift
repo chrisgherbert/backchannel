@@ -1895,7 +1895,7 @@ private actor DiskBackedStartupRelay {
         }
         lastDrainAt = now
 
-        let releasableBytes = releasableBytesByTime(now: now)
+        let releasableBytes = releasableBytesByBacklog(now: now)
         let maxBudget = max(estimatedBytesPerSecond * 2.0, 128_000)
         writeBudgetBytes = min(writeBudgetBytes, maxBudget)
 
@@ -1936,23 +1936,12 @@ private actor DiskBackedStartupRelay {
         return makeReport(now: now)
     }
 
-    private func releasableBytesByTime(now: Date) -> Int {
-        let threshold = now.addingTimeInterval(-delaySeconds)
-        var releasable = 0
-        var index = metaReadIndex
-        var offset = metaReadOffset
-
-        while index < chunkMetas.count {
-            let meta = chunkMetas[index]
-            if !inputEnded && meta.enqueuedAt > threshold {
-                break
-            }
-            let available = max(0, meta.byteCount - offset)
-            releasable += available
-            index += 1
-            offset = 0
-        }
-        return releasable
+    private func releasableBytesByBacklog(now: Date) -> Int {
+        let unreadBytes = max(0, unreadMetaBytes)
+        guard delaySeconds > 0 else { return unreadBytes }
+        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
+        let targetBacklogBytes = max(0, Int(ingressBytesPerSecond * delaySeconds))
+        return max(0, unreadBytes - targetBacklogBytes)
     }
 
     func finishInput() {
@@ -1983,27 +1972,17 @@ private actor DiskBackedStartupRelay {
 
     private func makeReport(now: Date) -> RelayBufferReport {
         let unreadBytes = max(0, unreadMetaBytes)
-        let ageBasedDelay = oldestUnreadChunkEnqueuedAt().map { max(0, now.timeIntervalSince($0)) } ?? 0
         let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
         let byteBasedDelay = ingressBytesPerSecond > 0
             ? Double(unreadBytes) / ingressBytesPerSecond
             : 0
-        let bufferedDelay = unreadBytes > 0
-            ? min(ageBasedDelay, byteBasedDelay)
-            : 0
         return RelayBufferReport(
-            bufferedDelaySeconds: bufferedDelay,
+            bufferedDelaySeconds: byteBasedDelay,
             unreadBytes: unreadBytes,
             targetDelaySeconds: delaySeconds,
             hasSink: sink != nil,
             isInputEnded: inputEnded
         )
-    }
-
-    private func oldestUnreadChunkEnqueuedAt() -> Date? {
-        guard unreadMetaBytes > 0 else { return nil }
-        guard metaReadIndex < chunkMetas.count else { return nil }
-        return chunkMetas[metaReadIndex].enqueuedAt
     }
 
     private func consumeMetaBytes(_ count: Int) {
@@ -2094,16 +2073,16 @@ private actor StartupGateRelay {
             return makeReport(now: now)
         }
 
-        let threshold = now.addingTimeInterval(-delaySeconds)
+        let releasableBytes = releasableBytesByBacklog(now: now)
+        var remainingReleasable = releasableBytes
         var writes = 0
-        while readIndex < bufferedChunks.count {
+        while readIndex < bufferedChunks.count, remainingReleasable > 0 {
             let chunk = bufferedChunks[readIndex]
-            if !inputEnded && chunk.enqueuedAt > threshold {
-                break
-            }
+            if chunk.data.count > remainingReleasable { break }
             try? sink.write(contentsOf: chunk.data)
             readIndex += 1
             unreadByteCount = max(0, unreadByteCount - chunk.data.count)
+            remainingReleasable = max(0, remainingReleasable - chunk.data.count)
             writes += 1
             if writes >= 128 {
                 break
@@ -2141,22 +2120,25 @@ private actor StartupGateRelay {
     }
 
     private func makeReport(now: Date) -> RelayBufferReport {
-        let unread = max(0, bufferedChunks.count - readIndex)
-        let ageBasedDelay: TimeInterval = unread > 0
-            ? max(0, now.timeIntervalSince(bufferedChunks[readIndex].enqueuedAt))
-            : 0
         let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
         let byteBasedDelay: TimeInterval = ingressBytesPerSecond > 0
             ? Double(unreadByteCount) / ingressBytesPerSecond
             : 0
-        let bufferedDelay = unread > 0 ? min(ageBasedDelay, byteBasedDelay) : 0
         return RelayBufferReport(
-            bufferedDelaySeconds: bufferedDelay,
+            bufferedDelaySeconds: byteBasedDelay,
             unreadBytes: unreadByteCount,
             targetDelaySeconds: delaySeconds,
             hasSink: sink != nil,
             isInputEnded: inputEnded
         )
+    }
+
+    private func releasableBytesByBacklog(now: Date) -> Int {
+        let unreadBytes = max(0, unreadByteCount)
+        guard delaySeconds > 0 else { return unreadBytes }
+        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
+        let targetBacklogBytes = max(0, Int(ingressBytesPerSecond * delaySeconds))
+        return max(0, unreadBytes - targetBacklogBytes)
     }
 
     private func estimatedIngressBytesPerSecond(now: Date) -> Double {
