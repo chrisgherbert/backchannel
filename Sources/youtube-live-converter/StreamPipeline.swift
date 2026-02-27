@@ -604,7 +604,7 @@ final class StreamPipeline: ObservableObject {
                 pendingRestartAfterDrain = false
                 terminatePipeline()
                 if shouldKeepRunning {
-                    scheduleRestart(generation: generation)
+                    scheduleRestart(generation: generation, reason: .processExit)
                 } else {
                     Task { @MainActor in
                         self.isRunning = false
@@ -618,7 +618,7 @@ final class StreamPipeline: ObservableObject {
         terminatePipeline()
 
         if shouldKeepRunning {
-            scheduleRestart(generation: generation)
+            scheduleRestart(generation: generation, reason: .processExit)
         } else {
             Task { @MainActor in
                 self.isRunning = false
@@ -638,10 +638,11 @@ final class StreamPipeline: ObservableObject {
         restartScheduled = true
         restartAttempts += 1
         let delay = min(pow(2.0, Double(restartAttempts)), 30.0)
+        let reasonLabel = restartReasonLabel(reason)
 
         status = "Reconnecting (\(Int(delay))s)"
         parsedStatus.reconnectDelay = "\(Int(delay))s"
-        appendLog("[app] Restarting pipeline in \(Int(delay))s.")
+        appendLog("[app] Restarting pipeline in \(Int(delay))s (reason: \(reasonLabel)).")
 
         Task { @MainActor [weak self] in
             let duration = UInt64(delay * 1_000_000_000)
@@ -691,6 +692,10 @@ final class StreamPipeline: ObservableObject {
             "-progress",
             "pipe:2"
         ]
+        if supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0 {
+            // Keep publish pacing close to realtime even when relay backlog is healthy.
+            args += ["-re"]
+        }
         args += inputArgs
         args += ["-i", "pipe:0"]
         // Keep stream selection deterministic to avoid stream switching side-effects.
@@ -1154,8 +1159,10 @@ final class StreamPipeline: ObservableObject {
                         lowSpeedSince = now
                     }
                     let lowSpeedDuration = now.timeIntervalSince(lowSpeedSince)
-                    let relayHealthy = (lastRelayReport?.bufferedDelaySeconds ?? 0) >= Self.lowSpeedMinBufferSeconds
-                    if relayHealthy &&
+                    let relayBufferedSeconds = lastRelayReport?.bufferedDelaySeconds ?? 0
+                    let relayStarved = lastRelayReport != nil &&
+                        relayBufferedSeconds <= Self.lowSpeedRestartBufferCeiling
+                    if relayStarved &&
                         lowSpeedDuration >= Self.lowSpeedRestartThreshold &&
                         !freezeRecoveryTriggered &&
                         shouldKeepRunning &&
@@ -1163,12 +1170,13 @@ final class StreamPipeline: ObservableObject {
                         freezeRecoveryTriggered = true
                         ffmpegDiagnosticCounters["speed_low_restart", default: 0] += 1
                         let lowSpeedText = String(format: "%.2f", speed)
+                        let relayText = String(format: "%.1f", relayBufferedSeconds)
                         appendLog(
-                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with healthy buffer. Restarting pipeline."
+                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with low relay buffer (\(relayText)s). Restarting pipeline."
                         )
                         appendDiagnosticSnapshot(reason: "low-speed-restart")
                         terminatePipeline()
-                        scheduleRestart(generation: generation)
+                        scheduleRestart(generation: generation, reason: .lowSpeed)
                         return
                     }
                 } else {
@@ -1214,7 +1222,7 @@ final class StreamPipeline: ObservableObject {
                     appendLog("[app] Output appears stalled (no ffmpeg time advance for \(Int(Self.outputStallThreshold))s). Restarting pipeline.")
                     appendDiagnosticSnapshot(reason: "stall-restart")
                     terminatePipeline()
-                    scheduleRestart(generation: generation)
+                    scheduleRestart(generation: generation, reason: .stall)
                     return
                 }
             }
@@ -1354,7 +1362,7 @@ final class StreamPipeline: ObservableObject {
                 appendLog("[app] Visual freeze persisted for \(Int(freezeDuration.rounded()))s. Restarting pipeline.")
                 appendDiagnosticSnapshot(reason: "dup-freeze-restart")
                 terminatePipeline()
-                scheduleRestart(generation: generation)
+                scheduleRestart(generation: generation, reason: .freeze)
             }
             return
         }
@@ -1492,8 +1500,8 @@ final class StreamPipeline: ObservableObject {
     private static let speedDriftThreshold: Double = 1.15
     private static let speedDriftLogInterval: TimeInterval = 8.0
     private static let lowSpeedThreshold: Double = 0.92
-    private static let lowSpeedRestartThreshold: TimeInterval = 12.0
-    private static let lowSpeedMinBufferSeconds: TimeInterval = 8.0
+    private static let lowSpeedRestartThreshold: TimeInterval = 18.0
+    private static let lowSpeedRestartBufferCeiling: TimeInterval = 3.0
     private static let logFlushInterval: TimeInterval = 0.2
     private static let diagnosticSnapshotInterval: TimeInterval = 20.0
     private static let diagnosticSnapshotMinGap: TimeInterval = 4.0
@@ -1629,6 +1637,24 @@ final class StreamPipeline: ObservableObject {
     private enum RestartReason {
         case general
         case freeze
+        case lowSpeed
+        case stall
+        case processExit
+    }
+
+    private func restartReasonLabel(_ reason: RestartReason) -> String {
+        switch reason {
+        case .general:
+            return "general"
+        case .freeze:
+            return "output-freeze"
+        case .lowSpeed:
+            return "low-speed-with-low-buffer"
+        case .stall:
+            return "progress-stall"
+        case .processExit:
+            return "process-exit"
+        }
     }
 
     private func startDiagnosticHeartbeatIfNeeded() {
