@@ -227,18 +227,20 @@ final class StreamPipeline: ObservableObject {
         let requestID = previewRequestID
         previewStatus = "Loading source info..."
 
-        Task { [weak self] in
-            guard let self else { return }
-            let metadata = await self.fetchPreviewMetadata(for: trimmed)
-            guard requestID == self.previewRequestID else { return }
-            self.previewSourceURL = trimmed
+        Task.detached(priority: .userInitiated) {
+            let metadata = await StreamPipeline.fetchPreviewMetadata(for: trimmed)
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard requestID == self.previewRequestID else { return }
+                self.previewSourceURL = trimmed
 
-            if let preview = metadata.preview {
-                self.preview = preview
-                self.previewStatus = self.previewStatusText(for: preview.publishState)
-            } else {
-                self.preview = nil
-                self.previewStatus = metadata.message
+                if let preview = metadata.preview {
+                    self.preview = preview
+                    self.previewStatus = self.previewStatusText(for: preview.publishState)
+                } else {
+                    self.preview = nil
+                    self.previewStatus = metadata.message
+                }
             }
         }
     }
@@ -1498,7 +1500,7 @@ final class StreamPipeline: ObservableObject {
     private static let maxDiagnosticLines: Int = 24
     private static let relayReadChunkSize: Int = 262_144
     private static let maxToolLogPayloadLength: Int = 800
-    private static let processTimeoutExitCode: Int32 = -999
+    nonisolated private static let processTimeoutExitCode: Int32 = -999
     private static let verboseMetadataTokens: [String] = [
         "Skip ('#EXT-X-DATERANGE",
         "Skip ('#EXT-X-CUEPOINT",
@@ -1712,12 +1714,16 @@ final class StreamPipeline: ObservableObject {
         )
     }
 
-    private func fetchPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
-        guard let paths = resolveToolPaths() else {
+    nonisolated private static func fetchPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
+        guard
+            let ytDlp = resolveToolForPreview(named: "yt-dlp"),
+            let ffmpeg = resolveToolForPreview(named: "ffmpeg")
+        else {
             return (nil, "Tools unavailable")
         }
 
-        let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
+        let deno = resolveToolForPreview(named: "deno")
+        let ffmpegToolsDir = ffmpeg.deletingLastPathComponent().path
         let ytDlpWorkDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("youtube-live-converter", isDirectory: true)
         do {
@@ -1730,7 +1736,7 @@ final class StreamPipeline: ObservableObject {
         }
 
         var args = ["--dump-single-json", "--skip-download", "--no-warnings"]
-        if let deno = paths.deno {
+        if let deno {
             args += ["--js-runtimes", "deno:\(deno.path)"]
         }
         args += [
@@ -1740,10 +1746,10 @@ final class StreamPipeline: ObservableObject {
             sourceURL
         ]
 
-        guard let result = await runProcessCapture(
-            executableURL: paths.ytDlp,
+        guard let result = await runProcessCaptureForPreview(
+            executableURL: ytDlp,
             arguments: args,
-            environment: mergedEnvironment(prependingPath: ffmpegToolsDir),
+            environment: mergedEnvironmentForPreview(prependingPath: ffmpegToolsDir),
             currentDirectoryURL: ytDlpWorkDir,
             timeoutSeconds: 20
         ) else {
@@ -2456,7 +2462,104 @@ private extension StreamPipeline {
         }
     }
 
-    func parsePublishState(from object: [String: Any]) -> PublishState {
+    nonisolated private static func resolveToolForPreview(named name: String) -> URL? {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+
+        if let bundleURL = Bundle.main.resourceURL {
+            candidates.append(bundleURL.appendingPathComponent("bin/\(name)"))
+            candidates.append(bundleURL.appendingPathComponent(name))
+        }
+
+        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/\(name)"))
+        candidates.append(URL(fileURLWithPath: "/usr/local/bin/\(name)"))
+        candidates.append(URL(fileURLWithPath: "/usr/bin/\(name)"))
+
+        return candidates.first(where: { fm.isExecutableFile(atPath: $0.path) })
+    }
+
+    nonisolated private static func mergedEnvironmentForPreview(prependingPath: String) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        env["PATH"] = "\(prependingPath):\(existing)"
+        return env
+    }
+
+    nonisolated private static func runProcessCaptureForPreview(
+        executableURL: URL,
+        arguments: [String],
+        environment: [String: String],
+        currentDirectoryURL: URL,
+        timeoutSeconds: TimeInterval = 20
+    ) async -> (exitCode: Int32, stdoutData: Data, stderrData: Data)? {
+        let process = Process()
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.environment = environment
+        process.currentDirectoryURL = currentDirectoryURL
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let timeoutExitCode = Self.processTimeoutExitCode
+
+        return await withCheckedContinuation { continuation in
+            let stdoutHandle = stdout.fileHandleForReading
+            let stderrHandle = stderr.fileHandleForReading
+            let captureState = ProcessCaptureState(continuation: continuation)
+
+            stdoutHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                captureState.appendStdout(chunk)
+            }
+
+            stderrHandle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                guard !chunk.isEmpty else { return }
+                captureState.appendStderr(chunk)
+            }
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds) {
+                guard process.isRunning else { return }
+                stdoutHandle.readabilityHandler = nil
+                stderrHandle.readabilityHandler = nil
+                process.terminate()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.25) {
+                    if process.isRunning {
+                        process.interrupt()
+                    }
+                }
+                captureState.finish(
+                    exitCode: timeoutExitCode,
+                    stdoutHandle: stdoutHandle,
+                    stderrHandle: stderrHandle,
+                    drainRemaining: false
+                )
+            }
+
+            process.terminationHandler = { proc in
+                stdoutHandle.readabilityHandler = nil
+                stderrHandle.readabilityHandler = nil
+                captureState.finish(
+                    exitCode: proc.terminationStatus,
+                    stdoutHandle: stdoutHandle,
+                    stderrHandle: stderrHandle,
+                    drainRemaining: true
+                )
+            }
+        }
+    }
+
+    nonisolated private static func parsePublishState(from object: [String: Any]) -> PublishState {
         if let liveStatus = object["live_status"] as? String {
             switch liveStatus {
             case "is_live":
@@ -2485,7 +2588,7 @@ private extension StreamPipeline {
         return .unknown
     }
 
-    func parseTechnicalSummary(from object: [String: Any]) -> (resolution: String, fps: String, bitrate: String, codec: String) {
+    nonisolated private static func parseTechnicalSummary(from object: [String: Any]) -> (resolution: String, fps: String, bitrate: String, codec: String) {
         var width = intValue(from: object["width"])
         var height = intValue(from: object["height"])
         var fps = doubleValue(from: object["fps"])
@@ -2561,13 +2664,13 @@ private extension StreamPipeline {
         return (resolutionText, fpsText, bitrateText, codecText)
     }
 
-    func pixelCount(of format: [String: Any]) -> Int {
+    nonisolated private static func pixelCount(of format: [String: Any]) -> Int {
         let width = intValue(from: format["width"]) ?? 0
         let height = intValue(from: format["height"]) ?? 0
         return width * height
     }
 
-    func intValue(from raw: Any?) -> Int? {
+    nonisolated private static func intValue(from raw: Any?) -> Int? {
         if let int = raw as? Int {
             return int
         }
@@ -2580,7 +2683,7 @@ private extension StreamPipeline {
         return nil
     }
 
-    func doubleValue(from raw: Any?) -> Double? {
+    nonisolated private static func doubleValue(from raw: Any?) -> Double? {
         if let double = raw as? Double {
             return double
         }
@@ -2593,7 +2696,7 @@ private extension StreamPipeline {
         return nil
     }
 
-    func codecValue(from raw: Any?) -> String? {
+    nonisolated private static func codecValue(from raw: Any?) -> String? {
         guard let codec = raw as? String else { return nil }
         let trimmed = codec.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.lowercased() != "none" else { return nil }
