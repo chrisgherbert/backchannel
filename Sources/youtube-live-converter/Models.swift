@@ -25,7 +25,7 @@ struct StreamConfig {
     var outputType: OutputType = .rtmp
     var encodeMode: EncodeMode = .transcode
     var bufferSeconds: Int = 30
-    var useDiskBackedBuffer: Bool = false
+    var useDiskBackedBuffer: Bool = true
     var autoAVSync: Bool = true
     var avSyncOffsetMs: Int = 0
     var audioBoostEnabled: Bool = false

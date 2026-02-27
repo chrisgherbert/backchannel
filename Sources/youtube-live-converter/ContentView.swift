@@ -8,10 +8,12 @@ struct ContentView: View {
     @State private var autoLoadInfoTask: Task<Void, Never>?
     @State private var lastAutoLoadedSourceURL = ""
     @State private var selectedRtmpPresetID = ""
+    @State private var selectedSourcePresetID = ""
     @State private var selectedPanel: PanelTab = .status
     @AppStorage("show_inspector") private var showInspector = true
-    @AppStorage("log_monitoring_enabled") private var logMonitoringEnabled = true
+    @AppStorage(AppPreferenceKeys.logMonitoringEnabled) private var logMonitoringEnabled = true
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
+    @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
     private let bufferOptions = [0, 5, 15, 30, 60, 120]
     private let audioBoostOptions = [0, 5, 10, 20]
     private let autoLoadDebounceNs: UInt64 = 900_000_000
@@ -48,6 +50,7 @@ struct ContentView: View {
             pipeline.setLogMonitoringEnabled(logMonitoringEnabled)
             copyModePacingEnabled = config.encodeMode == .copyPaced
             syncSelectedRtmpPreset()
+            syncSelectedSourcePreset()
         }
         .onDisappear {
             autoLoadInfoTask?.cancel()
@@ -58,6 +61,7 @@ struct ContentView: View {
         }
         .onChange(of: config.sourceURL) { _ in
             scheduleAutoLoadInfo()
+            syncSelectedSourcePreset()
         }
         .onChange(of: config.encodeMode) { newValue in
             if newValue != .transcode {
@@ -79,8 +83,14 @@ struct ContentView: View {
         .onChange(of: selectedRtmpPresetID) { newValue in
             applyRtmpPresetSelection(newValue)
         }
+        .onChange(of: selectedSourcePresetID) { newValue in
+            applySourcePresetSelection(newValue)
+        }
         .onChange(of: rtmpPresetsJSON) { _ in
             syncSelectedRtmpPreset()
+        }
+        .onChange(of: sourcePresetsJSON) { _ in
+            syncSelectedSourcePreset()
         }
     }
 
@@ -113,11 +123,17 @@ struct ContentView: View {
             .frame(maxWidth: .infinity, alignment: .center)
 
             HStack(spacing: 8) {
-                Button("Start") { startStream() }
-                    .disabled(!canStart)
-                    .buttonStyle(.borderedProminent)
-                    .tint(.green)
-                    .controlSize(.regular)
+                if canStart {
+                    Button("Start") { startStream() }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.green)
+                        .controlSize(.regular)
+                } else {
+                    Button("Start") { startStream() }
+                        .disabled(true)
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                }
                 if pipeline.isRunning {
                     Button("Stop") { pipeline.stop() }
                         .buttonStyle(.borderedProminent)
@@ -154,7 +170,10 @@ struct ContentView: View {
                     .disabled(pipeline.isRunning)
                 }
             ) {
-                tabbedContentContainer(contextText: transportContextText) {
+                tabbedContentContainer(
+                    contextText: transportContextText,
+                    animatedSwapID: AnyHashable(config.outputType)
+                ) {
                     transportSectionFields
                 }
                 .disabled(pipeline.isRunning)
@@ -164,8 +183,8 @@ struct ContentView: View {
                 subtitle: "Choose passthrough vs compatibility processing",
                 headerAccessory: {
                     Picker("Mode", selection: outputModeBinding) {
-                        Text("Compat").tag(OutputModeSelection.highCompatibility)
-                        Text("Copy").tag(OutputModeSelection.streamCopy)
+                        Text("Compatible").tag(OutputModeSelection.highCompatibility)
+                        Text("Stream Copy").tag(OutputModeSelection.streamCopy)
                     }
                     .pickerStyle(.segmented)
                     .frame(width: 210)
@@ -173,7 +192,10 @@ struct ContentView: View {
                     .disabled(pipeline.isRunning)
                 }
             ) {
-                tabbedContentContainer(contextText: videoModeContextText) {
+                tabbedContentContainer(
+                    contextText: videoModeContextText,
+                    animatedSwapID: AnyHashable(selectedOutputMode)
+                ) {
                     videoModeSectionFields
                 }
                 .disabled(pipeline.isRunning)
@@ -199,7 +221,7 @@ struct ContentView: View {
 
     private var inspectorPanel: some View {
         sectionCard(title: "Monitoring", subtitle: "Operational status and advanced logs") {
-            tabbedContentContainer(contextText: monitoringContextText) {
+            tabbedContentContainer(contextText: monitoringContextText, animatedSwapID: nil) {
                 monitoringSectionContent
             }
         }
@@ -208,6 +230,19 @@ struct ContentView: View {
 
     private var inputSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
+            if !sourcePresets.isEmpty {
+                labeled("Preset") {
+                    Picker("Input Source Preset", selection: $selectedSourcePresetID) {
+                        Text("Custom").tag("")
+                        ForEach(sourcePresets) { preset in
+                            Text(preset.name).tag(preset.id)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 280, alignment: .leading)
+                }
+            }
+
             HStack {
                 TextField("https://www.youtube.com/watch?v=...", text: $config.sourceURL)
                     .textFieldStyle(.roundedBorder)
@@ -344,39 +379,43 @@ struct ContentView: View {
     private var videoModeSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
             if selectedOutputMode == .streamCopy {
-                labeled("Pace Output") {
+                labeledInline("Pace Output") {
                     HStack(spacing: 10) {
                         Toggle("Enable", isOn: pacedStreamCopyBinding)
                             .toggleStyle(.switch)
                             .labelsHidden()
+                            .controlSize(.small)
                         Text("Enable paced output")
-                            .font(.subheadline)
+                            .font(.caption)
                         Spacer()
                     }
                 }
             }
 
             if config.encodeMode == .transcode || pacedStreamCopyBinding.wrappedValue {
-                labeled("Buffer Delay") {
-                    Picker("Buffer Delay", selection: $config.bufferSeconds) {
+                labeledInline("Buffer Delay") {
+                    Picker("", selection: $config.bufferSeconds) {
                         ForEach(bufferOptions, id: \.self) { seconds in
                             Text(seconds == 0 ? "No buffer" : "\(seconds)s").tag(seconds)
                         }
                     }
                     .pickerStyle(.menu)
+                    .labelsHidden()
                     .frame(width: 140, alignment: .leading)
+                    .controlSize(.small)
                 }
             }
 
             if config.encodeMode == .transcode {
-                labeled("Buffer Storage") {
-                    HStack(spacing: 10) {
+                labeledInline("Buffer Storage") {
+                    HStack(spacing: 8) {
                         Toggle("Disk-backed", isOn: $config.useDiskBackedBuffer)
                             .toggleStyle(.switch)
                             .labelsHidden()
+                            .controlSize(.mini)
                             .disabled(config.bufferSeconds <= 0)
                         Text("Disk-backed buffer")
-                            .font(.subheadline)
+                            .font(.caption2)
                         Spacer()
                     }
                 }
@@ -385,25 +424,22 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
 
 
-                labeled("A/V Sync Offset") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Stepper(value: $config.avSyncOffsetMs, in: -2000...2000, step: 50) {
-                            Text("\(config.avSyncOffsetMs) ms")
-                                .monospacedDigit()
-                        }
-                        Text("Positive offsets delay audio; negative offsets delay video.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                labeledInline("A/V Sync Offset") {
+                    Stepper(value: $config.avSyncOffsetMs, in: -2000...2000, step: 50) {
+                        Text("\(config.avSyncOffsetMs) ms")
+                            .monospacedDigit()
                     }
+                    .controlSize(.small)
                 }
 
-                labeled("Audio Boost") {
-                    HStack(spacing: 10) {
+                labeledInline("Audio Boost") {
+                    HStack(spacing: 8) {
                         Toggle("Enable", isOn: $config.audioBoostEnabled)
                             .toggleStyle(.switch)
                             .labelsHidden()
+                            .controlSize(.mini)
                         Text("Enable")
-                            .font(.subheadline)
+                            .font(.caption2)
                         if config.audioBoostEnabled {
                             Picker("Boost", selection: $config.audioBoostDb) {
                                 ForEach(audioBoostOptions, id: \.self) { db in
@@ -412,6 +448,7 @@ struct ContentView: View {
                             }
                             .pickerStyle(.menu)
                             .frame(width: 110, alignment: .leading)
+                            .controlSize(.small)
                         }
                         Spacer()
                     }
@@ -487,12 +524,12 @@ struct ContentView: View {
             HStack(spacing: 10) {
                 Toggle("Extended Logging", isOn: $logMonitoringEnabled)
                     .toggleStyle(.switch)
-                    .font(.caption)
-                    .controlSize(.small)
+                    .font(.caption2)
+                    .controlSize(.mini)
                     .disabled(pipeline.isRunning)
                 if pipeline.isRunning {
                     Text("Applies on next start")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -555,6 +592,7 @@ struct ContentView: View {
 
     private func tabbedContentContainer<Content: View>(
         contextText: String,
+        animatedSwapID: AnyHashable? = nil,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -562,8 +600,18 @@ struct ContentView: View {
             Text(contextText)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 10) {
-                content()
+            Group {
+                if let animatedSwapID {
+                    VStack(alignment: .leading, spacing: 10) {
+                        content()
+                    }
+                    .id(animatedSwapID)
+                    .transition(.opacity)
+                } else {
+                    VStack(alignment: .leading, spacing: 10) {
+                        content()
+                    }
+                }
             }
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -576,6 +624,7 @@ struct ContentView: View {
                     .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
             )
         }
+        .animation(animatedSwapID == nil ? nil : .easeOut(duration: 0.22), value: animatedSwapID)
     }
 
     private func labeled<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
@@ -584,6 +633,18 @@ struct ContentView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             content()
+        }
+    }
+
+    private func labeledInline<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 104, alignment: .leading)
+                .padding(.top, 3)
+            content()
+            Spacer(minLength: 0)
         }
     }
 
@@ -651,6 +712,10 @@ struct ContentView: View {
 
     private var rtmpPresets: [RtmpPreset] {
         AppPreferencesCodec.decodePresets(from: rtmpPresetsJSON)
+    }
+
+    private var sourcePresets: [SourcePreset] {
+        AppPreferencesCodec.decodeSourcePresets(from: sourcePresetsJSON)
     }
 
     private var transportContextText: String {
@@ -955,12 +1020,63 @@ struct ContentView: View {
         }
     }
 
+    private func applySourcePresetSelection(_ id: String) {
+        guard !id.isEmpty else { return }
+        guard let preset = sourcePresets.first(where: { $0.id == id }) else { return }
+        guard config.sourceURL != preset.url else { return }
+        config.sourceURL = preset.url
+    }
+
+    private func syncSelectedSourcePreset() {
+        let url = sourceURLTrimmed
+        if url.isEmpty {
+            selectedSourcePresetID = ""
+            return
+        }
+
+        if let match = sourcePresets.first(where: {
+            $0.url.trimmingCharacters(in: .whitespacesAndNewlines) == url
+        }) {
+            selectedSourcePresetID = match.id
+        } else {
+            selectedSourcePresetID = ""
+        }
+    }
+
     private static func makeInitialConfig() -> StreamConfig {
         var config = StreamConfig()
-        let raw = UserDefaults.standard.string(forKey: AppPreferenceKeys.defaultEncodeMode) ?? ""
+        let defaults = UserDefaults.standard
+
+        let raw = defaults.string(forKey: AppPreferenceKeys.defaultEncodeMode) ?? ""
         if let mode = EncodeMode(rawValue: raw) {
             config.encodeMode = mode
         }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultBufferSeconds) != nil {
+            let seconds = defaults.integer(forKey: AppPreferenceKeys.defaultBufferSeconds)
+            let allowed = [0, 5, 15, 30, 60, 120]
+            config.bufferSeconds = allowed.contains(seconds) ? seconds : 30
+        }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultUseDiskBackedBuffer) != nil {
+            config.useDiskBackedBuffer = defaults.bool(forKey: AppPreferenceKeys.defaultUseDiskBackedBuffer)
+        }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultAVSyncOffsetMs) != nil {
+            let offset = defaults.integer(forKey: AppPreferenceKeys.defaultAVSyncOffsetMs)
+            config.avSyncOffsetMs = min(2000, max(-2000, offset))
+        }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultAudioBoostEnabled) != nil {
+            config.audioBoostEnabled = defaults.bool(forKey: AppPreferenceKeys.defaultAudioBoostEnabled)
+        }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultAudioBoostDb) != nil {
+            let db = defaults.integer(forKey: AppPreferenceKeys.defaultAudioBoostDb)
+            let allowedDb = [0, 5, 10, 20]
+            config.audioBoostDb = allowedDb.contains(db) ? db : 0
+        }
+
         return config
     }
 

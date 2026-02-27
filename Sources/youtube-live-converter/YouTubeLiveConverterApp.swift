@@ -5,11 +5,13 @@ import AppKit
 struct YouTubeLiveConverterApp: App {
     @StateObject private var pipeline = StreamPipeline()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
 
     var body: some Scene {
         WindowGroup {
             ContentView(pipeline: pipeline)
                 .frame(minWidth: 1080, minHeight: 700)
+                .preferredColorScheme(preferredColorScheme)
                 .onAppear {
                     appDelegate.pipeline = pipeline
                 }
@@ -17,6 +19,18 @@ struct YouTubeLiveConverterApp: App {
 
         Settings {
             SettingsView()
+        }
+    }
+
+    private var preferredColorScheme: ColorScheme? {
+        guard let mode = AppearanceMode(rawValue: appearanceModeRaw) else { return nil }
+        switch mode {
+        case .automatic:
+            return nil
+        case .light:
+            return .light
+        case .dark:
+            return .dark
         }
     }
 }
