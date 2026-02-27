@@ -70,6 +70,8 @@ final class StreamPipeline: ObservableObject {
     private var lastFfmpegProgressLogAt = Date.distantPast
     private var lastRelayReport: RelayBufferReport?
     private var lastRelayReportAt = Date.distantPast
+    private var pendingReprimeAfterRestart = false
+    private var startupReprimeActive = false
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
@@ -84,6 +86,8 @@ final class StreamPipeline: ObservableObject {
 
         forceSoftwareEncoderForSession = false
         freezeRestartTimestamps = []
+        pendingReprimeAfterRestart = false
+        startupReprimeActive = false
         startPipeline(config: config, paths: paths)
     }
 
@@ -132,6 +136,8 @@ final class StreamPipeline: ObservableObject {
         lastFfmpegProgressLogAt = Date.distantPast
         lastRelayReport = nil
         lastRelayReportAt = Date.distantPast
+        pendingReprimeAfterRestart = false
+        startupReprimeActive = false
     }
 
     private func startPipeline(config: StreamConfig, paths: ToolPaths) {
@@ -299,6 +305,9 @@ final class StreamPipeline: ObservableObject {
         let ytError = monitorLogs ? Pipe() : nil
         let ffError = monitorLogs ? Pipe() : nil
         let useStartupGate = supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0
+        let isReprimeLaunch = pendingReprimeAfterRestart && useStartupGate
+        startupReprimeActive = isReprimeLaunch
+        pendingReprimeAfterRestart = false
 
         ytDlp.standardOutput = mediaPipe
         if let ytError {
@@ -387,6 +396,9 @@ final class StreamPipeline: ObservableObject {
                 parsedStatus.outputState = "Buffering"
                 appendLog("[app] Pipeline started (startup gate active).")
                 appendLog("[app] Output publish will begin after \(config.bufferSeconds)s buffer fill.")
+                if isReprimeLaunch {
+                    appendLog("[app] Re-priming startup buffer after restart.")
+                }
                 if config.encodeMode == .transcode {
                     let storage = config.useDiskBackedBuffer ? "Disk" : "Memory"
                     appendLog("[app] Buffer storage: \(storage)")
@@ -498,6 +510,7 @@ final class StreamPipeline: ObservableObject {
             try ffmpeg.run()
             ffmpegProcess = ffmpeg
             parsedStatus.outputState = "Running"
+            startupReprimeActive = false
             appendLog("[app] Startup buffer filled. Publishing to destination.")
             if let inputPipe = stagedInputPipe {
                 await relay.attachSink(inputPipe.fileHandleForWriting)
@@ -612,11 +625,14 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func scheduleRestart(generation: Int) {
+    private func scheduleRestart(generation: Int, reason: RestartReason = .general) {
         guard generation == self.generation else { return }
         guard shouldKeepRunning else { return }
         guard !restartScheduled else { return }
 
+        if reason == .freeze {
+            pendingReprimeAfterRestart = true
+        }
         restartScheduled = true
         restartAttempts += 1
         let delay = min(pow(2.0, Double(restartAttempts)), 30.0)
@@ -1362,9 +1378,13 @@ final class StreamPipeline: ObservableObject {
 
         let total = config.bufferSeconds
         parsedStatus.outputState = "Buffering"
-        parsedStatus.bufferState = "Filling (target \(total)s)"
+        parsedStatus.bufferState = startupReprimeActive ? "Re-priming (target \(total)s)" : "Filling (target \(total)s)"
         parsedStatus.bufferProgress = 0
-        appendLog("[app] Buffer priming started (target \(total)s).")
+        if startupReprimeActive {
+            appendLog("[app] Buffer re-priming started (target \(total)s).")
+        } else {
+            appendLog("[app] Buffer priming started (target \(total)s).")
+        }
     }
 
     private func applyBufferReport(_ report: RelayBufferReport, config: StreamConfig) {
@@ -1407,7 +1427,9 @@ final class StreamPipeline: ObservableObject {
             let rounded = Int(bufferedSeconds.rounded())
             let remaining = max(0, config.bufferSeconds - rounded)
             if remaining > 0 {
-                parsedStatus.bufferState = "Filling (\(remaining)s remaining)"
+                parsedStatus.bufferState = startupReprimeActive
+                    ? "Re-priming (\(remaining)s remaining)"
+                    : "Filling (\(remaining)s remaining)"
             } else {
                 parsedStatus.bufferState = "Primed (\(config.bufferSeconds)s delay)"
             }
@@ -1456,7 +1478,7 @@ final class StreamPipeline: ObservableObject {
     private static let transientStallLogThreshold: TimeInterval = 2.5
     private static let outputFreezeLogThreshold: TimeInterval = 6.0
     private static let outputFreezeHeartbeatInterval: TimeInterval = 10.0
-    private static let outputFreezeRestartThreshold: TimeInterval = 8.0
+    private static let outputFreezeRestartThreshold: TimeInterval = 12.0
     private static let outputFreezeMonitorPollInterval: TimeInterval = 1.0
     private static let duplicationFreezeDupPerSecondThreshold: Double = 10.0
     private static let duplicationFreezeHeartbeatInterval: TimeInterval = 10.0
@@ -1596,10 +1618,15 @@ final class StreamPipeline: ObservableObject {
                     )
                     self.appendDiagnosticSnapshot(reason: "output-freeze-restart")
                     self.terminatePipeline()
-                    self.scheduleRestart(generation: self.generation)
+                    self.scheduleRestart(generation: self.generation, reason: .freeze)
                 }
             }
         }
+    }
+
+    private enum RestartReason {
+        case general
+        case freeze
     }
 
     private func startDiagnosticHeartbeatIfNeeded() {
@@ -2029,6 +2056,7 @@ private actor StartupGateRelay {
     private let minimumPaceBytesPerSecond: Double = 64_000 // 512 kbps floor
     private var bufferedChunks: [Chunk] = []
     private var readIndex = 0
+    private var readOffsetInChunk = 0
     private var unreadByteCount = 0
     private var totalIngestedBytes: UInt64 = 0
     private var firstIngestAt: Date?
@@ -2078,11 +2106,26 @@ private actor StartupGateRelay {
         var writes = 0
         while readIndex < bufferedChunks.count, remainingReleasable > 0 {
             let chunk = bufferedChunks[readIndex]
-            if chunk.data.count > remainingReleasable { break }
-            try? sink.write(contentsOf: chunk.data)
-            readIndex += 1
-            unreadByteCount = max(0, unreadByteCount - chunk.data.count)
-            remainingReleasable = max(0, remainingReleasable - chunk.data.count)
+            let availableInChunk = max(0, chunk.data.count - readOffsetInChunk)
+            if availableInChunk == 0 {
+                readIndex += 1
+                readOffsetInChunk = 0
+                continue
+            }
+
+            let count = min(availableInChunk, remainingReleasable)
+            if count <= 0 { break }
+            let end = readOffsetInChunk + count
+            let payload = chunk.data.subdata(in: readOffsetInChunk..<end)
+            try? sink.write(contentsOf: payload)
+
+            readOffsetInChunk = end
+            unreadByteCount = max(0, unreadByteCount - count)
+            remainingReleasable = max(0, remainingReleasable - count)
+            if readOffsetInChunk >= chunk.data.count {
+                readIndex += 1
+                readOffsetInChunk = 0
+            }
             writes += 1
             if writes >= 128 {
                 break
@@ -2094,7 +2137,7 @@ private actor StartupGateRelay {
             readIndex = 0
         }
 
-        if inputEnded && readIndex >= bufferedChunks.count {
+        if inputEnded && readIndex >= bufferedChunks.count && readOffsetInChunk == 0 {
             closeNow()
         }
 
@@ -2114,6 +2157,7 @@ private actor StartupGateRelay {
         sink = nil
         bufferedChunks.removeAll(keepingCapacity: false)
         readIndex = 0
+        readOffsetInChunk = 0
         unreadByteCount = 0
         totalIngestedBytes = 0
         firstIngestAt = nil
