@@ -87,11 +87,12 @@ struct ContentView: View {
     private var footerBar: some View {
         HStack(spacing: 8) {
             HStack(spacing: 8) {
-                badge("Session \(pipeline.status)", toneForStatus(pipeline.status))
-                badge("Source \(pipeline.parsedStatus.sourceState)", toneForStatus(pipeline.parsedStatus.sourceState))
-                badge("Output \(pipeline.parsedStatus.outputState)", toneForStatus(pipeline.parsedStatus.outputState))
-                if !pipeline.parsedStatus.reconnectDelay.isEmpty {
+                badge(footerPrimaryStateText, footerPrimaryStateTone)
+                if shouldShowRetryChip {
                     badge("Retry \(pipeline.parsedStatus.reconnectDelay)", .warning)
+                }
+                if let bufferChipText {
+                    badge(bufferChipText, bufferChipTone)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -773,6 +774,81 @@ struct ContentView: View {
 
     private var isLoadingSourceInfo: Bool {
         pipeline.previewStatus == "Loading source info..."
+    }
+
+    private var footerPrimaryStateText: String {
+        let source = pipeline.parsedStatus.sourceState.lowercased()
+        let output = pipeline.parsedStatus.outputState.lowercased()
+        let status = pipeline.status.lowercased()
+        let lastError = pipeline.parsedStatus.lastError.lowercased()
+
+        if output.contains("error") || source.contains("error") || status.contains("error") || status.contains("failed") ||
+            (lastError != "none" && !lastError.isEmpty) {
+            return "Error"
+        }
+        if status.contains("reconnect") {
+            return "Recovering"
+        }
+        if !pipeline.isRunning {
+            return "Idle"
+        }
+        if output.contains("buffering") || output.contains("starting") || source.contains("starting") {
+            return "Buffering"
+        }
+        if output.contains("publishing") || output.contains("running") {
+            return "Live"
+        }
+        return "Starting"
+    }
+
+    private var footerPrimaryStateTone: StatusTone {
+        switch footerPrimaryStateText {
+        case "Live":
+            return .good
+        case "Recovering", "Buffering", "Starting":
+            return .warning
+        case "Error":
+            return .critical
+        default:
+            return .neutral
+        }
+    }
+
+    private var shouldShowRetryChip: Bool {
+        let retry = pipeline.parsedStatus.reconnectDelay.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !retry.isEmpty && retry.lowercased() != "none"
+    }
+
+    private var bufferChipText: String? {
+        guard pipeline.isRunning else { return nil }
+        guard (config.encodeMode == .copyPaced || config.encodeMode == .transcode) && config.bufferSeconds > 0 else {
+            return nil
+        }
+        let state = pipeline.parsedStatus.bufferState.lowercased()
+        if state.contains("exhausted") {
+            return "Buffer Empty"
+        }
+        let seconds = Int((Double(config.bufferSeconds) * pipeline.parsedStatus.bufferProgress).rounded())
+        return "Buffer \(max(0, seconds))s"
+    }
+
+    private var bufferChipTone: StatusTone {
+        let state = pipeline.parsedStatus.bufferState.lowercased()
+        if state.contains("exhausted") {
+            return .critical
+        }
+        let targetSeconds = Double(config.bufferSeconds)
+        guard targetSeconds > 0 else { return .neutral }
+        let bufferedSeconds = max(0.0, min(targetSeconds, targetSeconds * pipeline.parsedStatus.bufferProgress))
+        let redThreshold = min(2.0, targetSeconds * 0.25)
+        let yellowThreshold = min(8.0, targetSeconds * 0.60)
+        if bufferedSeconds < redThreshold {
+            return .critical
+        }
+        if bufferedSeconds < yellowThreshold {
+            return .warning
+        }
+        return .good
     }
 
     private func loadInfo() {
