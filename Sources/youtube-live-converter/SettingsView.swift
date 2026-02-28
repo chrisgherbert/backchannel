@@ -20,6 +20,7 @@ struct SettingsView: View {
     @AppStorage(AppPreferenceKeys.defaultAVSyncOffsetMs) private var defaultAVSyncOffsetMs = 0
     @AppStorage(AppPreferenceKeys.defaultAudioBoostEnabled) private var defaultAudioBoostEnabled = false
     @AppStorage(AppPreferenceKeys.defaultAudioBoostDb) private var defaultAudioBoostDb = 0
+    @AppStorage(AppPreferenceKeys.defaultAudioContinuityEnabled) private var defaultAudioContinuityEnabled = true
     @AppStorage(AppPreferenceKeys.logMonitoringEnabled) private var defaultExtendedLogging = true
     @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
@@ -113,22 +114,11 @@ struct SettingsView: View {
                         Text("Default Mode")
                             .frame(width: 170, alignment: .leading)
                         Picker("", selection: defaultModeSelectionBinding) {
-                            Text("Compatible").tag(DefaultOutputModeSelection.compatible)
+                            Text("Compatible (DVR-to-Live)").tag(DefaultOutputModeSelection.compatible)
                             Text("Stream Copy").tag(DefaultOutputModeSelection.streamCopy)
                         }
                         .pickerStyle(.menu)
                         .labelsHidden()
-                        Spacer(minLength: 0)
-                    }
-
-                    HStack {
-                        Text("Paced Output")
-                            .frame(width: 170, alignment: .leading)
-                        Toggle("Enable", isOn: defaultPacedStreamCopyBinding)
-                            .labelsHidden()
-                            .toggleStyle(.switch)
-                            .controlSize(.small)
-                            .disabled(defaultModeSelection == .compatible)
                         Spacer(minLength: 0)
                     }
 
@@ -142,19 +132,24 @@ struct SettingsView: View {
                         }
                         .pickerStyle(.menu)
                         .labelsHidden()
+                        .disabled(defaultModeSelection != .compatible)
                         Spacer(minLength: 0)
                     }
 
                     HStack {
-                        Text("Disk-Backed Buffer")
+                        Text("DVR Disk Staging")
                             .frame(width: 170, alignment: .leading)
                         Toggle("Enable", isOn: $defaultUseDiskBackedBuffer)
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
-                            .disabled(defaultBufferSeconds <= 0)
+                            .disabled(defaultModeSelection != .compatible || defaultBufferSeconds <= 0)
                         Spacer(minLength: 0)
                     }
+
+                    Text("Compatible mode stages normalized media to a local DVR playlist before publish.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Audio/Video") {
@@ -166,6 +161,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                         }
                         .controlSize(.small)
+                        .disabled(defaultModeSelection != .compatible)
                         Spacer(minLength: 0)
                     }
 
@@ -176,6 +172,7 @@ struct SettingsView: View {
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
+                            .disabled(defaultModeSelection != .compatible)
                         if defaultAudioBoostEnabled {
                             Picker("", selection: $defaultAudioBoostDb) {
                                 ForEach(audioBoostOptions, id: \.self) { db in
@@ -184,7 +181,19 @@ struct SettingsView: View {
                             }
                             .pickerStyle(.menu)
                             .labelsHidden()
+                            .disabled(defaultModeSelection != .compatible)
                         }
+                        Spacer(minLength: 0)
+                    }
+
+                    HStack {
+                        Text("Audio Continuity")
+                            .frame(width: 170, alignment: .leading)
+                        Toggle("Enable", isOn: $defaultAudioContinuityEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .disabled(defaultModeSelection != .compatible)
                         Spacer(minLength: 0)
                     }
                 }
@@ -311,6 +320,9 @@ struct SettingsView: View {
     }
 
     private var defaultModeSelection: DefaultOutputModeSelection {
+        if defaultEncodeModeRaw == "Stream Copy (Paced)" {
+            return .streamCopy
+        }
         let mode = EncodeMode(rawValue: defaultEncodeModeRaw) ?? .transcode
         return mode == .transcode ? .compatible : .streamCopy
     }
@@ -323,25 +335,16 @@ struct SettingsView: View {
                 case .compatible:
                     defaultEncodeModeRaw = EncodeMode.transcode.rawValue
                 case .streamCopy:
-                    if defaultEncodeModeRaw == EncodeMode.transcode.rawValue {
-                        defaultEncodeModeRaw = EncodeMode.copy.rawValue
-                    }
+                    defaultEncodeModeRaw = EncodeMode.copy.rawValue
                 }
             }
         )
     }
 
-    private var defaultPacedStreamCopyBinding: Binding<Bool> {
-        Binding(
-            get: { defaultEncodeModeRaw == EncodeMode.copyPaced.rawValue },
-            set: { isEnabled in
-                guard defaultModeSelection == .streamCopy else { return }
-                defaultEncodeModeRaw = isEnabled ? EncodeMode.copyPaced.rawValue : EncodeMode.copy.rawValue
-            }
-        )
-    }
-
     private func sanitizeDefaults() {
+        if defaultEncodeModeRaw == "Stream Copy (Paced)" {
+            defaultEncodeModeRaw = EncodeMode.copy.rawValue
+        }
         if !bufferOptions.contains(defaultBufferSeconds) {
             defaultBufferSeconds = 30
         }
@@ -358,6 +361,7 @@ struct SettingsView: View {
         defaultAVSyncOffsetMs = 0
         defaultAudioBoostEnabled = false
         defaultAudioBoostDb = 0
+        defaultAudioContinuityEnabled = true
         defaultExtendedLogging = true
     }
 

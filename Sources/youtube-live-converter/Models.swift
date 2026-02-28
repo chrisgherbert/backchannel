@@ -9,7 +9,6 @@ enum OutputType: String, CaseIterable, Identifiable {
 
 enum EncodeMode: String, CaseIterable, Identifiable {
     case copy = "Stream Copy"
-    case copyPaced = "Stream Copy (Paced)"
     case transcode = "High Compatibility"
 
     var id: String { rawValue }
@@ -30,6 +29,7 @@ struct StreamConfig {
     var avSyncOffsetMs: Int = 0
     var audioBoostEnabled: Bool = false
     var audioBoostDb: Int = 0
+    var audioContinuityEnabled: Bool = true
 
     func resolvedOutputTarget() -> String {
         switch outputType {

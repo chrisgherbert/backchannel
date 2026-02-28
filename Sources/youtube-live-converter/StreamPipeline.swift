@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 @MainActor
 final class StreamPipeline: ObservableObject {
@@ -12,17 +13,17 @@ final class StreamPipeline: ObservableObject {
 
     private var ytDlpProcess: Process?
     private var ffmpegProcess: Process?
+    private var normalizerProcess: Process?
     private var ytDlpErrorPipe: Pipe?
     private var ffmpegErrorPipe: Pipe?
-    private var stagedMediaPipe: Pipe?
-    private var stagedInputPipe: Pipe?
-    private var startupRelay: AnyStartupRelay?
-    private var delayedFfmpegTask: Task<Void, Never>?
-    private var relayDrainTask: Task<Void, Never>?
-    private var relayReadTask: Task<Void, Never>?
+    private var normalizerErrorPipe: Pipe?
+    private var dvrBufferMonitorTask: Task<Void, Never>?
     private var outputFreezeMonitorTask: Task<Void, Never>?
     private var diagnosticHeartbeatTask: Task<Void, Never>?
     private var currentConfig: StreamConfig?
+    private var dvrSessionDirectory: URL?
+    private var dvrPlaylistURL: URL?
+    private var dvrSegmentPattern: String?
 
     private var shouldKeepRunning = false
     private var restartScheduled = false
@@ -30,6 +31,7 @@ final class StreamPipeline: ObservableObject {
     private var restartAttempts = 0
     private var toolPaths: ToolPaths?
     private var logMonitoringEnabled = true
+    private var cliLogMirroringEnabled = false
     private var forceSoftwareEncoderForSession = false
     private var freezeRestartTimestamps: [Date] = []
     private var bufferCountdownTask: Task<Void, Never>?
@@ -41,11 +43,17 @@ final class StreamPipeline: ObservableObject {
     private var lastFfmpegProgressAt = Date.distantPast
     private var hasSeenFfmpegProgress = false
     private var lowSpeedSince = Date.distantPast
+    private var lowSpeedHealthySince = Date.distantPast
     private var outputFreezeActive = false
     private var outputFreezeStartedAt = Date.distantPast
     private var lastOutputFreezeHeartbeatAt = Date.distantPast
     private var lastFfmpegDupCount: Int?
     private var lastFfmpegDupSampleAt = Date.distantPast
+    private var lastFfmpegFrameCount: Int?
+    private var lastVideoFrameAdvanceAt = Date.distantPast
+    private var videoCadenceFreezeActive = false
+    private var videoCadenceFreezeStartedAt = Date.distantPast
+    private var lastVideoCadenceHeartbeatAt = Date.distantPast
     private var duplicationFreezeActive = false
     private var duplicationFreezeStartedAt = Date.distantPast
     private var lastDuplicationAlertAt = Date.distantPast
@@ -67,11 +75,14 @@ final class StreamPipeline: ObservableObject {
     private var recentFfmpegDiagnosticLines: [String] = []
     private var lastDiagnosticSnapshotAt = Date.distantPast
     private var lastSpeedDriftLogAt = Date.distantPast
+    private var destinationBusyUntil = Date.distantPast
+    private var highSpeedSince = Date.distantPast
+    private var lastPublishStartedAt = Date.distantPast
+    private var publisherRestartScheduled = false
     private var lastFfmpegProgressLogAt = Date.distantPast
-    private var lastRelayReport: RelayBufferReport?
-    private var lastRelayReportAt = Date.distantPast
     private var pendingReprimeAfterRestart = false
     private var startupReprimeActive = false
+    private var catchUpExpiresAt = Date.distantPast
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
@@ -88,6 +99,11 @@ final class StreamPipeline: ObservableObject {
         freezeRestartTimestamps = []
         pendingReprimeAfterRestart = false
         startupReprimeActive = false
+        catchUpExpiresAt = Date.distantPast
+        destinationBusyUntil = Date.distantPast
+        highSpeedSince = Date.distantPast
+        lastPublishStartedAt = Date.distantPast
+        publisherRestartScheduled = false
         startPipeline(config: config, paths: paths)
     }
 
@@ -111,11 +127,17 @@ final class StreamPipeline: ObservableObject {
         freezeRecoveryTriggered = false
         hasSeenFfmpegProgress = false
         lowSpeedSince = Date.distantPast
+        lowSpeedHealthySince = Date.distantPast
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
         lastOutputFreezeHeartbeatAt = Date.distantPast
         lastFfmpegDupCount = nil
         lastFfmpegDupSampleAt = Date.distantPast
+        lastFfmpegFrameCount = nil
+        lastVideoFrameAdvanceAt = Date.distantPast
+        videoCadenceFreezeActive = false
+        videoCadenceFreezeStartedAt = Date.distantPast
+        lastVideoCadenceHeartbeatAt = Date.distantPast
         duplicationFreezeActive = false
         duplicationFreezeStartedAt = Date.distantPast
         lastDuplicationAlertAt = Date.distantPast
@@ -134,10 +156,19 @@ final class StreamPipeline: ObservableObject {
         lastDiagnosticSnapshotAt = Date.distantPast
         lastSpeedDriftLogAt = Date.distantPast
         lastFfmpegProgressLogAt = Date.distantPast
-        lastRelayReport = nil
-        lastRelayReportAt = Date.distantPast
         pendingReprimeAfterRestart = false
         startupReprimeActive = false
+        catchUpExpiresAt = Date.distantPast
+        destinationBusyUntil = Date.distantPast
+        highSpeedSince = Date.distantPast
+        lastPublishStartedAt = Date.distantPast
+        publisherRestartScheduled = false
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = nil
+        cleanupDvrSessionFiles()
+        dvrSessionDirectory = nil
+        dvrPlaylistURL = nil
+        dvrSegmentPattern = nil
     }
 
     private func startPipeline(config: StreamConfig, paths: ToolPaths) {
@@ -156,11 +187,17 @@ final class StreamPipeline: ObservableObject {
         lastFfmpegProgressAt = Date()
         hasSeenFfmpegProgress = false
         lowSpeedSince = Date.distantPast
+        lowSpeedHealthySince = Date.distantPast
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
         lastOutputFreezeHeartbeatAt = Date.distantPast
         lastFfmpegDupCount = nil
         lastFfmpegDupSampleAt = Date.distantPast
+        lastFfmpegFrameCount = nil
+        lastVideoFrameAdvanceAt = Date.distantPast
+        videoCadenceFreezeActive = false
+        videoCadenceFreezeStartedAt = Date.distantPast
+        lastVideoCadenceHeartbeatAt = Date.distantPast
         duplicationFreezeActive = false
         duplicationFreezeStartedAt = Date.distantPast
         lastDuplicationAlertAt = Date.distantPast
@@ -184,8 +221,10 @@ final class StreamPipeline: ObservableObject {
         lastDiagnosticSnapshotAt = Date.distantPast
         lastSpeedDriftLogAt = Date.distantPast
         lastFfmpegProgressLogAt = Date.distantPast
-        lastRelayReport = nil
-        lastRelayReportAt = Date.distantPast
+        destinationBusyUntil = Date.distantPast
+        highSpeedSince = Date.distantPast
+        lastPublishStartedAt = Date.distantPast
+        publisherRestartScheduled = false
 
         launchPipeline()
     }
@@ -212,6 +251,10 @@ final class StreamPipeline: ObservableObject {
             parsedStatus.ffmpegBitrate = ""
             parsedStatus.ffmpegSpeed = ""
         }
+    }
+
+    func setCliLogMirroringEnabled(_ enabled: Bool) {
+        cliLogMirroringEnabled = enabled
     }
 
     func loadPreview(for sourceURL: String) {
@@ -306,9 +349,9 @@ final class StreamPipeline: ObservableObject {
         let monitorLogs = logMonitoringEnabled
         let ytError = monitorLogs ? Pipe() : nil
         let ffError = monitorLogs ? Pipe() : nil
-        let useStartupGate = supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0
-        let isReprimeLaunch = pendingReprimeAfterRestart && useStartupGate
-        startupReprimeActive = isReprimeLaunch
+        let normalizerError = (monitorLogs && config.encodeMode == .transcode) ? Pipe() : nil
+        let useDvrPipeline = config.encodeMode == .transcode
+        startupReprimeActive = false
         pendingReprimeAfterRestart = false
 
         ytDlp.standardOutput = mediaPipe
@@ -320,6 +363,7 @@ final class StreamPipeline: ObservableObject {
 
         ytDlpErrorPipe = ytError
         ffmpegErrorPipe = ffError
+        normalizerErrorPipe = normalizerError
 
         resetPerLaunchState(config: config)
 
@@ -328,6 +372,9 @@ final class StreamPipeline: ObservableObject {
         }
         if let ffError {
             observe(pipe: ffError, source: "ffmpeg", generation: currentGeneration)
+        }
+        if let normalizerError {
+            observe(pipe: normalizerError, source: "ffmpeg-normalizer", generation: currentGeneration)
         }
 
         ytDlp.terminationHandler = { [weak self] proc in
@@ -341,98 +388,79 @@ final class StreamPipeline: ObservableObject {
         }
 
         do {
-            var relayForGate: AnyStartupRelay?
+            let ffmpeg: Process
+            var normalizer: Process?
             let ffmpegInput: Pipe
-            if useStartupGate {
-                let relay: AnyStartupRelay
-                if config.encodeMode == .transcode && config.useDiskBackedBuffer {
-                    relay = try makeDiskBackedRelay(delaySeconds: Double(config.bufferSeconds))
-                } else {
-                    relay = AnyStartupRelay(StartupGateRelay(delaySeconds: Double(config.bufferSeconds)))
-                }
-                relayForGate = relay
-                startupRelay = relay
-                stagedMediaPipe = mediaPipe
-                let delayedInput = Pipe()
-                stagedInputPipe = delayedInput
-                ffmpegInput = delayedInput
-
-                let relaySourceHandle = mediaPipe.fileHandleForReading
-                let relayReadChunkSize = Self.relayReadChunkSize
-                relayReadTask?.cancel()
-                relayReadTask = Task.detached(priority: .userInitiated) {
-                    while !Task.isCancelled {
-                        do {
-                            let data = try relaySourceHandle.read(upToCount: relayReadChunkSize) ?? Data()
-                            if data.isEmpty {
-                                await relay.finishInput()
-                                break
-                            }
-                            await relay.ingest(data)
-                        } catch {
-                            await relay.finishInput()
-                            break
-                        }
-                    }
-                }
+            if useDvrPipeline {
+                let dvr = try makeDvrSessionDirectory()
+                dvrSessionDirectory = dvr.directory
+                dvrPlaylistURL = dvr.playlistURL
+                dvrSegmentPattern = dvr.segmentPattern
+                ffmpegInput = Pipe()
+                let norm = makeDvrNormalizerProcess(
+                    paths: paths,
+                    config: config,
+                    generation: currentGeneration,
+                    normalizerError: normalizerError,
+                    input: mediaPipe,
+                    playlistURL: dvr.playlistURL,
+                    segmentPattern: dvr.segmentPattern,
+                    ffmpegToolsDir: ffmpegToolsDir
+                )
+                normalizer = norm
+                ffmpeg = makeDvrPublisherProcess(
+                    paths: paths,
+                    config: config,
+                    generation: currentGeneration,
+                    ffError: ffError,
+                    playlistURL: dvr.playlistURL,
+                    ffmpegToolsDir: ffmpegToolsDir
+                )
             } else {
                 ffmpegInput = mediaPipe
+                ffmpeg = makeFFmpegProcess(
+                    paths: paths,
+                    config: config,
+                    generation: currentGeneration,
+                    ffError: ffError,
+                    input: ffmpegInput,
+                    ffmpegToolsDir: ffmpegToolsDir
+                )
             }
-
-            let ffmpeg = makeFFmpegProcess(
-                paths: paths,
-                config: config,
-                generation: currentGeneration,
-                ffError: ffError,
-                input: ffmpegInput,
-                ffmpegToolsDir: ffmpegToolsDir
-            )
 
             try ytDlp.run()
             ytDlpProcess = ytDlp
 
-            if useStartupGate {
+            if useDvrPipeline {
                 isRunning = true
                 status = "Running"
                 parsedStatus.sourceState = "Running"
                 parsedStatus.outputState = "Buffering"
-                appendLog("[app] Pipeline started (startup gate active).")
-                appendLog("[app] Output publish will begin after \(config.bufferSeconds)s buffer fill.")
-                if isReprimeLaunch {
-                    appendLog("[app] Re-priming startup buffer after restart.")
+                appendLog("[app] Pipeline started (dvr-to-live staging active).")
+                if config.bufferSeconds > 0 {
+                    appendLog("[app] Output publish will begin after \(config.bufferSeconds)s staged media fill.")
+                } else {
+                    appendLog("[app] Output publish will begin as soon as staged playlist is ready.")
                 }
-                if config.encodeMode == .transcode {
-                    let storage = config.useDiskBackedBuffer ? "Disk" : "Memory"
-                    appendLog("[app] Buffer storage: \(storage)")
+                if let normalizer {
+                    try normalizer.run()
+                    normalizerProcess = normalizer
+                    appendLog("[app] Normalizer started. Writing staged DVR playlist.")
                 }
-                delayedFfmpegTask = Task { [weak self] in
-                    guard let self, let relay = relayForGate else { return }
-                    let targetDelay = Double(config.bufferSeconds)
-                    while !Task.isCancelled {
-                        guard self.shouldKeepRunning, currentGeneration == self.generation else { return }
-
-                        let report = await relay.drainReady()
-                        await MainActor.run {
-                            self.applyBufferReport(report, config: config)
-                        }
-
-                        if report.isInputEnded || report.bufferedDelaySeconds >= targetDelay {
-                            break
-                        }
-
-                        try? await Task.sleep(nanoseconds: 200_000_000)
-                    }
-
-                    guard self.shouldKeepRunning, currentGeneration == self.generation else { return }
-                    await self.startBufferedPublisher(
-                        ffmpeg: ffmpeg,
-                        relay: relay,
-                        generation: currentGeneration
-                    )
-                }
+                startDvrBufferMonitorAndPublisher(
+                    publisher: ffmpeg,
+                    config: config,
+                    generation: currentGeneration
+                )
             } else {
+                if let normalizer {
+                    try normalizer.run()
+                    normalizerProcess = normalizer
+                }
                 try ffmpeg.run()
                 ffmpegProcess = ffmpeg
+                lastPublishStartedAt = Date()
+                highSpeedSince = Date.distantPast
 
                 isRunning = true
                 status = "Running"
@@ -445,9 +473,14 @@ final class StreamPipeline: ObservableObject {
             appendLog("[app] Using ffmpeg: \(paths.ffmpeg.path)")
             appendLog("[app] Using ffprobe: \(paths.ffprobe.path)")
             appendSessionConfigurationLog(config)
+            if isCatchUpActive() {
+                let remaining = max(1, Int(catchUpExpiresAt.timeIntervalSinceNow.rounded()))
+                appendLog("[app] Catch-up mode active (\(remaining)s remaining): realtime pacing (-re) disabled.")
+            }
             if config.encodeMode == .transcode {
                 let encoder = paths.supportsVideoToolboxH264 ? "h264_videotoolbox (hardware)" : "libx264 (software)"
                 appendLog("[app] High compatibility video encoder: \(encoder)")
+                appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged DVR -> publish).")
             }
             if let deno = paths.deno {
                 appendLog("[app] Using deno: \(deno.path)")
@@ -462,17 +495,6 @@ final class StreamPipeline: ObservableObject {
             terminatePipeline()
             scheduleRestart(generation: currentGeneration)
         }
-    }
-
-    private func makeDiskBackedRelay(delaySeconds: TimeInterval) throws -> AnyStartupRelay {
-        let relayDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("youtube-live-converter-relay", isDirectory: true)
-        try FileManager.default.createDirectory(at: relayDirectory, withIntermediateDirectories: true)
-        let relay = try DiskBackedStartupRelay(
-            delaySeconds: delaySeconds,
-            tempDirectory: relayDirectory
-        )
-        return AnyStartupRelay(relay)
     }
 
     private func makeFFmpegProcess(
@@ -506,45 +528,158 @@ final class StreamPipeline: ObservableObject {
         return ffmpeg
     }
 
-    private func startBufferedPublisher(ffmpeg: Process, relay: AnyStartupRelay, generation: Int) async {
-        guard shouldKeepRunning, generation == self.generation else { return }
-        do {
-            try ffmpeg.run()
-            ffmpegProcess = ffmpeg
-            parsedStatus.outputState = "Running"
-            startupReprimeActive = false
-            appendLog("[app] Startup buffer filled. Publishing to destination.")
-            if let inputPipe = stagedInputPipe {
-                await relay.attachSink(inputPipe.fileHandleForWriting)
-                relayDrainTask?.cancel()
-                relayDrainTask = Task { [weak self] in
-                    while let self, !Task.isCancelled {
-                        let report = await relay.drainReady()
-                        if let config = self.currentConfig {
-                            self.applyBufferReport(report, config: config)
-                        }
-                        try? await Task.sleep(nanoseconds: 20_000_000)
-                        if !self.shouldKeepRunning {
+    private struct DvrSession {
+        let directory: URL
+        let playlistURL: URL
+        let segmentPattern: String
+    }
+
+    private func makeDvrSessionDirectory() throws -> DvrSession {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("youtube-live-converter-dvr", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sessionDir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        let playlistURL = sessionDir.appendingPathComponent("staged.m3u8")
+        let segmentPattern = sessionDir.appendingPathComponent("seg-%09d.ts").path
+        return DvrSession(directory: sessionDir, playlistURL: playlistURL, segmentPattern: segmentPattern)
+    }
+
+    private func makeDvrNormalizerProcess(
+        paths: ToolPaths,
+        config: StreamConfig,
+        generation: Int,
+        normalizerError: Pipe?,
+        input: Pipe,
+        playlistURL: URL,
+        segmentPattern: String,
+        ffmpegToolsDir: String
+    ) -> Process {
+        let normalizer = Process()
+        normalizer.executableURL = paths.ffmpeg
+        normalizer.arguments = normalizerToDvrArguments(
+            for: config,
+            playlistURL: playlistURL,
+            segmentPattern: segmentPattern
+        )
+        normalizer.environment = mergedEnvironment(prependingPath: ffmpegToolsDir)
+        normalizer.standardInput = input
+        normalizer.standardOutput = FileHandle.nullDevice
+        if let normalizerError {
+            normalizer.standardError = normalizerError
+        } else {
+            normalizer.standardError = FileHandle.nullDevice
+        }
+        normalizer.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                self?.handleTermination(
+                    generation: generation,
+                    source: "normalizer",
+                    status: proc.terminationStatus
+                )
+            }
+        }
+        return normalizer
+    }
+
+    private func makeDvrPublisherProcess(
+        paths: ToolPaths,
+        config: StreamConfig,
+        generation: Int,
+        ffError: Pipe?,
+        playlistURL: URL,
+        ffmpegToolsDir: String
+    ) -> Process {
+        let ffmpeg = Process()
+        ffmpeg.executableURL = paths.ffmpeg
+        ffmpeg.arguments = dvrPublisherArguments(for: config, playlistURL: playlistURL)
+        ffmpeg.environment = mergedEnvironment(prependingPath: ffmpegToolsDir)
+        ffmpeg.standardInput = FileHandle.nullDevice
+        ffmpeg.standardOutput = FileHandle.nullDevice
+        if let ffError {
+            ffmpeg.standardError = ffError
+        } else {
+            ffmpeg.standardError = FileHandle.nullDevice
+        }
+        ffmpeg.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                self?.handleTermination(
+                    generation: generation,
+                    source: "ffmpeg",
+                    status: proc.terminationStatus
+                )
+            }
+        }
+        return ffmpeg
+    }
+
+    private func startDvrBufferMonitorAndPublisher(
+        publisher: Process,
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let playlistURL = self.dvrPlaylistURL else { return }
+            let targetDelay = max(0.0, Double(config.bufferSeconds))
+            var startedPublishing = false
+
+            while !Task.isCancelled {
+                guard self.shouldKeepRunning, generation == self.generation else { return }
+
+                let playlistDuration = self.readPlaylistDurationSeconds(from: playlistURL)
+                let outputSeconds = self.parseClockToSeconds(self.parsedStatus.ffmpegTime) ?? 0
+                let availableSeconds = max(0.0, playlistDuration - outputSeconds)
+                self.updateDvrBufferState(
+                    config: config,
+                    availableSeconds: availableSeconds,
+                    targetDelay: targetDelay,
+                    publishingStarted: startedPublishing
+                )
+
+                if !startedPublishing {
+                    let reachedTarget = targetDelay <= 0 || playlistDuration >= targetDelay
+                    let canStartEarlyOnEnd = self.ytDlpProcess?.isRunning != true && playlistDuration > 0.5
+                    if reachedTarget || canStartEarlyOnEnd {
+                        do {
+                            try publisher.run()
+                            self.ffmpegProcess = publisher
+                            self.lastPublishStartedAt = Date()
+                            self.highSpeedSince = Date.distantPast
+                            self.publisherRestartScheduled = false
+                            self.parsedStatus.outputState = "Publishing"
+                            self.startupReprimeActive = false
+                            self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            startedPublishing = true
+                        } catch {
+                            let nsError = error as NSError
+                            self.appendLog(
+                                "[app] Failed to start publisher after buffer fill: \(error.localizedDescription) [domain=\(nsError.domain) code=\(nsError.code)]"
+                            )
+                            self.terminatePipeline()
+                            self.scheduleRestart(generation: generation)
                             return
                         }
                     }
                 }
+
+                try? await Task.sleep(nanoseconds: 250_000_000)
             }
-        } catch {
-            appendLog("[app] Failed to start publisher after buffer fill: \(error.localizedDescription)")
-            scheduleRestart(generation: generation)
         }
     }
 
     private func terminatePipeline() {
-        ytDlpProcess?.terminationHandler = nil
-        ffmpegProcess?.terminationHandler = nil
-        delayedFfmpegTask?.cancel()
-        delayedFfmpegTask = nil
-        relayDrainTask?.cancel()
-        relayDrainTask = nil
-        relayReadTask?.cancel()
-        relayReadTask = nil
+        let ytProcess = ytDlpProcess
+        let outProcess = ffmpegProcess
+        let normProcess = normalizerProcess
+
+        ytProcess?.terminationHandler = nil
+        outProcess?.terminationHandler = nil
+        normProcess?.terminationHandler = nil
+        publisherRestartScheduled = false
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = nil
         outputFreezeMonitorTask?.cancel()
         outputFreezeMonitorTask = nil
         diagnosticHeartbeatTask?.cancel()
@@ -552,26 +687,36 @@ final class StreamPipeline: ObservableObject {
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
 
-        if ytDlpProcess?.isRunning == true {
-            ytDlpProcess?.terminate()
-        }
-        if ffmpegProcess?.isRunning == true {
-            ffmpegProcess?.terminate()
-        }
+        terminateProcessIfRunning(ytProcess, label: "yt-dlp")
+        terminateProcessIfRunning(outProcess, label: "ffmpeg")
+        terminateProcessIfRunning(normProcess, label: "normalizer")
 
         ytDlpProcess = nil
         ffmpegProcess = nil
-        stagedMediaPipe?.fileHandleForReading.readabilityHandler = nil
-        stagedMediaPipe = nil
-        if let relay = startupRelay {
-            Task { await relay.closeNow() }
-        }
-        startupRelay = nil
-        stagedInputPipe = nil
+        normalizerProcess = nil
+        cleanupDvrSessionFiles()
+        dvrSessionDirectory = nil
+        dvrPlaylistURL = nil
+        dvrSegmentPattern = nil
         ytDlpErrorPipe?.fileHandleForReading.readabilityHandler = nil
         ffmpegErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        normalizerErrorPipe?.fileHandleForReading.readabilityHandler = nil
         ytDlpErrorPipe = nil
         ffmpegErrorPipe = nil
+        normalizerErrorPipe = nil
+    }
+
+    private func terminateProcessIfRunning(_ process: Process?, label: String) {
+        guard let process, process.isRunning else { return }
+        process.terminate()
+        let pid = process.processIdentifier
+        DispatchQueue.global().asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard process.isRunning else { return }
+            _ = Darwin.kill(pid_t(pid), SIGKILL)
+            Task { @MainActor in
+                self?.appendLog("[app] Force-killed lingering \(label) process (pid \(pid)).")
+            }
+        }
     }
 
     private func handleTermination(generation: Int, source: String, status: Int32) {
@@ -613,6 +758,15 @@ final class StreamPipeline: ObservableObject {
                 }
                 return
             }
+        } else if source == "normalizer" {
+            normalizerProcess = nil
+            normalizerErrorPipe?.fileHandleForReading.readabilityHandler = nil
+            normalizerErrorPipe = nil
+
+            if pendingRestartAfterDrain {
+                // Source has already ended; let publisher drain and own restart timing.
+                return
+            }
         }
 
         terminatePipeline()
@@ -637,7 +791,9 @@ final class StreamPipeline: ObservableObject {
         }
         restartScheduled = true
         restartAttempts += 1
-        let delay = min(pow(2.0, Double(restartAttempts)), 30.0)
+        let baseDelay = min(pow(2.0, Double(restartAttempts)), 30.0)
+        let destinationBusyDelay = max(0, destinationBusyUntil.timeIntervalSinceNow)
+        let delay = max(baseDelay, destinationBusyDelay)
         let reasonLabel = restartReasonLabel(reason)
 
         status = "Reconnecting (\(Int(delay))s)"
@@ -658,16 +814,87 @@ final class StreamPipeline: ObservableObject {
         launchPipeline()
     }
 
+    private func schedulePublisherOnlyRestart(
+        generation: Int,
+        reason: String,
+        delay: TimeInterval = 1.5
+    ) {
+        guard !publisherRestartScheduled else { return }
+        guard shouldKeepRunning, generation == self.generation else { return }
+        guard let config = currentConfig,
+              config.encodeMode == .transcode else {
+            appendLog("[app] Publisher-only restart unavailable; falling back to full pipeline restart.")
+            terminatePipeline()
+            scheduleRestart(generation: generation, reason: .general)
+            return
+        }
+
+        publisherRestartScheduled = true
+        parsedStatus.outputState = "Reconnecting Output"
+        appendLog("[app] Restarting publisher stage (\(reason)).")
+
+        ffmpegProcess?.terminationHandler = nil
+        terminateProcessIfRunning(ffmpegProcess, label: "ffmpeg")
+        ffmpegProcess = nil
+        ffmpegErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        ffmpegErrorPipe = nil
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard self.shouldKeepRunning, generation == self.generation else {
+                self.publisherRestartScheduled = false
+                return
+            }
+            guard let paths = self.toolPaths,
+                  let playlistURL = self.dvrPlaylistURL else {
+                self.publisherRestartScheduled = false
+                self.appendLog("[app] Publisher restart prerequisites missing; doing full restart.")
+                self.terminatePipeline()
+                self.scheduleRestart(generation: generation, reason: .general)
+                return
+            }
+
+            let ffError = Pipe()
+            self.ffmpegErrorPipe = ffError
+            if self.logMonitoringEnabled {
+                self.observe(pipe: ffError, source: "ffmpeg", generation: generation)
+            }
+            let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
+            let publisher = self.makeDvrPublisherProcess(
+                paths: paths,
+                config: config,
+                generation: generation,
+                ffError: ffError,
+                playlistURL: playlistURL,
+                ffmpegToolsDir: ffmpegToolsDir
+            )
+            do {
+                try publisher.run()
+                self.ffmpegProcess = publisher
+                self.lastPublishStartedAt = Date()
+                self.highSpeedSince = Date.distantPast
+                self.parsedStatus.outputState = "Publishing"
+                self.appendLog("[app] Publisher restarted from staged DVR playlist.")
+            } catch {
+                self.appendLog("[app] Publisher restart failed: \(error.localizedDescription)")
+                self.terminatePipeline()
+                self.scheduleRestart(generation: generation, reason: .general)
+            }
+            self.publisherRestartScheduled = false
+        }
+    }
+
     private func ffmpegArguments(for config: StreamConfig) -> [String] {
         let syncOffsetMs = config.avSyncOffsetMs
         let extraAudioDelayMs = max(0, syncOffsetMs)
         let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
-        // Startup buffering is handled by relay gating; filters should only apply A/V sync offsets.
+        // Startup buffering is handled by staged DVR playout; filters should only apply A/V sync offsets.
         let totalVideoDelaySeconds = extraVideoDelaySeconds
         let totalAudioDelayMs = extraAudioDelayMs
         var audioFilters: [String] = []
         var inputArgs: [String] = []
-        if config.encodeMode == .copy || config.encodeMode == .copyPaced {
+        if config.encodeMode == .copy {
             // Be more tolerant of HLS discontinuities and timestamp issues in copy-based modes.
             inputArgs += ["-fflags", "+genpts+discardcorrupt+igndts+sortdts", "-err_detect", "ignore_err"]
         }
@@ -679,10 +906,6 @@ final class StreamPipeline: ObservableObject {
                 "-err_detect", "ignore_err"
             ]
         }
-        if config.encodeMode == .copyPaced {
-            // Keep copy mode stable while smoothing bursty input pacing.
-            inputArgs += ["-thread_queue_size", "8192"]
-        }
         var args = [
             "-hide_banner",
             "-loglevel",
@@ -692,8 +915,8 @@ final class StreamPipeline: ObservableObject {
             "-progress",
             "pipe:2"
         ]
-        if supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0 {
-            // Keep publish pacing close to realtime even when relay backlog is healthy.
+        if config.encodeMode == .transcode {
+            // Keep publisher egress deterministic for receiver compatibility.
             args += ["-re"]
         }
         args += inputArgs
@@ -705,18 +928,15 @@ final class StreamPipeline: ObservableObject {
         switch config.encodeMode {
         case .copy:
             args += ["-c:v", "copy", "-c:a", "copy"]
-        case .copyPaced:
-            args += [
-                "-fps_mode", "passthrough",
-                "-c:v", "copy",
-                "-c:a", "copy"
-            ]
         case .transcode:
             // Rebuild a stable monotonic A/V timeline in compatibility mode.
-            audioFilters.append("aresample=48000:async=1000:min_hard_comp=0.050:first_pts=0")
-            audioFilters.append("asetpts=PTS-STARTPTS")
-            let targetFps = 30
-            var videoSetptsExpr = "PTS-STARTPTS"
+            // Keep correction gentle to avoid audible pitch warble on long sessions.
+            let asyncDepth = config.audioContinuityEnabled ? "1000" : "1"
+            audioFilters.append("aresample=48000:async=\(asyncDepth):min_hard_comp=0.100:comp_duration=1.5:max_soft_comp=0.050:first_pts=0")
+            audioFilters.append("asetpts=N/SR/TB")
+            let targetFps = resolvedTargetFPS()
+            // Build video timing from frame count to avoid inheriting source PTS discontinuities.
+            var videoSetptsExpr = "N/\(targetFps)/TB"
             if totalVideoDelaySeconds > 0 {
                 let delay = String(format: "%.3f", totalVideoDelaySeconds)
                 videoSetptsExpr += "+\(delay)/TB"
@@ -786,11 +1006,12 @@ final class StreamPipeline: ObservableObject {
         }
 
         if config.outputType == .rtmp {
-            if config.encodeMode == .copy || config.encodeMode == .copyPaced {
+            if config.encodeMode == .copy {
                 // Improve RTMP receiver compatibility when remuxing bursty MPEG-TS input.
                 args += ["-bsf:v", "extract_extradata"]
             }
-            // Keep muxing latency/interleave tight so audio/video stay closer under jitter.
+            // Keep muxing latency low but not ultra-tight; more tolerant settings work better
+            // across ingest stacks based on ffmpeg/vlc derivatives.
             args += [
                 "-flvflags", "no_duration_filesize",
                 "-fflags", "+flush_packets",
@@ -819,8 +1040,212 @@ final class StreamPipeline: ObservableObject {
         return args
     }
 
+    private func normalizerArguments(for config: StreamConfig) -> [String] {
+        let syncOffsetMs = config.avSyncOffsetMs
+        let extraAudioDelayMs = max(0, syncOffsetMs)
+        let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
+        let totalVideoDelaySeconds = extraVideoDelaySeconds
+        let totalAudioDelayMs = extraAudioDelayMs
+        var audioFilters: [String] = []
+
+        var args = [
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-stats_period",
+            "1",
+            "-progress",
+            "pipe:2",
+            "-thread_queue_size",
+            "8192",
+            "-fflags",
+            "+genpts+discardcorrupt+igndts+sortdts",
+            "-err_detect",
+            "ignore_err",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?"
+        ]
+
+        // Rebuild a stable monotonic A/V timeline in compatibility mode.
+        let asyncDepth = config.audioContinuityEnabled ? "1000" : "1"
+        audioFilters.append("aresample=48000:async=\(asyncDepth):min_hard_comp=0.100:comp_duration=1.5:max_soft_comp=0.050:first_pts=0")
+        audioFilters.append("asetpts=N/SR/TB")
+        let targetFps = resolvedTargetFPS()
+        var videoSetptsExpr = "N/\(targetFps)/TB"
+        if totalVideoDelaySeconds > 0 {
+            let delay = String(format: "%.3f", totalVideoDelaySeconds)
+            videoSetptsExpr += "+\(delay)/TB"
+        }
+        let videoFilter = "fps=\(targetFps),settb=AVTB,setpts=\(videoSetptsExpr)"
+        let useVideoToolbox = (toolPaths?.supportsVideoToolboxH264 == true) && !forceSoftwareEncoderForSession
+        if useVideoToolbox {
+            args += [
+                "-fps_mode", "cfr",
+                "-vsync", "cfr",
+                "-r", "\(targetFps)",
+                "-c:v", "h264_videotoolbox",
+                "-allow_sw", "1",
+                "-realtime", "1",
+                "-pix_fmt", "yuv420p",
+                "-g", "30",
+                "-keyint_min", "30",
+                "-bf", "0",
+                "-b:v", "3500k",
+                "-maxrate", "4500k",
+                "-bufsize", "9000k",
+                "-profile:v", "baseline",
+                "-force_key_frames", "expr:gte(t,n_forced*1)",
+                "-vf", videoFilter,
+                "-c:a", "aac",
+                "-ar", "48000",
+                "-ac", "2",
+                "-b:a", "128k"
+            ]
+        } else {
+            args += [
+                "-fps_mode", "cfr",
+                "-vsync", "cfr",
+                "-r", "\(targetFps)",
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-tune", "zerolatency",
+                "-crf", "27",
+                "-x264-params", "force-cfr=1:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1",
+                "-pix_fmt", "yuv420p",
+                "-g", "30",
+                "-keyint_min", "30",
+                "-sc_threshold", "0",
+                "-profile:v", "baseline",
+                "-force_key_frames", "expr:gte(t,n_forced*1)",
+                "-vf", videoFilter,
+                "-c:a", "aac",
+                "-ar", "48000",
+                "-ac", "2",
+                "-b:a", "128k"
+            ]
+        }
+
+        if totalAudioDelayMs > 0 {
+            audioFilters.append("adelay=\(totalAudioDelayMs)|\(totalAudioDelayMs)")
+        }
+        if config.audioBoostEnabled {
+            let boostDb = config.audioBoostDb
+            if boostDb > 0 {
+                audioFilters.append("volume=\(boostDb)dB")
+            }
+            audioFilters.append("alimiter=limit=0.891251")
+        }
+        if !audioFilters.isEmpty {
+            args += ["-af", audioFilters.joined(separator: ",")]
+        }
+
+        args += [
+            "-muxdelay", "0",
+            "-muxpreload", "0",
+            "-f", "mpegts",
+            "pipe:1"
+        ]
+        return args
+    }
+
+    private func normalizerToDvrArguments(
+        for config: StreamConfig,
+        playlistURL: URL,
+        segmentPattern: String
+    ) -> [String] {
+        var args = normalizerArguments(for: config)
+        if let last = args.last, last == "pipe:1" {
+            _ = args.popLast()
+        }
+        if args.suffix(2) == ["-f", "mpegts"] {
+            _ = args.popLast()
+            _ = args.popLast()
+        }
+        args += [
+            "-f", "hls",
+            "-hls_time", "1",
+            "-hls_list_size", "0",
+            "-hls_flags", "append_list+omit_endlist+independent_segments+program_date_time+temp_file",
+            "-hls_segment_filename", segmentPattern,
+            playlistURL.path
+        ]
+        return args
+    }
+
+    private func dvrPublisherArguments(for config: StreamConfig, playlistURL: URL) -> [String] {
+        var args = [
+            "-hide_banner",
+            "-loglevel", "info",
+            "-stats_period", "1",
+            "-progress", "pipe:2",
+            "-re",
+            "-thread_queue_size", "8192",
+            "-fflags", "+genpts+discardcorrupt+igndts+sortdts",
+            "-err_detect", "ignore_err",
+            "-i", playlistURL.path,
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "copy",
+            "-c:a", "copy"
+        ]
+
+        if config.outputType == .rtmp {
+            args += [
+                "-bsf:v", "extract_extradata",
+                "-flvflags", "no_duration_filesize",
+                "-fflags", "+flush_packets",
+                "-flush_packets", "1",
+                "-max_muxing_queue_size", "4096",
+                "-muxdelay", "0",
+                "-muxpreload", "0",
+                "-max_interleave_delta", "0",
+                "-rtmp_live", "live"
+            ]
+        }
+
+        switch config.outputType {
+        case .rtmp:
+            args += ["-f", "flv", config.outputTarget]
+        case .hls:
+            args += [
+                "-f", "hls",
+                "-hls_time", "2",
+                "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+append_list+independent_segments",
+                config.outputTarget
+            ]
+        }
+        return args
+    }
+
+    private func resolvedTargetFPS() -> Int {
+        let fallback = 30
+        guard let label = preview?.frameRateLabel.trimmingCharacters(in: .whitespacesAndNewlines),
+              !label.isEmpty else {
+            return fallback
+        }
+
+        let lower = label.lowercased()
+        if lower.contains("vfr") || lower.contains("variable") || lower.contains("unknown") {
+            return fallback
+        }
+
+        if let match = lower.range(of: #"[0-9]+(\.[0-9]+)?"#, options: .regularExpression),
+           let value = Double(lower[match]) {
+            let rounded = Int(value.rounded())
+            if rounded >= 15 && rounded <= 120 {
+                return rounded
+            }
+        }
+        return fallback
+    }
+
     private func bufferStateText(for config: StreamConfig) -> String {
-        guard supportsStartupBuffer(config.encodeMode) else {
+        guard config.encodeMode == .transcode else {
             return "Off (Stream Copy)"
         }
         if config.bufferSeconds <= 0 {
@@ -830,7 +1255,7 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func initialBufferProgress(for config: StreamConfig) -> Double {
-        if !supportsStartupBuffer(config.encodeMode) {
+        if config.encodeMode != .transcode {
             return 1.0
         }
         return config.bufferSeconds > 0 ? 0.0 : 1.0
@@ -859,10 +1284,12 @@ final class StreamPipeline: ObservableObject {
         }
 
         let boostLabel = config.audioBoostEnabled ? "\(config.audioBoostDb)dB" : "off"
+        let continuityLabel = config.audioContinuityEnabled ? "on" : "off"
         let storageLabel = config.useDiskBackedBuffer ? "disk" : "memory"
         let monitoringLabel = logMonitoringEnabled ? "on" : "off"
+        let fpsLabel = config.encodeMode == .transcode ? "\(resolvedTargetFPS())fps" : "source"
         appendLog(
-            "[app] Session config: mode=\(config.encodeMode.rawValue), format=\(config.outputType.rawValue), buffer=\(config.bufferSeconds)s, storage=\(storageLabel), avOffset=\(config.avSyncOffsetMs)ms, audioBoost=\(boostLabel), logMonitoring=\(monitoringLabel), output=\(outputTarget)"
+            "[app] Session config: mode=\(config.encodeMode.rawValue), format=\(config.outputType.rawValue), buffer=\(config.bufferSeconds)s, storage=\(storageLabel), avOffset=\(config.avSyncOffsetMs)ms, targetFps=\(fpsLabel), audioBoost=\(boostLabel), audioContinuity=\(continuityLabel), logMonitoring=\(monitoringLabel), output=\(outputTarget)"
         )
     }
 
@@ -875,6 +1302,14 @@ final class StreamPipeline: ObservableObject {
 
         let portSuffix = components.port.map { ":\($0)" } ?? ""
         let pathParts = components.path.split(separator: "/")
+
+        // If target is only the app endpoint (e.g. rtmp://127.0.0.1/live),
+        // keep it visible so logs do not imply a hidden stream key.
+        if pathParts.count <= 1 && (components.query?.isEmpty ?? true) {
+            let safePath = components.path.isEmpty ? "" : components.path
+            return "\(scheme)://\(host)\(portSuffix)\(safePath)"
+        }
+
         let appPart = pathParts.first.map(String.init) ?? "app"
         return "\(scheme)://\(host)\(portSuffix)/\(appPart)/<redacted>"
     }
@@ -953,11 +1388,17 @@ final class StreamPipeline: ObservableObject {
         lastFfmpegProgressAt = Date()
         hasSeenFfmpegProgress = false
         lowSpeedSince = Date.distantPast
+        lowSpeedHealthySince = Date.distantPast
         outputFreezeActive = false
         outputFreezeStartedAt = Date.distantPast
         lastOutputFreezeHeartbeatAt = Date.distantPast
         lastFfmpegDupCount = nil
         lastFfmpegDupSampleAt = Date.distantPast
+        lastFfmpegFrameCount = nil
+        lastVideoFrameAdvanceAt = Date.distantPast
+        videoCadenceFreezeActive = false
+        videoCadenceFreezeStartedAt = Date.distantPast
+        lastVideoCadenceHeartbeatAt = Date.distantPast
         duplicationFreezeActive = false
         duplicationFreezeStartedAt = Date.distantPast
         lastDuplicationAlertAt = Date.distantPast
@@ -972,8 +1413,6 @@ final class StreamPipeline: ObservableObject {
         lastDiagnosticSnapshotAt = Date.distantPast
         lastSpeedDriftLogAt = Date.distantPast
         lastFfmpegProgressLogAt = Date.distantPast
-        lastRelayReport = nil
-        lastRelayReportAt = Date.distantPast
         pendingLogChunkBySource = [:]
         suppressedMetadataLineCount = 0
         lastSuppressedMetadataFlushAt = Date.distantPast
@@ -1009,6 +1448,10 @@ final class StreamPipeline: ObservableObject {
     private func appendLogCore(_ message: String) {
         let timestamp = Self.timestampFormatter.string(from: Date())
         let line = "[\(timestamp)] \(message)"
+        if cliLogMirroringEnabled {
+            fputs(line + "\n", stdout)
+            fflush(stdout)
+        }
         pendingUiLogLines.append(line)
         scheduleLogFlushIfNeeded()
         parseStatus(from: message)
@@ -1154,15 +1597,43 @@ final class StreamPipeline: ObservableObject {
                     appendDiagnosticSnapshot(reason: "speed-drift")
                 }
 
+                let publishAge = now.timeIntervalSince(lastPublishStartedAt)
+                let outputState = parsedStatus.outputState.lowercased()
+                let canEnforceHighSpeed = shouldKeepRunning &&
+                    isRunning &&
+                    outputState.contains("publish") &&
+                    publishAge >= Self.highSpeedRestartGracePeriod
+                if canEnforceHighSpeed && speed > Self.highSpeedRestartThreshold {
+                    if highSpeedSince == Date.distantPast {
+                        highSpeedSince = now
+                    }
+                    let highSpeedDuration = now.timeIntervalSince(highSpeedSince)
+                    if highSpeedDuration >= Self.highSpeedRestartDuration {
+                        let speedText = String(format: "%.2f", speed)
+                        ffmpegDiagnosticCounters["speed_high_restart", default: 0] += 1
+                        appendLog(
+                            "[app] Output speed stayed high (\(speedText)x for \(Int(highSpeedDuration.rounded()))s). Restarting publisher stage with strict pacing."
+                        )
+                        appendDiagnosticSnapshot(reason: "high-speed-publisher-restart")
+                        highSpeedSince = Date.distantPast
+                        schedulePublisherOnlyRestart(
+                            generation: generation,
+                            reason: "sustained speed \(speedText)x"
+                        )
+                        return
+                    }
+                } else {
+                    highSpeedSince = Date.distantPast
+                }
+
                 if speed < Self.lowSpeedThreshold {
                     if lowSpeedSince == Date.distantPast {
                         lowSpeedSince = now
                     }
                     let lowSpeedDuration = now.timeIntervalSince(lowSpeedSince)
-                    let relayBufferedSeconds = lastRelayReport?.bufferedDelaySeconds ?? 0
-                    let relayStarved = lastRelayReport != nil &&
-                        relayBufferedSeconds <= Self.lowSpeedRestartBufferCeiling
-                    if relayStarved &&
+                    let bufferedSeconds = estimatedBufferedSeconds()
+                    let bufferStarved = bufferedSeconds <= Self.lowSpeedRestartBufferCeiling
+                    if bufferStarved &&
                         lowSpeedDuration >= Self.lowSpeedRestartThreshold &&
                         !freezeRecoveryTriggered &&
                         shouldKeepRunning &&
@@ -1170,22 +1641,51 @@ final class StreamPipeline: ObservableObject {
                         freezeRecoveryTriggered = true
                         ffmpegDiagnosticCounters["speed_low_restart", default: 0] += 1
                         let lowSpeedText = String(format: "%.2f", speed)
-                        let relayText = String(format: "%.1f", relayBufferedSeconds)
+                        let bufferText = String(format: "%.1f", bufferedSeconds)
                         appendLog(
-                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with low relay buffer (\(relayText)s). Restarting pipeline."
+                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with low staged buffer (\(bufferText)s). Restarting pipeline."
                         )
                         appendDiagnosticSnapshot(reason: "low-speed-restart")
                         terminatePipeline()
                         scheduleRestart(generation: generation, reason: .lowSpeed)
                         return
                     }
+
+                    let bufferHealthy = bufferedSeconds >= Self.catchUpBufferFloor
+                    let catchUpEligibleSpeed = speed < Self.catchUpLowSpeedThreshold
+                    if bufferHealthy && catchUpEligibleSpeed {
+                        if lowSpeedHealthySince == Date.distantPast {
+                            lowSpeedHealthySince = now
+                        }
+                        let healthyLowSpeedDuration = now.timeIntervalSince(lowSpeedHealthySince)
+                        if healthyLowSpeedDuration >= Self.catchUpTriggerThreshold &&
+                            !isCatchUpActive(now: now) &&
+                            shouldKeepRunning &&
+                            isRunning {
+                            let speedText = String(format: "%.2f", speed)
+                            let bufferText = String(format: "%.1f", bufferedSeconds)
+                            catchUpExpiresAt = now.addingTimeInterval(Self.catchUpDuration)
+                            ffmpegDiagnosticCounters["speed_low_catchup", default: 0] += 1
+                            appendLog(
+                                "[app] Output speed stayed below realtime (\(speedText)x for \(Int(healthyLowSpeedDuration.rounded()))s) with healthy staged buffer (\(bufferText)s). Enabling temporary catch-up mode (no -re) for \(Int(Self.catchUpDuration))s."
+                            )
+                            appendDiagnosticSnapshot(reason: "catch-up-enable")
+                            terminatePipeline()
+                            scheduleRestart(generation: generation, reason: .catchUp)
+                            return
+                        }
+                    } else {
+                        lowSpeedHealthySince = Date.distantPast
+                    }
                 } else {
                     lowSpeedSince = Date.distantPast
+                    lowSpeedHealthySince = Date.distantPast
                 }
             }
             if let bps = parseBitrateToBps(parsedStatus.ffmpegBitrate) {
                 estimatedOutputBitrateBps = bps
             }
+            updateVideoCadence(from: message, now: now)
             updateDuplicationFreezeDetection(from: message, now: now)
 
             if let progressSeconds = parseClockToSeconds(parsedStatus.ffmpegTime) {
@@ -1226,6 +1726,16 @@ final class StreamPipeline: ObservableObject {
                     return
                 }
             }
+        }
+
+        if message.contains("[ffmpeg]") && message.contains("Server error: Stream already publishing") {
+            parsedStatus.outputState = "Destination Busy"
+            destinationBusyUntil = now.addingTimeInterval(Self.destinationBusyRetryDelay)
+            appendLog("[app] Destination reported an active publisher. Waiting before retry.")
+            appendDiagnosticSnapshot(reason: "destination-busy")
+            terminatePipeline()
+            scheduleRestart(generation: generation, reason: .destinationBusy)
+            return
         }
 
         if message.contains("[ffmpeg]") && message.contains("Error opening") {
@@ -1321,6 +1831,27 @@ final class StreamPipeline: ObservableObject {
         return Int(captured)
     }
 
+    private func updateVideoCadence(from message: String, now: Date) {
+        guard let frameCount = captureInt(regex: Self.ffmpegFrameRegex, in: message) else { return }
+        defer {
+            lastFfmpegFrameCount = frameCount
+        }
+
+        if let prior = lastFfmpegFrameCount {
+            if frameCount > prior {
+                lastVideoFrameAdvanceAt = now
+                if videoCadenceFreezeActive {
+                    let freezeDuration = max(0, now.timeIntervalSince(videoCadenceFreezeStartedAt))
+                    videoCadenceFreezeActive = false
+                    appendLog("[app] Video cadence recovered after \(Int(freezeDuration.rounded()))s.")
+                    appendDiagnosticSnapshot(reason: "video-cadence-recovered")
+                }
+            }
+        } else {
+            lastVideoFrameAdvanceAt = now
+        }
+    }
+
     private func updateDuplicationFreezeDetection(from message: String, now: Date) {
         guard let dupCount = captureInt(regex: Self.ffmpegDupRegex, in: message) else { return }
 
@@ -1380,7 +1911,7 @@ final class StreamPipeline: ObservableObject {
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
 
-        guard supportsStartupBuffer(config.encodeMode), config.bufferSeconds > 0 else {
+        guard config.encodeMode == .transcode, config.bufferSeconds > 0 else {
             parsedStatus.bufferState = bufferStateText(for: config)
             parsedStatus.bufferProgress = initialBufferProgress(for: config)
             return
@@ -1397,83 +1928,89 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func applyBufferReport(_ report: RelayBufferReport, config: StreamConfig) {
-        guard supportsStartupBuffer(config.encodeMode), config.bufferSeconds > 0 else { return }
-
-        let now = Date()
-        lastRelayReport = report
-        lastRelayReportAt = now
-        let target = max(1.0, Double(config.bufferSeconds))
-        let bufferedSecondsFromBitrate: Double? = {
-            guard estimatedOutputBitrateBps > 32_000 else { return nil }
-            return (Double(report.unreadBytes) * 8.0) / estimatedOutputBitrateBps
-        }()
-        let bufferedSeconds = max(
-            report.bufferedDelaySeconds,
-            bufferedSecondsFromBitrate ?? 0
-        )
-
-        let exhaustionThreshold = min(1.0, report.targetDelaySeconds * 0.2)
-        let recoveryThreshold = exhaustionThreshold + 0.8
-        let shouldMarkExhausted: Bool
-        if bufferExhausted {
-            shouldMarkExhausted = bufferedSeconds < recoveryThreshold
-        } else {
-            shouldMarkExhausted = bufferedSeconds < exhaustionThreshold
+    private func readPlaylistDurationSeconds(from playlistURL: URL) -> Double {
+        guard let text = try? String(contentsOf: playlistURL, encoding: .utf8) else {
+            return 0
         }
+        var total: Double = 0
+        for line in text.split(whereSeparator: \.isNewline) {
+            guard line.hasPrefix("#EXTINF:") else { continue }
+            let raw = line.dropFirst("#EXTINF:".count)
+            let valueText = raw.split(separator: ",", maxSplits: 1).first.map(String.init) ?? ""
+            if let seconds = Double(valueText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                total += max(0, seconds)
+            }
+        }
+        return total
+    }
 
-        let isExhausted = report.hasSink &&
-            !report.isInputEnded &&
-            shouldMarkExhausted
-
-        let exhaustionChanged = bufferExhausted != isExhausted
-        guard exhaustionChanged || now.timeIntervalSince(lastBufferUiUpdate) >= 0.5 else { return }
+    private func updateDvrBufferState(
+        config: StreamConfig,
+        availableSeconds: Double,
+        targetDelay: Double,
+        publishingStarted: Bool
+    ) {
+        guard config.encodeMode == .transcode else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastBufferUiUpdate) >= 0.25 else { return }
         lastBufferUiUpdate = now
 
-        let fill = min(1.0, max(0.0, bufferedSeconds / target))
+        let target = max(1.0, targetDelay)
+        let fill = min(1.0, max(0.0, availableSeconds / target))
+        let exhaustionThreshold = min(1.0, target * 0.15)
+        let recoveryThreshold = exhaustionThreshold + 1.0
 
-        // Before publishing begins, show true media-buffer progress toward target.
-        if !report.hasSink && !report.isInputEnded {
-            let rounded = Int(bufferedSeconds.rounded())
-            let remaining = max(0, config.bufferSeconds - rounded)
+        if publishingStarted {
+            if bufferExhausted {
+                if availableSeconds >= recoveryThreshold {
+                    bufferExhausted = false
+                    appendLog("[app] Buffer recovered. Publishing resumed.")
+                }
+            } else if availableSeconds < exhaustionThreshold {
+                bufferExhausted = true
+                appendLog("[app] Buffer exhausted. Waiting for staged media to refill.")
+            }
+        } else {
+            bufferExhausted = false
+        }
+
+        if !publishingStarted {
+            let remaining = max(0, Int((targetDelay - availableSeconds).rounded(.up)))
+            parsedStatus.outputState = "Buffering"
             if remaining > 0 {
                 parsedStatus.bufferState = startupReprimeActive
                     ? "Re-priming (\(remaining)s remaining)"
                     : "Filling (\(remaining)s remaining)"
             } else {
-                parsedStatus.bufferState = "Primed (\(config.bufferSeconds)s delay)"
+                parsedStatus.bufferState = targetDelay > 0 ? "Primed (\(config.bufferSeconds)s delay)" : "Primed"
             }
-            parsedStatus.bufferProgress = fill
-            parsedStatus.outputState = "Buffering"
-            return
-        }
-
-        if isExhausted {
-            if !bufferExhausted {
-                appendLog("[app] Buffer exhausted. Waiting for source to refill.")
-            }
-            bufferExhausted = true
-            parsedStatus.bufferState = "Exhausted (\(Int(bufferedSeconds.rounded()))s/\(config.bufferSeconds)s)"
-            parsedStatus.bufferProgress = fill
-            parsedStatus.outputState = "Buffering"
+            parsedStatus.bufferProgress = targetDelay > 0 ? fill : 1.0
             return
         }
 
         if bufferExhausted {
-            appendLog("[app] Buffer recovered. Publishing resumed.")
+            parsedStatus.outputState = "Buffering"
+            parsedStatus.bufferState = "Exhausted (\(Int(availableSeconds.rounded()))s/\(config.bufferSeconds)s)"
+            parsedStatus.bufferProgress = fill
+            return
         }
-        bufferExhausted = false
 
-        if !parsedStatus.bufferState.contains("Filling") {
-            let rounded = Int(bufferedSeconds.rounded())
-            if rounded >= config.bufferSeconds {
-                parsedStatus.bufferState = "Primed (\(config.bufferSeconds)s delay)"
-                parsedStatus.bufferProgress = 1.0
-            } else {
-                parsedStatus.bufferState = "Buffered (\(rounded)s/\(config.bufferSeconds)s)"
-                parsedStatus.bufferProgress = fill
-            }
+        parsedStatus.outputState = "Publishing"
+        if targetDelay <= 0 {
+            parsedStatus.bufferState = "Live (no delay)"
+            parsedStatus.bufferProgress = 1.0
+        } else if availableSeconds >= targetDelay {
+            parsedStatus.bufferState = "Primed (\(config.bufferSeconds)s delay)"
+            parsedStatus.bufferProgress = 1.0
+        } else {
+            parsedStatus.bufferState = "Buffered (\(Int(availableSeconds.rounded()))s/\(config.bufferSeconds)s)"
+            parsedStatus.bufferProgress = fill
         }
+    }
+
+    private func cleanupDvrSessionFiles() {
+        guard let dir = dvrSessionDirectory else { return }
+        try? FileManager.default.removeItem(at: dir)
     }
 
     private static let timestampFormatter: DateFormatter = {
@@ -1490,6 +2027,10 @@ final class StreamPipeline: ObservableObject {
     private static let outputFreezeHeartbeatInterval: TimeInterval = 10.0
     private static let outputFreezeRestartThreshold: TimeInterval = 12.0
     private static let outputFreezeMonitorPollInterval: TimeInterval = 1.0
+    private static let videoCadenceProgressFreshThreshold: TimeInterval = 2.5
+    private static let videoCadenceLogThreshold: TimeInterval = 6.0
+    private static let videoCadenceHeartbeatInterval: TimeInterval = 10.0
+    private static let videoCadenceRestartThreshold: TimeInterval = 12.0
     private static let duplicationFreezeDupPerSecondThreshold: Double = 10.0
     private static let duplicationFreezeHeartbeatInterval: TimeInterval = 10.0
     private static let duplicationFreezeRecoveryWindow: TimeInterval = 3.0
@@ -1502,11 +2043,19 @@ final class StreamPipeline: ObservableObject {
     private static let lowSpeedThreshold: Double = 0.92
     private static let lowSpeedRestartThreshold: TimeInterval = 18.0
     private static let lowSpeedRestartBufferCeiling: TimeInterval = 3.0
+    private static let highSpeedRestartThreshold: Double = 1.05
+    private static let highSpeedRestartDuration: TimeInterval = 8.0
+    private static let highSpeedRestartGracePeriod: TimeInterval = 20.0
+    private static let catchUpLowSpeedThreshold: Double = 0.98
+    private static let catchUpTriggerThreshold: TimeInterval = 10.0
+    private static let catchUpBufferFloor: TimeInterval = 8.0
+    private static let catchUpDuration: TimeInterval = 90.0
+    private static let destinationBusyRetryDelay: TimeInterval = 8.0
+    private static let publishRampDelay: TimeInterval = 2.0
     private static let logFlushInterval: TimeInterval = 0.2
     private static let diagnosticSnapshotInterval: TimeInterval = 20.0
     private static let diagnosticSnapshotMinGap: TimeInterval = 4.0
     private static let maxDiagnosticLines: Int = 24
-    private static let relayReadChunkSize: Int = 262_144
     private static let maxToolLogPayloadLength: Int = 800
     nonisolated private static let processTimeoutExitCode: Int32 = -999
     private static let verboseMetadataTokens: [String] = [
@@ -1520,6 +2069,7 @@ final class StreamPipeline: ObservableObject {
     private static let ffmpegTimeRegex = try! NSRegularExpression(pattern: #"time=\s*([0-9:\.]+)"#)
     private static let ffmpegBitrateRegex = try! NSRegularExpression(pattern: #"bitrate=\s*([^\s]+)"#)
     private static let ffmpegSpeedRegex = try! NSRegularExpression(pattern: #"speed=\s*([^\s]+)"#)
+    private static let ffmpegFrameRegex = try! NSRegularExpression(pattern: #"frame=\s*([0-9]+)"#)
     private static let ffmpegDupRegex = try! NSRegularExpression(pattern: #"dup=\s*([0-9]+)"#)
 
     private enum MessageSource {
@@ -1567,19 +2117,28 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func supportsStartupBuffer(_ mode: EncodeMode) -> Bool {
-        mode == .transcode || mode == .copyPaced
+    private func isCatchUpActive(now: Date = Date()) -> Bool {
+        now < catchUpExpiresAt
     }
 
     private func supportsBufferedDrainOnSourceExit() -> Bool {
         guard let config = currentConfig else { return false }
-        return supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0
+        return config.encodeMode == .transcode && config.bufferSeconds > 0
     }
 
     private func shouldMonitorStallRecovery() -> Bool {
         guard let config = currentConfig else { return true }
-        let usesDelayedRelay = supportsStartupBuffer(config.encodeMode) && config.bufferSeconds > 0
-        return !usesDelayedRelay
+        let usesDelayedBuffer = config.encodeMode == .transcode && config.bufferSeconds > 0
+        return !usesDelayedBuffer
+    }
+
+    private func estimatedBufferedSeconds() -> Double {
+        guard let config = currentConfig,
+              config.encodeMode == .transcode,
+              config.bufferSeconds > 0 else {
+            return 0
+        }
+        return max(0, min(Double(config.bufferSeconds), Double(config.bufferSeconds) * parsedStatus.bufferProgress))
     }
 
     private func startOutputFreezeMonitorIfNeeded() {
@@ -1598,6 +2157,43 @@ final class StreamPipeline: ObservableObject {
 
                 let now = Date()
                 let stalledFor = now.timeIntervalSince(self.lastFfmpegProgressAt)
+                let frameStalledFor = self.lastVideoFrameAdvanceAt == Date.distantPast
+                    ? 0
+                    : now.timeIntervalSince(self.lastVideoFrameAdvanceAt)
+
+                // Detect video-only freezes where audio/output time still advances.
+                if self.lastVideoFrameAdvanceAt != Date.distantPast &&
+                    stalledFor < Self.videoCadenceProgressFreshThreshold &&
+                    frameStalledFor >= Self.videoCadenceLogThreshold {
+                    if !self.videoCadenceFreezeActive {
+                        self.videoCadenceFreezeActive = true
+                        self.videoCadenceFreezeStartedAt = self.lastVideoFrameAdvanceAt
+                        self.lastVideoCadenceHeartbeatAt = now
+                        self.appendLog(
+                            "[app] Video cadence freeze detected: video frames have not advanced for \(Int(frameStalledFor.rounded()))s while output timeline is still moving."
+                        )
+                        self.appendDiagnosticSnapshot(reason: "video-cadence-freeze-detected")
+                    } else if now.timeIntervalSince(self.lastVideoCadenceHeartbeatAt) >= Self.videoCadenceHeartbeatInterval {
+                        self.lastVideoCadenceHeartbeatAt = now
+                        self.appendLog(
+                            "[app] Video cadence freeze ongoing: no frame advance for \(Int(frameStalledFor.rounded()))s."
+                        )
+                        self.appendDiagnosticSnapshot(reason: "video-cadence-freeze-ongoing")
+                    }
+
+                    if !self.freezeRecoveryTriggered &&
+                        frameStalledFor >= Self.videoCadenceRestartThreshold {
+                        self.freezeRecoveryTriggered = true
+                        self.appendLog(
+                            "[app] Video cadence freeze persisted for \(Int(frameStalledFor.rounded()))s. Restarting pipeline."
+                        )
+                        self.appendDiagnosticSnapshot(reason: "video-cadence-freeze-restart")
+                        self.terminatePipeline()
+                        self.scheduleRestart(generation: self.generation, reason: .freeze)
+                        continue
+                    }
+                }
+
                 if stalledFor < Self.outputFreezeLogThreshold {
                     continue
                 }
@@ -1638,8 +2234,10 @@ final class StreamPipeline: ObservableObject {
         case general
         case freeze
         case lowSpeed
+        case catchUp
         case stall
         case processExit
+        case destinationBusy
     }
 
     private func restartReasonLabel(_ reason: RestartReason) -> String {
@@ -1650,10 +2248,14 @@ final class StreamPipeline: ObservableObject {
             return "output-freeze"
         case .lowSpeed:
             return "low-speed-with-low-buffer"
+        case .catchUp:
+            return "low-speed-with-healthy-buffer-catchup"
         case .stall:
             return "progress-stall"
         case .processExit:
             return "process-exit"
+        case .destinationBusy:
+            return "destination-busy"
         }
     }
 
@@ -1713,30 +2315,16 @@ final class StreamPipeline: ObservableObject {
         lastDiagnosticSnapshotAt = now
 
         let stalledFor = hasSeenFfmpegProgress ? max(0, now.timeIntervalSince(lastFfmpegProgressAt)) : 0
-        let relay = lastRelayReport
-        let relayAge = relay == nil ? -1.0 : now.timeIntervalSince(lastRelayReportAt)
         let counters = ffmpegDiagnosticCounters
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: ",")
         let lastDiagLine = recentFfmpegDiagnosticLines.last?.replacingOccurrences(of: "\n", with: " ") ?? "-"
         let countersText = counters.isEmpty ? "none" : counters
-        let relayText: String
-        if let relay {
-            relayText = String(
-                format: "delay=%.1fs unread=%d hasSink=%@ ended=%@ age=%.1fs",
-                relay.bufferedDelaySeconds,
-                relay.unreadBytes,
-                relay.hasSink ? "1" : "0",
-                relay.isInputEnded ? "1" : "0",
-                max(0, relayAge)
-            )
-        } else {
-            relayText = "n/a"
-        }
+        let stagedBufferText = String(format: "%.1fs", estimatedBufferedSeconds())
 
         appendLogCore(
-            "[app] diag(\(reason)): output=\(parsedStatus.outputState), ffmpegTime=\(parsedStatus.ffmpegTime.isEmpty ? "-" : parsedStatus.ffmpegTime), speed=\(parsedStatus.ffmpegSpeed.isEmpty ? "-" : parsedStatus.ffmpegSpeed), bitrate=\(parsedStatus.ffmpegBitrate.isEmpty ? "-" : parsedStatus.ffmpegBitrate), stalled=\(Int(stalledFor.rounded()))s, buffer=\(parsedStatus.bufferState), relay={\(relayText)}, counters={\(countersText)}, lastFFmpegDiag=\(lastDiagLine)"
+            "[app] diag(\(reason)): output=\(parsedStatus.outputState), ffmpegTime=\(parsedStatus.ffmpegTime.isEmpty ? "-" : parsedStatus.ffmpegTime), speed=\(parsedStatus.ffmpegSpeed.isEmpty ? "-" : parsedStatus.ffmpegSpeed), bitrate=\(parsedStatus.ffmpegBitrate.isEmpty ? "-" : parsedStatus.ffmpegBitrate), stalled=\(Int(stalledFor.rounded()))s, buffer=\(parsedStatus.bufferState), staged=\(stagedBufferText), counters={\(countersText)}, lastFFmpegDiag=\(lastDiagLine)"
         )
     }
 
@@ -1828,411 +2416,6 @@ final class StreamPipeline: ObservableObject {
             return (nil, "Could not parse source info")
         }
     }
-}
-
-private final class AnyStartupRelay: @unchecked Sendable {
-    private let ingestFn: (Data) async -> Void
-    private let attachSinkFn: (FileHandle) async -> Void
-    private let drainReadyFn: () async -> RelayBufferReport
-    private let finishInputFn: () async -> Void
-    private let closeNowFn: () async -> Void
-
-    init(_ relay: StartupGateRelay) {
-        ingestFn = { data in await relay.ingest(data) }
-        attachSinkFn = { handle in await relay.attachSink(handle) }
-        drainReadyFn = { await relay.drainReady() }
-        finishInputFn = { await relay.finishInput() }
-        closeNowFn = { await relay.closeNow() }
-    }
-
-    init(_ relay: DiskBackedStartupRelay) {
-        ingestFn = { data in await relay.ingest(data) }
-        attachSinkFn = { handle in await relay.attachSink(handle) }
-        drainReadyFn = { await relay.drainReady() }
-        finishInputFn = { await relay.finishInput() }
-        closeNowFn = { await relay.closeNow() }
-    }
-
-    func ingest(_ data: Data) async {
-        await ingestFn(data)
-    }
-
-    func attachSink(_ handle: FileHandle) async {
-        await attachSinkFn(handle)
-    }
-
-    func drainReady() async -> RelayBufferReport {
-        await drainReadyFn()
-    }
-
-    func finishInput() async {
-        await finishInputFn()
-    }
-
-    func closeNow() async {
-        await closeNowFn()
-    }
-}
-
-private actor DiskBackedStartupRelay {
-    private struct ChunkMeta {
-        let byteCount: Int
-        let enqueuedAt: Date
-    }
-
-    private let delaySeconds: TimeInterval
-    private let fileURL: URL
-    private let writeHandle: FileHandle
-    private let readHandle: FileHandle
-    private let minimumPaceBytesPerSecond: Double = 64_000 // 512 kbps floor
-
-    private var nextOffset: UInt64 = 0
-    private var readOffset: UInt64 = 0
-    private var sink: FileHandle?
-    private var inputEnded = false
-    private var isClosed = false
-    private var totalIngestedBytes: UInt64 = 0
-    private var firstIngestAt: Date?
-    private var lastDrainAt: Date?
-    private var writeBudgetBytes: Double = 0
-    private var chunkMetas: [ChunkMeta] = []
-    private var metaReadIndex = 0
-    private var metaReadOffset = 0
-    private var unreadMetaBytes: Int = 0
-
-    init(delaySeconds: TimeInterval, tempDirectory: URL) throws {
-        self.delaySeconds = max(0, delaySeconds)
-        self.fileURL = tempDirectory.appendingPathComponent("relay-\(UUID().uuidString).bin")
-        FileManager.default.createFile(atPath: fileURL.path, contents: nil)
-        self.writeHandle = try FileHandle(forWritingTo: fileURL)
-        self.readHandle = try FileHandle(forReadingFrom: fileURL)
-    }
-
-    func ingest(_ data: Data) {
-        guard !isClosed else { return }
-        writeHandle.seekToEndOfFile()
-        writeHandle.write(data)
-        nextOffset += UInt64(data.count)
-        totalIngestedBytes += UInt64(data.count)
-        chunkMetas.append(ChunkMeta(byteCount: data.count, enqueuedAt: Date()))
-        unreadMetaBytes += data.count
-        if firstIngestAt == nil {
-            firstIngestAt = Date()
-        }
-        if sink != nil {
-            _ = drainReady()
-        }
-    }
-
-    func attachSink(_ handle: FileHandle) {
-        guard !isClosed else { return }
-        sink = handle
-        _ = drainReady()
-    }
-
-    func drainReady(now: Date = Date()) -> RelayBufferReport {
-        guard !isClosed else {
-            return RelayBufferReport(
-                bufferedDelaySeconds: 0,
-                unreadBytes: 0,
-                targetDelaySeconds: delaySeconds,
-                hasSink: false,
-                isInputEnded: true
-            )
-        }
-        guard let sink else {
-            return makeReport(now: now)
-        }
-
-        let estimatedBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
-        if let last = lastDrainAt {
-            let elapsed = max(0, now.timeIntervalSince(last))
-            writeBudgetBytes += elapsed * estimatedBytesPerSecond
-        } else {
-            // Let publishing begin promptly without draining in one burst.
-            writeBudgetBytes = max(writeBudgetBytes, estimatedBytesPerSecond * 0.2)
-        }
-        lastDrainAt = now
-
-        let releasableBytes = releasableBytesByBacklog(now: now)
-        let maxBudget = max(estimatedBytesPerSecond * 2.0, 128_000)
-        writeBudgetBytes = min(writeBudgetBytes, maxBudget)
-
-        var remaining = releasableBytes
-        var writes = 0
-        while remaining > 0 && writeBudgetBytes >= 1 && writes < 16 {
-            let batchCap = max(8_192, Int(estimatedBytesPerSecond * 0.05))
-            let count = min(remaining, min(Int(writeBudgetBytes), batchCap))
-            if count <= 0 { break }
-
-            readHandle.seek(toFileOffset: readOffset)
-            let payload = readHandle.readData(ofLength: count)
-            if payload.isEmpty { break }
-
-            do {
-                try sink.write(contentsOf: payload)
-            } catch {
-                closeNow()
-                return makeReport(now: now)
-            }
-
-            let written = payload.count
-            readOffset += UInt64(written)
-            writeBudgetBytes = max(0, writeBudgetBytes - Double(written))
-            remaining -= written
-            writes += 1
-            consumeMetaBytes(written)
-
-            if written < count {
-                break
-            }
-        }
-
-        if inputEnded && readOffset >= nextOffset {
-            closeNow()
-        }
-
-        return makeReport(now: now)
-    }
-
-    private func releasableBytesByBacklog(now: Date) -> Int {
-        let unreadBytes = max(0, unreadMetaBytes)
-        guard delaySeconds > 0 else { return unreadBytes }
-        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
-        let targetBacklogBytes = max(0, Int(ingressBytesPerSecond * delaySeconds))
-        return max(0, unreadBytes - targetBacklogBytes)
-    }
-
-    func finishInput() {
-        guard !isClosed else { return }
-        inputEnded = true
-        _ = drainReady()
-    }
-
-    func closeNow() {
-        guard !isClosed else { return }
-        isClosed = true
-        sink?.closeFile()
-        sink = nil
-        writeHandle.closeFile()
-        readHandle.closeFile()
-        nextOffset = 0
-        readOffset = 0
-        totalIngestedBytes = 0
-        firstIngestAt = nil
-        lastDrainAt = nil
-        writeBudgetBytes = 0
-        chunkMetas.removeAll(keepingCapacity: false)
-        metaReadIndex = 0
-        metaReadOffset = 0
-        unreadMetaBytes = 0
-        try? FileManager.default.removeItem(at: fileURL)
-    }
-
-    private func makeReport(now: Date) -> RelayBufferReport {
-        let unreadBytes = max(0, unreadMetaBytes)
-        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
-        let byteBasedDelay = ingressBytesPerSecond > 0
-            ? Double(unreadBytes) / ingressBytesPerSecond
-            : 0
-        return RelayBufferReport(
-            bufferedDelaySeconds: byteBasedDelay,
-            unreadBytes: unreadBytes,
-            targetDelaySeconds: delaySeconds,
-            hasSink: sink != nil,
-            isInputEnded: inputEnded
-        )
-    }
-
-    private func consumeMetaBytes(_ count: Int) {
-        guard count > 0 else { return }
-        unreadMetaBytes = max(0, unreadMetaBytes - count)
-
-        var remaining = count
-        while remaining > 0, metaReadIndex < chunkMetas.count {
-            let current = chunkMetas[metaReadIndex]
-            let available = current.byteCount - metaReadOffset
-            if remaining >= available {
-                remaining -= available
-                metaReadIndex += 1
-                metaReadOffset = 0
-            } else {
-                metaReadOffset += remaining
-                remaining = 0
-            }
-        }
-
-        if metaReadIndex > 512 && metaReadIndex >= chunkMetas.count / 2 {
-            chunkMetas.removeFirst(metaReadIndex)
-            metaReadIndex = 0
-        }
-    }
-
-    private func estimatedIngressBytesPerSecond(now: Date) -> Double {
-        guard let firstIngestAt, totalIngestedBytes > 0 else {
-            return minimumPaceBytesPerSecond
-        }
-        let elapsed = max(1.0, now.timeIntervalSince(firstIngestAt))
-        let average = Double(totalIngestedBytes) / elapsed
-        return max(minimumPaceBytesPerSecond, average)
-    }
-}
-
-private actor StartupGateRelay {
-    private struct Chunk {
-        let data: Data
-        let enqueuedAt: Date
-    }
-
-    private let delaySeconds: TimeInterval
-    private let minimumPaceBytesPerSecond: Double = 64_000 // 512 kbps floor
-    private var bufferedChunks: [Chunk] = []
-    private var readIndex = 0
-    private var readOffsetInChunk = 0
-    private var unreadByteCount = 0
-    private var totalIngestedBytes: UInt64 = 0
-    private var firstIngestAt: Date?
-    private var sink: FileHandle?
-    private var inputEnded = false
-    private var isClosed = false
-
-    init(delaySeconds: TimeInterval) {
-        self.delaySeconds = max(0, delaySeconds)
-    }
-
-    func ingest(_ data: Data) {
-        guard !isClosed else { return }
-        bufferedChunks.append(Chunk(data: data, enqueuedAt: Date()))
-        unreadByteCount += data.count
-        totalIngestedBytes += UInt64(data.count)
-        if firstIngestAt == nil {
-            firstIngestAt = Date()
-        }
-        if sink != nil {
-            _ = drainReady()
-        }
-    }
-
-    func attachSink(_ handle: FileHandle) {
-        guard !isClosed else { return }
-        sink = handle
-        _ = drainReady()
-    }
-
-    func drainReady(now: Date = Date()) -> RelayBufferReport {
-        guard !isClosed else {
-            return RelayBufferReport(
-                bufferedDelaySeconds: 0,
-                unreadBytes: 0,
-                targetDelaySeconds: delaySeconds,
-                hasSink: false,
-                isInputEnded: true
-            )
-        }
-        guard let sink else {
-            return makeReport(now: now)
-        }
-
-        let releasableBytes = releasableBytesByBacklog(now: now)
-        var remainingReleasable = releasableBytes
-        var writes = 0
-        while readIndex < bufferedChunks.count, remainingReleasable > 0 {
-            let chunk = bufferedChunks[readIndex]
-            let availableInChunk = max(0, chunk.data.count - readOffsetInChunk)
-            if availableInChunk == 0 {
-                readIndex += 1
-                readOffsetInChunk = 0
-                continue
-            }
-
-            let count = min(availableInChunk, remainingReleasable)
-            if count <= 0 { break }
-            let end = readOffsetInChunk + count
-            let payload = chunk.data.subdata(in: readOffsetInChunk..<end)
-            try? sink.write(contentsOf: payload)
-
-            readOffsetInChunk = end
-            unreadByteCount = max(0, unreadByteCount - count)
-            remainingReleasable = max(0, remainingReleasable - count)
-            if readOffsetInChunk >= chunk.data.count {
-                readIndex += 1
-                readOffsetInChunk = 0
-            }
-            writes += 1
-            if writes >= 128 {
-                break
-            }
-        }
-
-        if readIndex > 256 && readIndex >= bufferedChunks.count / 2 {
-            bufferedChunks.removeFirst(readIndex)
-            readIndex = 0
-        }
-
-        if inputEnded && readIndex >= bufferedChunks.count && readOffsetInChunk == 0 {
-            closeNow()
-        }
-
-        return makeReport(now: now)
-    }
-
-    func finishInput() {
-        guard !isClosed else { return }
-        inputEnded = true
-        _ = drainReady()
-    }
-
-    func closeNow() {
-        guard !isClosed else { return }
-        isClosed = true
-        sink?.closeFile()
-        sink = nil
-        bufferedChunks.removeAll(keepingCapacity: false)
-        readIndex = 0
-        readOffsetInChunk = 0
-        unreadByteCount = 0
-        totalIngestedBytes = 0
-        firstIngestAt = nil
-    }
-
-    private func makeReport(now: Date) -> RelayBufferReport {
-        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
-        let byteBasedDelay: TimeInterval = ingressBytesPerSecond > 0
-            ? Double(unreadByteCount) / ingressBytesPerSecond
-            : 0
-        return RelayBufferReport(
-            bufferedDelaySeconds: byteBasedDelay,
-            unreadBytes: unreadByteCount,
-            targetDelaySeconds: delaySeconds,
-            hasSink: sink != nil,
-            isInputEnded: inputEnded
-        )
-    }
-
-    private func releasableBytesByBacklog(now: Date) -> Int {
-        let unreadBytes = max(0, unreadByteCount)
-        guard delaySeconds > 0 else { return unreadBytes }
-        let ingressBytesPerSecond = estimatedIngressBytesPerSecond(now: now)
-        let targetBacklogBytes = max(0, Int(ingressBytesPerSecond * delaySeconds))
-        return max(0, unreadBytes - targetBacklogBytes)
-    }
-
-    private func estimatedIngressBytesPerSecond(now: Date) -> Double {
-        guard let firstIngestAt, totalIngestedBytes > 0 else {
-            return minimumPaceBytesPerSecond
-        }
-        let elapsed = max(1.0, now.timeIntervalSince(firstIngestAt))
-        let average = Double(totalIngestedBytes) / elapsed
-        return max(minimumPaceBytesPerSecond, average)
-    }
-}
-
-private struct RelayBufferReport {
-    let bufferedDelaySeconds: TimeInterval
-    let unreadBytes: Int
-    let targetDelaySeconds: TimeInterval
-    let hasSink: Bool
-    let isInputEnded: Bool
 }
 
 private struct ToolPaths {

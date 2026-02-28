@@ -9,6 +9,7 @@ enum AppPreferenceKeys {
     static let defaultAVSyncOffsetMs = "default_av_sync_offset_ms"
     static let defaultAudioBoostEnabled = "default_audio_boost_enabled"
     static let defaultAudioBoostDb = "default_audio_boost_db"
+    static let defaultAudioContinuityEnabled = "default_audio_continuity_enabled"
     static let logMonitoringEnabled = "log_monitoring_enabled"
     static let appearanceMode = "appearance_mode"
 }

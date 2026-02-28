@@ -3,9 +3,11 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var pipeline: StreamPipeline
-    @State private var config = ContentView.makeInitialConfig()
-    @State private var copyModePacingEnabled = false
+    private let launchOptions: LaunchOptions
+    @State private var config: StreamConfig
     @State private var autoLoadInfoTask: Task<Void, Never>?
+    @State private var didApplyLaunchOptions = false
+    @State private var didAutoStart = false
     @State private var lastAutoLoadedSourceURL = ""
     @State private var selectedRtmpPresetID = ""
     @State private var selectedSourcePresetID = ""
@@ -17,6 +19,13 @@ struct ContentView: View {
     private let bufferOptions = [0, 5, 15, 30, 60, 120]
     private let audioBoostOptions = [0, 5, 10, 20]
     private let autoLoadDebounceNs: UInt64 = 900_000_000
+
+    init(pipeline: StreamPipeline, launchOptions: LaunchOptions = LaunchOptions()) {
+        self.pipeline = pipeline
+        self.launchOptions = launchOptions
+        let initialConfig = ContentView.makeInitialConfig(overrides: launchOptions)
+        _config = State(initialValue: initialConfig)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -47,10 +56,20 @@ struct ContentView: View {
             }
         }
         .onAppear {
+            if !didApplyLaunchOptions {
+                didApplyLaunchOptions = true
+                if let forcedLogging = launchOptions.extendedLogging {
+                    logMonitoringEnabled = forcedLogging
+                }
+            }
+            pipeline.setCliLogMirroringEnabled(launchOptions.hasRuntimeOverrides)
             pipeline.setLogMonitoringEnabled(logMonitoringEnabled)
-            copyModePacingEnabled = config.encodeMode == .copyPaced
             syncSelectedRtmpPreset()
             syncSelectedSourcePreset()
+            if launchOptions.autoStart && !didAutoStart {
+                didAutoStart = true
+                startStream()
+            }
         }
         .onDisappear {
             autoLoadInfoTask?.cancel()
@@ -62,11 +81,6 @@ struct ContentView: View {
         .onChange(of: config.sourceURL) { _ in
             scheduleAutoLoadInfo()
             syncSelectedSourcePreset()
-        }
-        .onChange(of: config.encodeMode) { newValue in
-            if newValue != .transcode {
-                copyModePacingEnabled = (newValue == .copyPaced)
-            }
         }
         .onChange(of: config.outputType) { _ in
             syncSelectedRtmpPreset()
@@ -378,21 +392,7 @@ struct ContentView: View {
 
     private var videoModeSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if selectedOutputMode == .streamCopy {
-                labeledInline("Pace Output") {
-                    HStack(spacing: 10) {
-                        Toggle("Enable", isOn: pacedStreamCopyBinding)
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                            .controlSize(.small)
-                        Text("Enable paced output")
-                            .font(.caption)
-                        Spacer()
-                    }
-                }
-            }
-
-            if config.encodeMode == .transcode || pacedStreamCopyBinding.wrappedValue {
+            if config.encodeMode == .transcode {
                 labeledInline("Buffer Delay") {
                     Picker("", selection: $config.bufferSeconds) {
                         ForEach(bufferOptions, id: \.self) { seconds in
@@ -409,17 +409,17 @@ struct ContentView: View {
             if config.encodeMode == .transcode {
                 labeledInline("Buffer Storage") {
                     HStack(spacing: 8) {
-                        Toggle("Disk-backed", isOn: $config.useDiskBackedBuffer)
+                        Toggle("DVR disk staging", isOn: $config.useDiskBackedBuffer)
                             .toggleStyle(.switch)
                             .labelsHidden()
                             .controlSize(.mini)
                             .disabled(config.bufferSeconds <= 0)
-                        Text("Disk-backed buffer")
+                        Text("DVR disk staging")
                             .font(.caption2)
                         Spacer()
                     }
                 }
-                Text("When enabled, buffered media is staged to temporary disk storage before publish.")
+                Text("Stages normalized media into a local DVR playlist before publish.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -459,16 +459,22 @@ struct ContentView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-            } else {
-                if pacedStreamCopyBinding.wrappedValue {
-                    Text("Paced Stream Copy keeps copy codecs, while output timing is smoothed for better stability.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Stream Copy passes source audio/video through without re-encoding.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+
+                labeledInline("Audio Continuity") {
+                    HStack(spacing: 8) {
+                        Toggle("Enable", isOn: $config.audioContinuityEnabled)
+                            .toggleStyle(.switch)
+                            .labelsHidden()
+                            .controlSize(.mini)
+                        Text("Fill brief audio gaps with silence to keep timeline stable")
+                            .font(.caption2)
+                        Spacer()
+                    }
                 }
+            } else {
+                Text("Stream Copy passes source audio/video through without re-encoding.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if config.encodeMode == .copy {
@@ -730,9 +736,7 @@ struct ContentView: View {
     private var videoModeContextText: String {
         switch config.encodeMode {
         case .transcode:
-            return "Editing high compatibility output settings."
-        case .copyPaced:
-            return "Editing stream copy settings (paced output enabled)."
+            return "Editing compatible DVR-to-live output settings."
         case .copy:
             return "Editing stream copy settings."
         }
@@ -745,6 +749,10 @@ struct ContentView: View {
         case .advanced:
             return "Viewing advanced process diagnostics and logs."
         }
+    }
+
+    private var shouldSkipSourceInfoGate: Bool {
+        launchOptions.hasRuntimeOverrides
     }
 
     private var sourceValidationMessage: String? {
@@ -770,6 +778,7 @@ struct ContentView: View {
     }
 
     private var liveSourceValidationMessage: String? {
+        if shouldSkipSourceInfoGate { return nil }
         guard sourceValidationMessage == nil else { return nil }
         guard !sourceURLTrimmed.isEmpty else { return nil }
         guard !isLoadingSourceInfo else { return nil }
@@ -807,7 +816,7 @@ struct ContentView: View {
         if state.hasPrefix("Off") || state == "Stopped" {
             return false
         }
-        return config.encodeMode == .copyPaced || config.encodeMode == .transcode
+        return config.encodeMode == .transcode
     }
 
     private var bufferStatusColor: Color {
@@ -886,7 +895,7 @@ struct ContentView: View {
 
     private var bufferChipText: String? {
         guard pipeline.isRunning else { return nil }
-        guard (config.encodeMode == .copyPaced || config.encodeMode == .transcode) && config.bufferSeconds > 0 else {
+        guard config.encodeMode == .transcode && config.bufferSeconds > 0 else {
             return nil
         }
         let state = pipeline.parsedStatus.bufferState.lowercased()
@@ -922,6 +931,8 @@ struct ContentView: View {
     }
 
     private func scheduleAutoLoadInfo() {
+        if shouldSkipSourceInfoGate { return }
+
         autoLoadInfoTask?.cancel()
         autoLoadInfoTask = nil
 
@@ -969,24 +980,9 @@ struct ContentView: View {
             set: { selection in
                 switch selection {
                 case .streamCopy:
-                    config.encodeMode = copyModePacingEnabled ? .copyPaced : .copy
+                    config.encodeMode = .copy
                 case .highCompatibility:
                     config.encodeMode = .transcode
-                }
-            }
-        )
-    }
-
-    private var pacedStreamCopyBinding: Binding<Bool> {
-        Binding(
-            get: {
-                config.encodeMode == .copyPaced ||
-                    (config.encodeMode == .copy && copyModePacingEnabled)
-            },
-            set: { enabled in
-                copyModePacingEnabled = enabled
-                if selectedOutputMode == .streamCopy {
-                    config.encodeMode = enabled ? .copyPaced : .copy
                 }
             }
         )
@@ -1043,12 +1039,14 @@ struct ContentView: View {
         }
     }
 
-    private static func makeInitialConfig() -> StreamConfig {
+    private static func makeInitialConfig(overrides: LaunchOptions = LaunchOptions()) -> StreamConfig {
         var config = StreamConfig()
         let defaults = UserDefaults.standard
 
         let raw = defaults.string(forKey: AppPreferenceKeys.defaultEncodeMode) ?? ""
-        if let mode = EncodeMode(rawValue: raw) {
+        if raw == "Stream Copy (Paced)" {
+            config.encodeMode = .copy
+        } else if let mode = EncodeMode(rawValue: raw) {
             config.encodeMode = mode
         }
 
@@ -1075,6 +1073,64 @@ struct ContentView: View {
             let db = defaults.integer(forKey: AppPreferenceKeys.defaultAudioBoostDb)
             let allowedDb = [0, 5, 10, 20]
             config.audioBoostDb = allowedDb.contains(db) ? db : 0
+        }
+
+        if defaults.object(forKey: AppPreferenceKeys.defaultAudioContinuityEnabled) != nil {
+            config.audioContinuityEnabled = defaults.bool(forKey: AppPreferenceKeys.defaultAudioContinuityEnabled)
+        }
+
+        if let sourceURL = overrides.sourceURL {
+            config.sourceURL = sourceURL
+        }
+        if let outputType = overrides.outputType {
+            config.outputType = outputType
+        }
+        if let mode = overrides.encodeMode {
+            config.encodeMode = mode
+        }
+        if let bufferSeconds = overrides.bufferSeconds {
+            config.bufferSeconds = bufferSeconds
+        }
+        if let useDisk = overrides.useDiskBackedBuffer {
+            config.useDiskBackedBuffer = useDisk
+        }
+        if let avOffset = overrides.avSyncOffsetMs {
+            config.avSyncOffsetMs = avOffset
+        }
+        if let audioBoostEnabled = overrides.audioBoostEnabled {
+            config.audioBoostEnabled = audioBoostEnabled
+        }
+        if let audioBoostDb = overrides.audioBoostDb {
+            config.audioBoostDb = audioBoostDb
+            if audioBoostDb > 0 && overrides.audioBoostEnabled == nil {
+                config.audioBoostEnabled = true
+            }
+        }
+        if let audioContinuityEnabled = overrides.audioContinuityEnabled {
+            config.audioContinuityEnabled = audioContinuityEnabled
+        }
+        if let rtmpServer = overrides.rtmpServerURL {
+            config.rtmpServerURL = rtmpServer
+            config.outputType = .rtmp
+        }
+        if let rtmpKey = overrides.rtmpStreamKey {
+            config.rtmpStreamKey = rtmpKey
+            config.outputType = .rtmp
+        }
+        if let rtmpFull = overrides.rtmpFullURLOverride {
+            config.rtmpFullURLOverride = rtmpFull
+            config.outputType = .rtmp
+        }
+        if let hls = overrides.hlsPlaylistPath {
+            config.hlsPlaylistPath = hls
+            config.outputType = .hls
+        }
+        if let outputTarget = overrides.outputTarget {
+            if config.outputType == .hls {
+                config.hlsPlaylistPath = outputTarget
+            } else {
+                config.rtmpFullURLOverride = outputTarget
+            }
         }
 
         return config
