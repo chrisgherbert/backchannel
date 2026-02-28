@@ -25,6 +25,7 @@ APP_SHORT_VERSION="${APP_SHORT_VERSION:-1.0}"
 ICON_ALPHA_TRIM_THRESHOLD="${APP_ICON_ALPHA_TRIM_THRESHOLD:-0}"
 ICON_FIT_MODE="${APP_ICON_FIT_MODE:-contain}"
 ICON_NORMALIZE_ENABLED="${APP_ICON_TRIM_ALPHA:-0}"
+DENO_REQUIRED="${DENO_REQUIRED:-0}"
 
 find_tool() {
   local name="$1"
@@ -493,7 +494,7 @@ else
   echo "Or set APP_ICON_FILE=/absolute/path/icon.icon (or .png/.icns)."
 fi
 
-echo "Bundling yt-dlp, ffmpeg, ffprobe, and deno (if available)..."
+echo "Bundling yt-dlp, ffmpeg, ffprobe, and deno..."
 YTDLP_PATH="${YTDLP_BINARY:-}"
 if [[ -z "$YTDLP_PATH" ]]; then
   YTDLP_PATH="$(find_tool yt-dlp)" || {
@@ -526,6 +527,12 @@ fi
 DENO_PATH="${DENO_BINARY:-}"
 if [[ -z "$DENO_PATH" ]]; then
   DENO_PATH="$(find_tool deno || true)"
+fi
+
+if [[ -z "$DENO_PATH" ]] && [[ "$DENO_REQUIRED" == "1" ]]; then
+  echo "Error: deno not found. Release builds require deno to be bundled." >&2
+  echo "Install deno (e.g. brew install deno) or set DENO_BINARY=/absolute/path/to/deno." >&2
+  exit 1
 fi
 
 if [[ ! -x "$YTDLP_PATH" ]]; then
