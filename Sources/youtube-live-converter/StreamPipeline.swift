@@ -36,6 +36,7 @@ final class StreamPipeline: ObservableObject {
     private var freezeRestartTimestamps: [Date] = []
     private var bufferCountdownTask: Task<Void, Never>?
     private var previewRequestID = 0
+    private var startRequestID = 0
     private var lastStatsParseUpdate = Date.distantPast
     private var lastYtDlpEventUpdate = Date.distantPast
     private var lastFfmpegEventUpdate = Date.distantPast
@@ -89,25 +90,39 @@ final class StreamPipeline: ObservableObject {
             appendLog("[app] Source URL and output target are required.")
             return
         }
+        let requestID = startRequestID + 1
+        startRequestID = requestID
+        status = "Starting"
+        appendLog("[app] Resolving bundled tools...")
 
-        guard let paths = resolveToolPaths() else {
-            status = "Missing Tools"
-            return
+        let resourceURL = Bundle.main.resourceURL
+        Task { [weak self, config, requestID, resourceURL] in
+            let resolution = await Self.resolveToolPathsOffMain(resourceURL: resourceURL)
+            guard let self else { return }
+            guard self.startRequestID == requestID else { return }
+            for line in resolution.logLines {
+                self.appendLog(line)
+            }
+            guard let paths = resolution.paths else {
+                self.status = "Missing Tools"
+                return
+            }
+
+            self.forceSoftwareEncoderForSession = false
+            self.freezeRestartTimestamps = []
+            self.pendingReprimeAfterRestart = false
+            self.startupReprimeActive = false
+            self.catchUpExpiresAt = Date.distantPast
+            self.destinationBusyUntil = Date.distantPast
+            self.highSpeedSince = Date.distantPast
+            self.lastPublishStartedAt = Date.distantPast
+            self.publisherRestartScheduled = false
+            self.startPipeline(config: config, paths: paths)
         }
-
-        forceSoftwareEncoderForSession = false
-        freezeRestartTimestamps = []
-        pendingReprimeAfterRestart = false
-        startupReprimeActive = false
-        catchUpExpiresAt = Date.distantPast
-        destinationBusyUntil = Date.distantPast
-        highSpeedSince = Date.distantPast
-        lastPublishStartedAt = Date.distantPast
-        publisherRestartScheduled = false
-        startPipeline(config: config, paths: paths)
     }
 
     func stop() {
+        startRequestID += 1
         shouldKeepRunning = false
         generation += 1
         restartScheduled = false
@@ -628,7 +643,7 @@ final class StreamPipeline: ObservableObject {
             while !Task.isCancelled {
                 guard self.shouldKeepRunning, generation == self.generation else { return }
 
-                let playlistDuration = self.readPlaylistDurationSeconds(from: playlistURL)
+                let playlistDuration = await Self.readPlaylistDurationSecondsOffMain(from: playlistURL)
                 let outputSeconds = self.parseClockToSeconds(self.parsedStatus.ffmpegTime) ?? 0
                 let availableSeconds = max(0.0, playlistDuration - outputSeconds)
                 self.updateDvrBufferState(
@@ -1928,7 +1943,13 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func readPlaylistDurationSeconds(from playlistURL: URL) -> Double {
+    nonisolated private static func readPlaylistDurationSecondsOffMain(from playlistURL: URL) async -> Double {
+        await Task.detached(priority: .utility) {
+            readPlaylistDurationSecondsBlocking(from: playlistURL)
+        }.value
+    }
+
+    nonisolated private static func readPlaylistDurationSecondsBlocking(from playlistURL: URL) -> Double {
         guard let text = try? String(contentsOf: playlistURL, encoding: .utf8) else {
             return 0
         }
@@ -2418,7 +2439,7 @@ final class StreamPipeline: ObservableObject {
     }
 }
 
-private struct ToolPaths {
+private struct ToolPaths: Sendable {
     let ytDlp: URL
     let ffmpeg: URL
     let ffprobe: URL
@@ -2481,61 +2502,75 @@ private final class ProcessCaptureState: @unchecked Sendable {
 }
 
 private extension StreamPipeline {
-    func resolveToolPaths() -> ToolPaths? {
-        guard let ytDlp = resolveTool(named: "yt-dlp") else {
-            appendLog("[app] Could not find yt-dlp. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
-            return nil
+    nonisolated private struct ToolResolution {
+        let paths: ToolPaths?
+        let logLines: [String]
+    }
+
+    nonisolated private static func resolveToolPathsOffMain(resourceURL: URL?) async -> ToolResolution {
+        await Task.detached(priority: .userInitiated) {
+            resolveToolPathsBlocking(resourceURL: resourceURL)
+        }.value
+    }
+
+    nonisolated private static func resolveToolPathsBlocking(resourceURL: URL?) -> ToolResolution {
+        var logLines: [String] = []
+
+        guard let ytDlp = resolveTool(named: "yt-dlp", resourceURL: resourceURL) else {
+            logLines.append("[app] Could not find yt-dlp. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
-        guard let ffmpeg = resolveTool(named: "ffmpeg") else {
-            appendLog("[app] Could not find ffmpeg. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
-            return nil
+        guard let ffmpeg = resolveTool(named: "ffmpeg", resourceURL: resourceURL) else {
+            logLines.append("[app] Could not find ffmpeg. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
-        guard let ffprobe = resolveTool(named: "ffprobe") else {
-            appendLog("[app] Could not find ffprobe. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
-            return nil
+        guard let ffprobe = resolveTool(named: "ffprobe", resourceURL: resourceURL) else {
+            logLines.append("[app] Could not find ffprobe. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
 
         guard verifyExecutable(ytDlp, probeArgument: "--version") else {
-            appendLog("[app] Found yt-dlp at \(ytDlp.path) but it cannot run. Use a standalone yt-dlp binary for distribution.")
-            return nil
+            logLines.append("[app] Found yt-dlp at \(ytDlp.path) but it cannot run. Use a standalone yt-dlp binary for distribution.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
         guard verifyExecutable(ffmpeg, probeArgument: "-version") else {
-            appendLog("[app] Found ffmpeg at \(ffmpeg.path) but it cannot run.")
-            return nil
+            logLines.append("[app] Found ffmpeg at \(ffmpeg.path) but it cannot run.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
         guard verifyExecutable(ffprobe, probeArgument: "-version") else {
-            appendLog("[app] Found ffprobe at \(ffprobe.path) but it cannot run.")
-            return nil
+            logLines.append("[app] Found ffprobe at \(ffprobe.path) but it cannot run.")
+            return ToolResolution(paths: nil, logLines: logLines)
         }
 
         var denoURL: URL?
-        if let deno = resolveTool(named: "deno") {
+        if let deno = resolveTool(named: "deno", resourceURL: resourceURL) {
             if verifyExecutable(deno, probeArgument: "--version") {
                 denoURL = deno
             } else {
-                appendLog("[app] Found deno at \(deno.path) but it cannot run. Continuing without JS runtime.")
+                logLines.append("[app] Found deno at \(deno.path) but it cannot run. Continuing without JS runtime.")
             }
         }
 
         let supportsVideoToolboxH264 = supportsFFmpegEncoder(ffmpeg, encoderName: "h264_videotoolbox")
         if !supportsVideoToolboxH264 {
-            appendLog("[app] Hardware H.264 encoder not available; falling back to software x264.")
+            logLines.append("[app] Hardware H.264 encoder not available; falling back to software x264.")
         }
 
-        return ToolPaths(
+        let paths = ToolPaths(
             ytDlp: ytDlp,
             ffmpeg: ffmpeg,
             ffprobe: ffprobe,
             deno: denoURL,
             supportsVideoToolboxH264: supportsVideoToolboxH264
         )
+        return ToolResolution(paths: paths, logLines: logLines)
     }
 
-    func resolveTool(named name: String) -> URL? {
+    nonisolated private static func resolveTool(named name: String, resourceURL: URL?) -> URL? {
         let fm = FileManager.default
         var candidates: [URL] = []
 
-        if let bundleURL = Bundle.main.resourceURL {
+        if let bundleURL = resourceURL {
             candidates.append(bundleURL.appendingPathComponent("bin/\(name)"))
             candidates.append(bundleURL.appendingPathComponent(name))
         }
@@ -2550,7 +2585,7 @@ private extension StreamPipeline {
         return nil
     }
 
-    func verifyExecutable(_ url: URL, probeArgument: String) -> Bool {
+    nonisolated private static func verifyExecutable(_ url: URL, probeArgument: String) -> Bool {
         let process = Process()
         process.executableURL = url
         process.arguments = [probeArgument]
@@ -2566,7 +2601,7 @@ private extension StreamPipeline {
         }
     }
 
-    func supportsFFmpegEncoder(_ ffmpegURL: URL, encoderName: String) -> Bool {
+    nonisolated private static func supportsFFmpegEncoder(_ ffmpegURL: URL, encoderName: String) -> Bool {
         let process = Process()
         process.executableURL = ffmpegURL
         process.arguments = ["-hide_banner", "-encoders"]
