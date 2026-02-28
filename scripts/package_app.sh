@@ -2,10 +2,12 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DISPLAY_NAME="Backchannel"
+APP_DISPLAY_NAME="Back Channel"
+APP_EXECUTABLE_NAME="Backchannel"
 APP_NAME="${APP_DISPLAY_NAME}.app"
 APP_DIR="$ROOT_DIR/dist/$APP_NAME"
 LEGACY_APP_DIR="$ROOT_DIR/dist/YouTube Live Converter.app"
+PREVIOUS_APP_DIR="$ROOT_DIR/dist/Backchannel.app"
 BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 RES_BIN_DIR="$RES_DIR/bin"
@@ -16,7 +18,7 @@ DEFAULT_ICON_ICON="$ROOT_DIR/assets/$APP_ICON_PROJECT_NAME"
 DEFAULT_ICON_ICNS="$ROOT_DIR/assets/$APP_ICON_ICNS_NAME"
 DEFAULT_ICON_PNG="$ROOT_DIR/assets/AppIcon.png"
 PRODUCT_BIN="$ROOT_DIR/.build/arm64-apple-macosx/release/youtube-live-converter"
-APP_BIN="$BIN_DIR/$APP_DISPLAY_NAME"
+APP_BIN="$BIN_DIR/$APP_EXECUTABLE_NAME"
 APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.chrisgherbert.backchannel}"
 APP_BUILD_VERSION="${APP_BUILD_VERSION:-$(date +%Y%m%d%H%M%S)}"
 APP_SHORT_VERSION="${APP_SHORT_VERSION:-1.0}"
@@ -347,6 +349,9 @@ rm -rf "$APP_DIR"
 if [[ -d "$LEGACY_APP_DIR" ]] && [[ "$LEGACY_APP_DIR" != "$APP_DIR" ]]; then
   rm -rf "$LEGACY_APP_DIR"
 fi
+if [[ -d "$PREVIOUS_APP_DIR" ]] && [[ "$PREVIOUS_APP_DIR" != "$APP_DIR" ]]; then
+  rm -rf "$PREVIOUS_APP_DIR"
+fi
 mkdir -p "$BIN_DIR" "$RES_DIR" "$RES_BIN_DIR"
 cp "$PRODUCT_BIN" "$APP_BIN"
 chmod +x "$APP_BIN"
@@ -361,7 +366,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key>
     <string>$APP_DISPLAY_NAME</string>
     <key>CFBundleExecutable</key>
-    <string>$APP_DISPLAY_NAME</string>
+    <string>$APP_EXECUTABLE_NAME</string>
     <key>CFBundleIdentifier</key>
     <string>$APP_BUNDLE_ID</string>
     <key>CFBundleVersion</key>

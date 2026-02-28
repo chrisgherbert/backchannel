@@ -27,11 +27,11 @@ require_var TEAM_ID
 require_var NOTARY_KEYCHAIN_PROFILE
 require_var YTDLP_BINARY
 
-APP_PATH="${APP_PATH:-$ROOT_DIR/dist/Backchannel.app}"
+APP_PATH="${APP_PATH:-$ROOT_DIR/dist/Back Channel.app}"
 if [[ -n "${APP_SHORT_VERSION:-}" ]]; then
-  ZIP_PATH="$ROOT_DIR/dist/Backchannel-${APP_SHORT_VERSION}.zip"
+  ZIP_PATH="$ROOT_DIR/dist/Back-Channel-${APP_SHORT_VERSION}.zip"
 else
-  ZIP_PATH="$ROOT_DIR/dist/Backchannel.zip"
+  ZIP_PATH="$ROOT_DIR/dist/Back-Channel.zip"
 fi
 
 echo "==> Building package"

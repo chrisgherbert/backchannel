@@ -62,7 +62,7 @@ swift run
 
 ## Build Self-Contained `.app`
 
-This creates `dist/Backchannel.app` and bundles `yt-dlp` + `ffmpeg` + `ffprobe` (and `deno` when available) into:
+This creates `dist/Back Channel.app` and bundles `yt-dlp` + `ffmpeg` + `ffprobe` (and `deno` when available) into:
 
 `Contents/Resources/bin/`
 
@@ -95,7 +95,7 @@ Use the packaging script directly:
 It will:
 
 1. Build release binary.
-2. Create `dist/Backchannel.app`.
+2. Create `dist/Back Channel.app`.
 3. Bundle required tools into `Contents/Resources/bin`.
 4. Apply ad-hoc signing (for local execution).
 
@@ -131,8 +131,8 @@ The release script runs:
 
 Output:
 
-- App: `dist/Backchannel.app`
-- Zip: `dist/Backchannel-<version>.zip` (or `dist/Backchannel.zip`)
+- App: `dist/Back Channel.app`
+- Zip: `dist/Back-Channel-<version>.zip` (or `dist/Back-Channel.zip`)
 
 ### 4. Standalone `yt-dlp` Binary
 
@@ -155,11 +155,11 @@ YTDLP_BINARY="$HOME/.local/bin/yt-dlp"
 If you need to run manually instead of `release_app.sh`:
 
 ```bash
-codesign --force --options runtime --timestamp --sign "Developer ID Application: <Name> (<TEAMID>)" "dist/Backchannel.app"
-ditto -c -k --keepParent "dist/Backchannel.app" "dist/Backchannel.zip"
-xcrun notarytool submit "dist/Backchannel.zip" --keychain-profile "<profile>" --wait
-xcrun stapler staple "dist/Backchannel.app"
-xcrun stapler validate "dist/Backchannel.app"
+codesign --force --options runtime --timestamp --sign "Developer ID Application: <Name> (<TEAMID>)" "dist/Back Channel.app"
+ditto -c -k --keepParent "dist/Back Channel.app" "dist/Back-Channel.zip"
+xcrun notarytool submit "dist/Back-Channel.zip" --keychain-profile "<profile>" --wait
+xcrun stapler staple "dist/Back Channel.app"
+xcrun stapler validate "dist/Back Channel.app"
 ```
 
 ## Usage
