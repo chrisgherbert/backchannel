@@ -6,6 +6,16 @@
     {
       "layers" : [
         {
+          "glass" : false,
+          "image-name" : "Frame 5 Copy 20.png",
+          "name" : "Frame 5 Copy 20"
+        },
+        {
+          "glass" : false,
+          "image-name" : "Frame 5 Copy 19.png",
+          "name" : "Frame 5 Copy 19"
+        },
+        {
           "fill" : "none",
           "glass" : false,
           "image-name" : "Frame 5 Copy 17.png",
