@@ -7,19 +7,37 @@
       "layers" : [
         {
           "glass" : false,
-          "image-name" : "Frame 5 Copy 20.png",
-          "name" : "Frame 5 Copy 20"
+          "image-name" : "Frame 5 Copy 22.png",
+          "name" : "Frame 5 Copy 22",
+          "position-specializations" : [
+            {
+              "idiom" : "square",
+              "value" : {
+                "scale" : 0.5,
+                "translation-in-points" : [
+                  0,
+                  0
+                ]
+              }
+            }
+          ]
         },
         {
           "glass" : false,
-          "image-name" : "Frame 5 Copy 19.png",
-          "name" : "Frame 5 Copy 19"
-        },
-        {
-          "fill" : "none",
-          "glass" : false,
-          "image-name" : "Frame 5 Copy 17.png",
-          "name" : "Frame 5 Copy 17"
+          "image-name" : "Frame 5 Copy 21.png",
+          "name" : "Frame 5 Copy 21",
+          "position-specializations" : [
+            {
+              "idiom" : "square",
+              "value" : {
+                "scale" : 0.5,
+                "translation-in-points" : [
+                  0,
+                  0
+                ]
+              }
+            }
+          ]
         }
       ],
       "shadow" : {
