@@ -12,8 +12,9 @@ struct ContentView: View {
     @State private var selectedRtmpPresetID = ""
     @State private var selectedSourcePresetID = ""
     @State private var selectedPanel: PanelTab = .status
+    @State private var isStartPending = false
     @AppStorage("show_inspector") private var showInspector = true
-    @AppStorage(AppPreferenceKeys.logMonitoringEnabled) private var logMonitoringEnabled = true
+    @AppStorage(AppPreferenceKeys.runtimeLogMonitoringEnabled) private var logMonitoringEnabled = true
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
     private let bufferOptions = [0, 5, 15, 30, 60, 120]
@@ -58,6 +59,11 @@ struct ContentView: View {
         .onAppear {
             if !didApplyLaunchOptions {
                 didApplyLaunchOptions = true
+                let defaults = UserDefaults.standard
+                if defaults.object(forKey: AppPreferenceKeys.runtimeLogMonitoringEnabled) == nil {
+                    let defaultValue = defaults.object(forKey: AppPreferenceKeys.defaultLogMonitoringEnabled) as? Bool ?? true
+                    logMonitoringEnabled = defaultValue
+                }
                 if let forcedLogging = launchOptions.extendedLogging {
                     logMonitoringEnabled = forcedLogging
                 }
@@ -106,6 +112,16 @@ struct ContentView: View {
         .onChange(of: sourcePresetsJSON) { _ in
             syncSelectedSourcePreset()
         }
+        .onChange(of: pipeline.isRunning) { isRunning in
+            if isRunning {
+                isStartPending = false
+            }
+        }
+        .onChange(of: pipeline.status) { _ in
+            if shouldClearStartPending {
+                isStartPending = false
+            }
+        }
     }
 
     private var footerBar: some View {
@@ -138,23 +154,37 @@ struct ContentView: View {
 
             HStack(spacing: 8) {
                 if canStart {
-                    Button("Start") { startStream() }
+                    Button {
+                        startStream()
+                    } label: {
+                        startButtonLabel
+                    }
                         .buttonStyle(.borderedProminent)
                         .tint(.green)
                         .controlSize(.regular)
                 } else {
-                    Button("Start") { startStream() }
+                    Button {
+                        startStream()
+                    } label: {
+                        startButtonLabel
+                    }
                         .disabled(true)
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
                 }
                 if pipeline.isRunning {
-                    Button("Stop") { pipeline.stop() }
+                    Button("Stop") {
+                        isStartPending = false
+                        pipeline.stop()
+                    }
                         .buttonStyle(.borderedProminent)
                         .tint(.red)
                         .controlSize(.regular)
                 } else {
-                    Button("Stop") { pipeline.stop() }
+                    Button("Stop") {
+                        isStartPending = false
+                        pipeline.stop()
+                    }
                         .disabled(true)
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
@@ -245,15 +275,23 @@ struct ContentView: View {
     private var inputSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
             if !sourcePresets.isEmpty {
-                labeled("Preset") {
-                    Picker("Input Source Preset", selection: $selectedSourcePresetID) {
-                        Text("Custom").tag("")
-                        ForEach(sourcePresets) { preset in
-                            Text(preset.name).tag(preset.id)
+                HStack(spacing: 8) {
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 4) {
+                        Text("Manage Presets in Settings")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Picker("Input Source Preset", selection: $selectedSourcePresetID) {
+                            Text("Custom").tag("")
+                            ForEach(sourcePresets) { preset in
+                                Text(preset.name).tag(preset.id)
+                            }
                         }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        .frame(width: 220, alignment: .trailing)
+                        .controlSize(.small)
                     }
-                    .pickerStyle(.menu)
-                    .frame(width: 280, alignment: .leading)
                 }
             }
 
@@ -354,15 +392,23 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 10) {
             if config.outputType == .rtmp {
                 if !rtmpPresets.isEmpty {
-                    labeled("Preset") {
-                        Picker("RTMP Preset", selection: $selectedRtmpPresetID) {
-                            Text("Custom").tag("")
-                            ForEach(rtmpPresets) { preset in
-                                Text(preset.name).tag(preset.id)
+                    HStack(spacing: 8) {
+                        Spacer()
+                        VStack(alignment: .trailing, spacing: 4) {
+                            Text("Manage Presets in Settings")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Picker("RTMP Preset", selection: $selectedRtmpPresetID) {
+                                Text("Custom").tag("")
+                                ForEach(rtmpPresets) { preset in
+                                    Text(preset.name).tag(preset.id)
+                                }
                             }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .frame(width: 220, alignment: .trailing)
+                            .controlSize(.small)
                         }
-                        .pickerStyle(.menu)
-                        .frame(width: 260, alignment: .leading)
                     }
                 }
                 labeled("Server URL") {
@@ -803,7 +849,29 @@ struct ContentView: View {
             liveSourceValidationMessage == nil &&
             outputValidationMessage == nil &&
             !pipeline.isRunning &&
-            !isLoadingSourceInfo
+            !isLoadingSourceInfo &&
+            !isStartPending
+    }
+
+    private var startButtonLabel: some View {
+        HStack(spacing: 6) {
+            if isStartPending {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.8)
+            }
+            Text("Start")
+        }
+    }
+
+    private var shouldClearStartPending: Bool {
+        if pipeline.isRunning { return true }
+        let state = pipeline.status.lowercased()
+        return state.contains("missing tools") ||
+            state == "idle" ||
+            state == "stopped" ||
+            state.contains("error") ||
+            state.contains("failed")
     }
 
     private var fullLogText: String {
@@ -971,6 +1039,7 @@ struct ContentView: View {
     private func startStream() {
         var runtimeConfig = config
         runtimeConfig.outputTarget = runtimeConfig.resolvedOutputTarget()
+        isStartPending = true
         pipeline.start(config: runtimeConfig)
     }
 

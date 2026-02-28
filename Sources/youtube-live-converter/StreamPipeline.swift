@@ -72,6 +72,7 @@ final class StreamPipeline: ObservableObject {
     private var lastSuppressedProgressFlushAt = Date.distantPast
     private var pendingUiLogLines: [String] = []
     private var logFlushTask: Task<Void, Never>?
+    private var lastHighFrequencyParseAt = Date.distantPast
     private var ffmpegDiagnosticCounters: [String: Int] = [:]
     private var recentFfmpegDiagnosticLines: [String] = []
     private var lastDiagnosticSnapshotAt = Date.distantPast
@@ -84,6 +85,7 @@ final class StreamPipeline: ObservableObject {
     private var pendingReprimeAfterRestart = false
     private var startupReprimeActive = false
     private var catchUpExpiresAt = Date.distantPast
+    private var shouldResumeAfterSystemWake = false
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
@@ -184,6 +186,76 @@ final class StreamPipeline: ObservableObject {
         dvrSessionDirectory = nil
         dvrPlaylistURL = nil
         dvrSegmentPattern = nil
+    }
+
+    func stopForAppTermination() {
+        startRequestID += 1
+        shouldKeepRunning = false
+        generation += 1
+        restartScheduled = false
+        publisherRestartScheduled = false
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = nil
+        outputFreezeMonitorTask?.cancel()
+        outputFreezeMonitorTask = nil
+        diagnosticHeartbeatTask?.cancel()
+        diagnosticHeartbeatTask = nil
+        bufferCountdownTask?.cancel()
+        bufferCountdownTask = nil
+        logFlushTask?.cancel()
+        logFlushTask = nil
+
+        let processes = [
+            ("yt-dlp", ytDlpProcess),
+            ("ffmpeg", ffmpegProcess),
+            ("normalizer", normalizerProcess)
+        ]
+
+        for (_, process) in processes {
+            process?.terminationHandler = nil
+        }
+
+        for (label, process) in processes {
+            forceTerminateProcess(process, label: label)
+        }
+
+        ytDlpProcess = nil
+        ffmpegProcess = nil
+        normalizerProcess = nil
+        cleanupDvrSessionFiles()
+        dvrSessionDirectory = nil
+        dvrPlaylistURL = nil
+        dvrSegmentPattern = nil
+        ytDlpErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        ffmpegErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        normalizerErrorPipe?.fileHandleForReading.readabilityHandler = nil
+        ytDlpErrorPipe = nil
+        ffmpegErrorPipe = nil
+        normalizerErrorPipe = nil
+    }
+
+    func prepareForSystemSleep() -> Bool {
+        guard isRunning else { return false }
+        appendLog("[app] System sleep detected. Stopping active session.")
+        stop()
+        return true
+    }
+
+    func resumeAfterSystemWakeIfNeeded() {
+        guard !isRunning else { return }
+        guard let config = currentConfig else { return }
+        appendLog("[app] System wake detected. Restarting previous session.")
+        start(config: config)
+    }
+
+    func handleSystemWillSleep() {
+        shouldResumeAfterSystemWake = prepareForSystemSleep()
+    }
+
+    func handleSystemDidWake() {
+        guard shouldResumeAfterSystemWake else { return }
+        shouldResumeAfterSystemWake = false
+        resumeAfterSystemWakeIfNeeded()
     }
 
     private func startPipeline(config: StreamConfig, paths: ToolPaths) {
@@ -361,20 +433,16 @@ final class StreamPipeline: ObservableObject {
         )
 
         let mediaPipe = Pipe()
-        let monitorLogs = logMonitoringEnabled
-        let ytError = monitorLogs ? Pipe() : nil
-        let ffError = monitorLogs ? Pipe() : nil
-        let normalizerError = (monitorLogs && config.encodeMode == .transcode) ? Pipe() : nil
+        // Always capture stderr to keep process IO drained and telemetry behavior consistent.
+        let ytError = Pipe()
+        let ffError = Pipe()
+        let normalizerError = config.encodeMode == .transcode ? Pipe() : nil
         let useDvrPipeline = config.encodeMode == .transcode
         startupReprimeActive = false
         pendingReprimeAfterRestart = false
 
         ytDlp.standardOutput = mediaPipe
-        if let ytError {
-            ytDlp.standardError = ytError
-        } else {
-            ytDlp.standardError = FileHandle.nullDevice
-        }
+        ytDlp.standardError = ytError
 
         ytDlpErrorPipe = ytError
         ffmpegErrorPipe = ffError
@@ -382,12 +450,8 @@ final class StreamPipeline: ObservableObject {
 
         resetPerLaunchState(config: config)
 
-        if let ytError {
-            observe(pipe: ytError, source: "yt-dlp", generation: currentGeneration)
-        }
-        if let ffError {
-            observe(pipe: ffError, source: "ffmpeg", generation: currentGeneration)
-        }
+        observe(pipe: ytError, source: "yt-dlp", generation: currentGeneration)
+        observe(pipe: ffError, source: "ffmpeg", generation: currentGeneration)
         if let normalizerError {
             observe(pipe: normalizerError, source: "ffmpeg-normalizer", generation: currentGeneration)
         }
@@ -734,6 +798,18 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
+    private func forceTerminateProcess(_ process: Process?, label: String) {
+        guard let process, process.isRunning else { return }
+        let pid = process.processIdentifier
+        process.terminate()
+        usleep(150_000)
+        if process.isRunning {
+            _ = Darwin.kill(pid_t(pid), SIGKILL)
+            usleep(80_000)
+            appendLog("[app] Force-killed \(label) process during app termination (pid \(pid)).")
+        }
+    }
+
     private func handleTermination(generation: Int, source: String, status: Int32) {
         guard generation == self.generation else { return }
         bufferCountdownTask?.cancel()
@@ -872,9 +948,7 @@ final class StreamPipeline: ObservableObject {
 
             let ffError = Pipe()
             self.ffmpegErrorPipe = ffError
-            if self.logMonitoringEnabled {
-                self.observe(pipe: ffError, source: "ffmpeg", generation: generation)
-            }
+            self.observe(pipe: ffError, source: "ffmpeg", generation: generation)
             let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
             let publisher = self.makeDvrPublisherProcess(
                 paths: paths,
@@ -1444,20 +1518,63 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func appendLog(_ message: String) {
+        let isToolMessage = message.hasPrefix("[yt-dlp] ") ||
+            message.hasPrefix("[ffmpeg] ") ||
+            message.hasPrefix("[ffmpeg-normalizer] ")
+
         if shouldSuppressVerboseMetadata(message) {
+            parseSuppressedLineIfNeeded(message)
             suppressedMetadataLineCount += 1
             flushSuppressedMetadataIfNeeded(force: false)
             return
         }
         if shouldSuppressHighFrequencyProgress(message) {
-            parseStatus(from: message)
+            parseSuppressedLineIfNeeded(message)
             suppressedProgressLineCount += 1
             flushSuppressedProgressIfNeeded(force: false)
             return
         }
+
+        if isToolMessage && !logMonitoringEnabled {
+            parseStatus(from: message)
+            if shouldAlwaysSurfaceToolMessage(message) {
+                appendLogCore(message)
+            }
+            return
+        }
+
         flushSuppressedMetadataIfNeeded(force: false)
         flushSuppressedProgressIfNeeded(force: false)
         appendLogCore(message)
+    }
+
+    private func parseSuppressedLineIfNeeded(_ message: String) {
+        if message.contains("[ffmpeg] frame=") {
+            let now = Date()
+            guard now.timeIntervalSince(lastHighFrequencyParseAt) >= 0.25 else { return }
+            lastHighFrequencyParseAt = now
+            parseStatus(from: message)
+            return
+        }
+
+        if message.contains("[ffmpeg]") && (message.contains("out_time_") || message.contains("speed=") || message.contains("bitrate=")) {
+            parseStatus(from: message)
+            return
+        }
+    }
+
+    private func shouldAlwaysSurfaceToolMessage(_ message: String) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("error:") || lower.contains(" error") || lower.contains("failed") {
+            return true
+        }
+        if lower.contains("exited with status") ||
+            lower.contains("server error") ||
+            lower.contains("connection reset") ||
+            lower.contains("broken pipe") {
+            return true
+        }
+        return false
     }
 
     private func appendLogCore(_ message: String) {
@@ -2370,72 +2487,54 @@ final class StreamPipeline: ObservableObject {
             return (nil, "Failed to prepare temp directory")
         }
 
-        var args = ["--dump-single-json", "--skip-download", "--no-warnings"]
+        // Fast path: ask yt-dlp for only the fields the UI needs.
+        var fastArgs = ["--skip-download", "--no-warnings", "--no-playlist"]
         if let deno {
-            args += ["--js-runtimes", "deno:\(deno.path)"]
+            fastArgs += ["--js-runtimes", "deno:\(deno.path)"]
         }
-        args += [
+        fastArgs += [
+            "--print", "title=%(title)s",
+            "--print", "thumbnail=%(thumbnail)s",
+            "--print", "live_status=%(live_status)s",
+            "--print", "is_live=%(is_live)s",
+            "--print", "was_live=%(was_live)s",
+            "--print", "release_timestamp=%(release_timestamp)s",
+            "--print", "duration=%(duration)s",
+            "--print", "width=%(width)s",
+            "--print", "height=%(height)s",
+            "--print", "fps=%(fps)s",
+            "--print", "tbr=%(tbr)s",
+            "--print", "vcodec=%(vcodec)s",
             "--paths", "home:\(ytDlpWorkDir.path)",
             "--paths", "temp:\(ytDlpWorkDir.path)",
             "--ffmpeg-location", ffmpegToolsDir,
             sourceURL
         ]
 
-        guard let result = await runProcessCaptureForPreview(
+        if let fastResult = await runProcessCaptureForPreview(
             executableURL: ytDlp,
-            arguments: args,
+            arguments: fastArgs,
             environment: mergedEnvironmentForPreview(prependingPath: ffmpegToolsDir),
             currentDirectoryURL: ytDlpWorkDir,
-            timeoutSeconds: 20
-        ) else {
-            return (nil, "Failed to run metadata lookup")
-        }
-
-        if result.exitCode == Self.processTimeoutExitCode {
-            return (nil, "Source info lookup timed out")
-        }
-
-        guard result.exitCode == 0 else {
-            return (nil, "Could not load source info")
-        }
-
-        do {
-            guard
-                let object = try JSONSerialization.jsonObject(with: result.stdoutData) as? [String: Any]
-            else {
-                return (nil, "Metadata response was invalid")
+            timeoutSeconds: 12
+        ) {
+            if fastResult.exitCode == Self.processTimeoutExitCode {
+                return (nil, "Source info lookup timed out")
             }
-
-            let title = (object["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let description = (object["description"] as? String) ?? ""
-            let thumbnailString = (object["thumbnail"] as? String) ?? ""
-            let publishState = parsePublishState(from: object)
-            let streamTechnical = parseTechnicalSummary(from: object)
-            let excerpt = description
-                .replacingOccurrences(of: "\n", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let shortExcerpt = String(excerpt.prefix(220))
-
-            if title.isEmpty {
-                return (nil, "Source title unavailable")
+            if fastResult.exitCode == 0,
+               let quickPreview = parseQuickPreview(from: fastResult.stdoutData) {
+                return (quickPreview, "Source info loaded")
             }
-
-            return (
-                StreamPreview(
-                    title: title,
-                    descriptionExcerpt: shortExcerpt,
-                    thumbnailURL: URL(string: thumbnailString),
-                    publishState: publishState,
-                    resolutionLabel: streamTechnical.resolution,
-                    frameRateLabel: streamTechnical.fps,
-                    bitrateLabel: streamTechnical.bitrate,
-                    codecLabel: streamTechnical.codec
-                ),
-                "Source info loaded"
-            )
-        } catch {
-            return (nil, "Could not parse source info")
         }
+
+        // Fallback for providers/templates that don't expose quick fields reliably.
+        return await fetchPreviewMetadataViaJSON(
+            sourceURL: sourceURL,
+            ytDlp: ytDlp,
+            ffmpegToolsDir: ffmpegToolsDir,
+            deno: deno,
+            ytDlpWorkDir: ytDlpWorkDir
+        )
     }
 }
 
@@ -2832,6 +2931,180 @@ private extension StreamPipeline {
         return .unknown
     }
 
+    nonisolated private static func fetchPreviewMetadataViaJSON(
+        sourceURL: String,
+        ytDlp: URL,
+        ffmpegToolsDir: String,
+        deno: URL?,
+        ytDlpWorkDir: URL
+    ) async -> (preview: StreamPreview?, message: String) {
+        var args = ["--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist"]
+        if let deno {
+            args += ["--js-runtimes", "deno:\(deno.path)"]
+        }
+        args += [
+            "--paths", "home:\(ytDlpWorkDir.path)",
+            "--paths", "temp:\(ytDlpWorkDir.path)",
+            "--ffmpeg-location", ffmpegToolsDir,
+            sourceURL
+        ]
+
+        guard let result = await runProcessCaptureForPreview(
+            executableURL: ytDlp,
+            arguments: args,
+            environment: mergedEnvironmentForPreview(prependingPath: ffmpegToolsDir),
+            currentDirectoryURL: ytDlpWorkDir,
+            timeoutSeconds: 20
+        ) else {
+            return (nil, "Failed to run metadata lookup")
+        }
+
+        if result.exitCode == Self.processTimeoutExitCode {
+            return (nil, "Source info lookup timed out")
+        }
+
+        guard result.exitCode == 0 else {
+            return (nil, "Could not load source info")
+        }
+
+        do {
+            guard
+                let object = try JSONSerialization.jsonObject(with: result.stdoutData) as? [String: Any]
+            else {
+                return (nil, "Metadata response was invalid")
+            }
+
+            let title = (object["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let description = (object["description"] as? String) ?? ""
+            let thumbnailString = (object["thumbnail"] as? String) ?? ""
+            let publishState = parsePublishState(from: object)
+            let streamTechnical = parseTechnicalSummary(from: object)
+            let excerpt = description
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let shortExcerpt = String(excerpt.prefix(220))
+
+            if title.isEmpty {
+                return (nil, "Source title unavailable")
+            }
+
+            return (
+                StreamPreview(
+                    title: title,
+                    descriptionExcerpt: shortExcerpt,
+                    thumbnailURL: URL(string: thumbnailString),
+                    publishState: publishState,
+                    resolutionLabel: streamTechnical.resolution,
+                    frameRateLabel: streamTechnical.fps,
+                    bitrateLabel: streamTechnical.bitrate,
+                    codecLabel: streamTechnical.codec
+                ),
+                "Source info loaded"
+            )
+        } catch {
+            return (nil, "Could not parse source info")
+        }
+    }
+
+    nonisolated private static func parseQuickPreview(from data: Data) -> StreamPreview? {
+        let output = String(decoding: data, as: UTF8.self)
+        let lines = output.split(whereSeparator: \.isNewline)
+        var fields: [String: String] = [:]
+
+        for rawLine in lines {
+            let line = String(rawLine)
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let valueStart = line.index(after: eq)
+            let value = String(line[valueStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { continue }
+            fields[key] = value
+        }
+
+        let title = (fields["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return nil }
+
+        let publishState = parsePublishState(fromQuickFields: fields)
+        let streamTechnical = parseTechnicalSummary(fromQuickFields: fields)
+
+        return StreamPreview(
+            title: title,
+            descriptionExcerpt: "",
+            thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
+            publishState: publishState,
+            resolutionLabel: streamTechnical.resolution,
+            frameRateLabel: streamTechnical.fps,
+            bitrateLabel: streamTechnical.bitrate,
+            codecLabel: streamTechnical.codec
+        )
+    }
+
+    nonisolated private static func parsePublishState(fromQuickFields fields: [String: String]) -> PublishState {
+        if let liveStatus = fields["live_status"]?.lowercased() {
+            switch liveStatus {
+            case "is_live":
+                return .live
+            case "is_upcoming":
+                return .upcoming
+            case "not_live", "post_live", "was_live":
+                return .published
+            default:
+                break
+            }
+        }
+
+        if boolValue(from: fields["is_live"]) == true {
+            return .live
+        }
+        if boolValue(from: fields["was_live"]) == true {
+            return .published
+        }
+        if let releaseTs = intValue(from: fields["release_timestamp"]),
+           releaseTs > Int(Date().timeIntervalSince1970) {
+            return .upcoming
+        }
+        if let duration = doubleValue(from: fields["duration"]), duration > 0 {
+            return .published
+        }
+        return .unknown
+    }
+
+    nonisolated private static func parseTechnicalSummary(fromQuickFields fields: [String: String]) -> (resolution: String, fps: String, bitrate: String, codec: String) {
+        let width = intValue(from: fields["width"])
+        let height = intValue(from: fields["height"])
+        let fps = doubleValue(from: fields["fps"])
+        let tbr = doubleValue(from: fields["tbr"])
+        let codec = codecValue(from: fields["vcodec"])
+
+        let resolutionText: String
+        if let width, let height, width > 0, height > 0 {
+            resolutionText = "\(width)x\(height)"
+        } else {
+            resolutionText = "Unknown"
+        }
+
+        let fpsText: String
+        if let fps, fps > 0 {
+            fpsText = "\(Int(fps.rounded())) fps"
+        } else {
+            fpsText = "Unknown"
+        }
+
+        let bitrateText: String
+        if let tbr, tbr > 0 {
+            if tbr >= 1000 {
+                bitrateText = String(format: "%.2f Mbps", tbr / 1000.0)
+            } else {
+                bitrateText = "\(Int(tbr.rounded())) kbps"
+            }
+        } else {
+            bitrateText = "Unknown"
+        }
+
+        let codecText = codec ?? "Unknown"
+        return (resolutionText, fpsText, bitrateText, codecText)
+    }
+
     nonisolated private static func parseTechnicalSummary(from object: [String: Any]) -> (resolution: String, fps: String, bitrate: String, codec: String) {
         var width = intValue(from: object["width"])
         var height = intValue(from: object["height"])
@@ -2936,6 +3209,25 @@ private extension StreamPipeline {
         }
         if let string = raw as? String, let double = Double(string) {
             return double
+        }
+        return nil
+    }
+
+    nonisolated private static func boolValue(from raw: Any?) -> Bool? {
+        if let bool = raw as? Bool {
+            return bool
+        }
+        if let int = raw as? Int {
+            return int != 0
+        }
+        if let string = raw as? String {
+            let normalized = string.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if ["true", "yes", "1"].contains(normalized) {
+                return true
+            }
+            if ["false", "no", "0", ""].contains(normalized) {
+                return false
+            }
         }
         return nil
     }

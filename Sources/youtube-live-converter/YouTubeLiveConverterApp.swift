@@ -40,8 +40,26 @@ struct YouTubeLiveConverterApp: App {
     }
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var pipeline: StreamPipeline?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(handleWorkspaceWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(handleWorkspaceDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let pipeline, pipeline.isRunning else {
@@ -57,9 +75,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            pipeline.stop()
+            pipeline.stopForAppTermination()
             return .terminateNow
         }
         return .terminateCancel
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        pipeline?.stopForAppTermination()
+    }
+
+    @objc private func handleWorkspaceWillSleep() {
+        pipeline?.handleSystemWillSleep()
+    }
+
+    @objc private func handleWorkspaceDidWake() {
+        pipeline?.handleSystemDidWake()
     }
 }

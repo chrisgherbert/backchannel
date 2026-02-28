@@ -21,7 +21,7 @@ struct SettingsView: View {
     @AppStorage(AppPreferenceKeys.defaultAudioBoostEnabled) private var defaultAudioBoostEnabled = false
     @AppStorage(AppPreferenceKeys.defaultAudioBoostDb) private var defaultAudioBoostDb = 0
     @AppStorage(AppPreferenceKeys.defaultAudioContinuityEnabled) private var defaultAudioContinuityEnabled = true
-    @AppStorage(AppPreferenceKeys.logMonitoringEnabled) private var defaultExtendedLogging = true
+    @AppStorage(AppPreferenceKeys.defaultLogMonitoringEnabled) private var defaultExtendedLogging = true
     @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
