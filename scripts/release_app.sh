@@ -27,6 +27,13 @@ require_var TEAM_ID
 require_var NOTARY_KEYCHAIN_PROFILE
 require_var YTDLP_BINARY
 
+cleanup() {
+  if [[ -n "${NOTARY_RESULT_FILE:-}" ]] && [[ -f "$NOTARY_RESULT_FILE" ]]; then
+    rm -f "$NOTARY_RESULT_FILE"
+  fi
+}
+trap cleanup EXIT
+
 APP_PATH="${APP_PATH:-$ROOT_DIR/dist/Back Channel.app}"
 if [[ -n "${APP_SHORT_VERSION:-}" ]]; then
   ZIP_PATH="$ROOT_DIR/dist/Back-Channel-${APP_SHORT_VERSION}.zip"
@@ -61,7 +68,6 @@ codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_
 
 echo "==> Verifying signature"
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
-spctl --assess --type execute --verbose "$APP_PATH"
 
 if [[ "${STORE_NOTARY_CREDENTIALS:-0}" == "1" ]]; then
   require_var APPLE_ID
@@ -76,15 +82,38 @@ fi
 echo "==> Creating notarization archive"
 rm -f "$ZIP_PATH"
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
+if [[ ! -f "$ZIP_PATH" ]]; then
+  echo "Error: notarization archive was not created: $ZIP_PATH" >&2
+  exit 1
+fi
 
 echo "==> Submitting for notarization (wait)"
+NOTARY_RESULT_FILE="$(mktemp "${TMPDIR:-/tmp}/backchannel-notary.XXXXXX.json")"
 xcrun notarytool submit "$ZIP_PATH" \
   --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" \
-  --wait
+  --wait \
+  --output-format json > "$NOTARY_RESULT_FILE"
+
+NOTARY_STATUS="$(/usr/bin/plutil -extract status raw "$NOTARY_RESULT_FILE" 2>/dev/null || true)"
+NOTARY_ID="$(/usr/bin/plutil -extract id raw "$NOTARY_RESULT_FILE" 2>/dev/null || true)"
+echo "Notary submission ID: ${NOTARY_ID:-unknown}"
+echo "Notary status: ${NOTARY_STATUS:-unknown}"
+
+if [[ "${NOTARY_STATUS:-}" != "Accepted" ]]; then
+  echo "Error: notarization did not return Accepted." >&2
+  if [[ -n "${NOTARY_ID:-}" ]]; then
+    echo "Fetching notarization log for submission ${NOTARY_ID}..." >&2
+    xcrun notarytool log "$NOTARY_ID" --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" || true
+  fi
+  exit 1
+fi
 
 echo "==> Stapling ticket"
 xcrun stapler staple "$APP_PATH"
 xcrun stapler validate "$APP_PATH"
+
+echo "==> Final Gatekeeper assessment"
+spctl --assess --type execute --verbose=4 "$APP_PATH"
 
 echo "==> Release build ready"
 echo "App: $APP_PATH"
