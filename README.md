@@ -66,6 +66,11 @@ This creates `dist/Back Channel.app` and bundles `yt-dlp` + `ffmpeg` + `ffprobe`
 
 `Contents/Resources/bin/`
 
+It also bundles a CLI launcher and installer:
+
+- `Contents/Resources/bin/backchannel`
+- `Contents/Resources/bin/install-cli.sh`
+
 ```bash
 ./scripts/package_app.sh
 ```
@@ -79,6 +84,25 @@ You can override tool paths:
 
 ```bash
 YTDLP_BINARY=/path/to/yt-dlp FFMPEG_BINARY=/path/to/ffmpeg FFPROBE_BINARY=/path/to/ffprobe DENO_BINARY=/path/to/deno APP_ICON_FILE=/path/to/icon.png ./scripts/package_app.sh
+```
+
+Install terminal command from the packaged app:
+
+```bash
+"/Users/herbert/web/youtube-live-converter/dist/Back Channel.app/Contents/Resources/bin/install-cli.sh"
+```
+
+This installs to `~/.local/bin/backchannel` by default (no `sudo`).
+For a system-wide install, override target dir:
+
+```bash
+CLI_TARGET_DIR=/usr/local/bin "/Users/herbert/web/youtube-live-converter/dist/Back Channel.app/Contents/Resources/bin/install-cli.sh"
+```
+
+Then run:
+
+```bash
+backchannel --help
 ```
 
 For distribution to other Macs, use a standalone `yt-dlp` binary. Some Homebrew installs provide a Python wrapper script, which is not portable by itself.

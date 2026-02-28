@@ -72,7 +72,7 @@ struct ContentView: View {
             pipeline.setLogMonitoringEnabled(logMonitoringEnabled)
             syncSelectedRtmpPreset()
             syncSelectedSourcePreset()
-            if launchOptions.autoStart && !didAutoStart {
+            if launchOptions.shouldAutoStart && !didAutoStart {
                 didAutoStart = true
                 startStream()
             }

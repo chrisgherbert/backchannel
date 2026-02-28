@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Darwin
 
 @main
 struct YouTubeLiveConverterApp: App {
@@ -43,6 +44,9 @@ struct YouTubeLiveConverterApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var pipeline: StreamPipeline?
+    private var signalIntSource: DispatchSourceSignal?
+    private var signalTermSource: DispatchSourceSignal?
+    private var terminateWithoutPrompt = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let workspaceCenter = NSWorkspace.shared.notificationCenter
@@ -59,9 +63,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.didWakeNotification,
             object: nil
         )
+
+        installSignalHandlers()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if terminateWithoutPrompt {
+            pipeline?.stopForAppTermination()
+            return .terminateNow
+        }
+
         guard let pipeline, pipeline.isRunning else {
             return .terminateNow
         }
@@ -83,6 +94,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        signalIntSource?.cancel()
+        signalIntSource = nil
+        signalTermSource?.cancel()
+        signalTermSource = nil
         pipeline?.stopForAppTermination()
     }
 
@@ -92,5 +107,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleWorkspaceDidWake() {
         pipeline?.handleSystemDidWake()
+    }
+
+    private func installSignalHandlers() {
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+
+        let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
+        intSource.setEventHandler { [weak self] in
+            self?.handleTerminationSignal(name: "SIGINT")
+        }
+        intSource.resume()
+        signalIntSource = intSource
+
+        let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        termSource.setEventHandler { [weak self] in
+            self?.handleTerminationSignal(name: "SIGTERM")
+        }
+        termSource.resume()
+        signalTermSource = termSource
+    }
+
+    private func handleTerminationSignal(name: String) {
+        terminateWithoutPrompt = true
+        fputs("[app] Received \(name). Stopping session and exiting.\n", stderr)
+        fflush(stderr)
+        NSApplication.shared.terminate(nil)
     }
 }

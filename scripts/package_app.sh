@@ -11,6 +11,8 @@ PREVIOUS_APP_DIR="$ROOT_DIR/dist/Backchannel.app"
 BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 RES_BIN_DIR="$RES_DIR/bin"
+CLI_LAUNCHER_NAME="backchannel"
+CLI_INSTALLER_NAME="install-cli.sh"
 APP_ICON_NAME="AppIcon"
 APP_ICON_ICNS_NAME="${APP_ICON_NAME}.icns"
 APP_ICON_PROJECT_NAME="${APP_ICON_NAME}.icon"
@@ -356,6 +358,67 @@ fi
 mkdir -p "$BIN_DIR" "$RES_DIR" "$RES_BIN_DIR"
 cp "$PRODUCT_BIN" "$APP_BIN"
 chmod +x "$APP_BIN"
+
+cat > "$RES_BIN_DIR/$CLI_LAUNCHER_NAME" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_PATH="${BASH_SOURCE[0]:-$0}"
+while [[ -h "$SOURCE_PATH" ]]; do
+  SOURCE_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$SOURCE_PATH")"
+  if [[ "$LINK_TARGET" == /* ]]; then
+    SOURCE_PATH="$LINK_TARGET"
+  else
+    SOURCE_PATH="$SOURCE_DIR/$LINK_TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
+APP_EXEC="$SCRIPT_DIR/../../MacOS/Backchannel"
+
+if [[ ! -x "$APP_EXEC" ]]; then
+  echo "Error: Back Channel app executable not found at: $APP_EXEC" >&2
+  exit 1
+fi
+
+exec "$APP_EXEC" "$@"
+SH
+chmod +x "$RES_BIN_DIR/$CLI_LAUNCHER_NAME"
+
+cat > "$RES_BIN_DIR/$CLI_INSTALLER_NAME" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CLI_SOURCE="$SCRIPT_DIR/backchannel"
+DEFAULT_USER_BIN="${HOME:-}/.local/bin"
+CLI_TARGET_DIR="${CLI_TARGET_DIR:-$DEFAULT_USER_BIN}"
+CLI_TARGET="$CLI_TARGET_DIR/backchannel"
+
+if [[ ! -x "$CLI_SOURCE" ]]; then
+  echo "Error: CLI launcher not found: $CLI_SOURCE" >&2
+  exit 1
+fi
+
+if [[ -z "$CLI_TARGET_DIR" ]]; then
+  echo "Error: unable to determine target install directory." >&2
+  exit 1
+fi
+
+mkdir -p "$CLI_TARGET_DIR"
+ln -sf "$CLI_SOURCE" "$CLI_TARGET"
+
+echo "Installed: $CLI_TARGET -> $CLI_SOURCE"
+echo "Try: backchannel --help"
+if [[ ":$PATH:" != *":$CLI_TARGET_DIR:"* ]]; then
+  echo "Note: $CLI_TARGET_DIR is not currently in your PATH."
+  echo "Add this line to your shell profile:"
+  echo "  export PATH=\"$CLI_TARGET_DIR:\$PATH\""
+fi
+echo "For system-wide install, run with:"
+echo "  CLI_TARGET_DIR=/usr/local/bin \"$0\""
+SH
+chmod +x "$RES_BIN_DIR/$CLI_INSTALLER_NAME"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

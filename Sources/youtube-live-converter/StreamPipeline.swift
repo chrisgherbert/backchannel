@@ -20,6 +20,7 @@ final class StreamPipeline: ObservableObject {
     private var dvrBufferMonitorTask: Task<Void, Never>?
     private var outputFreezeMonitorTask: Task<Void, Never>?
     private var diagnosticHeartbeatTask: Task<Void, Never>?
+    private var cliStatusTask: Task<Void, Never>?
     private var currentConfig: StreamConfig?
     private var dvrSessionDirectory: URL?
     private var dvrPlaylistURL: URL?
@@ -86,6 +87,7 @@ final class StreamPipeline: ObservableObject {
     private var startupReprimeActive = false
     private var catchUpExpiresAt = Date.distantPast
     private var shouldResumeAfterSystemWake = false
+    private var lastCliStatusLine = ""
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
@@ -130,6 +132,8 @@ final class StreamPipeline: ObservableObject {
         restartScheduled = false
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
+        cliStatusTask?.cancel()
+        cliStatusTask = nil
         terminatePipeline()
         isRunning = false
         status = "Stopped"
@@ -186,6 +190,11 @@ final class StreamPipeline: ObservableObject {
         dvrSessionDirectory = nil
         dvrPlaylistURL = nil
         dvrSegmentPattern = nil
+        if cliLogMirroringEnabled {
+            emitCliStatus(force: true)
+            fputs("[cli] Session stopped.\n", stdout)
+            fflush(stdout)
+        }
     }
 
     func stopForAppTermination() {
@@ -200,6 +209,8 @@ final class StreamPipeline: ObservableObject {
         outputFreezeMonitorTask = nil
         diagnosticHeartbeatTask?.cancel()
         diagnosticHeartbeatTask = nil
+        cliStatusTask?.cancel()
+        cliStatusTask = nil
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
         logFlushTask?.cancel()
@@ -569,6 +580,7 @@ final class StreamPipeline: ObservableObject {
             startBufferCountdownIfNeeded(config: config, generation: currentGeneration)
             startOutputFreezeMonitorIfNeeded()
             startDiagnosticHeartbeatIfNeeded()
+            startCliStatusTickerIfNeeded()
         } catch {
             appendLog("[app] Failed to start pipeline: \(error.localizedDescription)")
             terminatePipeline()
@@ -763,6 +775,8 @@ final class StreamPipeline: ObservableObject {
         outputFreezeMonitorTask = nil
         diagnosticHeartbeatTask?.cancel()
         diagnosticHeartbeatTask = nil
+        cliStatusTask?.cancel()
+        cliStatusTask = nil
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
 
@@ -1587,6 +1601,43 @@ final class StreamPipeline: ObservableObject {
         pendingUiLogLines.append(line)
         scheduleLogFlushIfNeeded()
         parseStatus(from: message)
+    }
+
+    private func startCliStatusTickerIfNeeded() {
+        cliStatusTask?.cancel()
+        lastCliStatusLine = ""
+        guard cliLogMirroringEnabled else { return }
+        cliStatusTask = Task { @MainActor [weak self] in
+            while let self, !Task.isCancelled {
+                guard self.shouldKeepRunning || self.isRunning else { break }
+                self.emitCliStatus(force: false)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func emitCliStatus(force: Bool) {
+        guard cliLogMirroringEnabled else { return }
+        let retry = parsedStatus.reconnectDelay == "None" ? "-" : parsedStatus.reconnectDelay
+        let time = parsedStatus.ffmpegTime.isEmpty ? "-" : parsedStatus.ffmpegTime
+        let speed = parsedStatus.ffmpegSpeed.isEmpty ? "-" : parsedStatus.ffmpegSpeed
+        let percent = Int((max(0.0, min(1.0, parsedStatus.bufferProgress)) * 100).rounded())
+        let line = "[cli] src=\(parsedStatus.sourceState) | out=\(parsedStatus.outputState) | buffer=\(cliProgressBar(progress: parsedStatus.bufferProgress)) \(percent)% | time=\(time) | speed=\(speed) | retry=\(retry)"
+        if force || line != lastCliStatusLine {
+            lastCliStatusLine = line
+            fputs(line + "\n", stdout)
+            fflush(stdout)
+        }
+    }
+
+    private func cliProgressBar(progress: Double) -> String {
+        let clamped = max(0.0, min(1.0, progress))
+        let total = 10
+        let filled = Int((clamped * Double(total)).rounded())
+        let safeFilled = max(0, min(total, filled))
+        let hashes = String(repeating: "#", count: safeFilled)
+        let dashes = String(repeating: "-", count: total - safeFilled)
+        return "[\(hashes)\(dashes)]"
     }
 
     private func shouldSuppressVerboseMetadata(_ message: String) -> Bool {

@@ -17,6 +17,7 @@ struct LaunchOptions {
     var audioContinuityEnabled: Bool?
     var extendedLogging: Bool?
     var autoStart = false
+    var noAutoStart = false
 
     var hasRuntimeOverrides: Bool {
         sourceURL != nil ||
@@ -33,8 +34,12 @@ struct LaunchOptions {
         audioBoostEnabled != nil ||
         audioBoostDb != nil ||
         audioContinuityEnabled != nil ||
-        extendedLogging != nil ||
-        autoStart
+        extendedLogging != nil
+    }
+
+    var shouldAutoStart: Bool {
+        if noAutoStart { return false }
+        return autoStart || hasRuntimeOverrides
     }
 }
 
@@ -125,6 +130,8 @@ enum LaunchOptionsParser {
                 options.extendedLogging = parseBool(readValue(arg), flag: arg, fail: fail)
             case "--auto-start":
                 options.autoStart = true
+            case "--no-auto-start":
+                options.noAutoStart = true
             default:
                 fail("Unknown argument '\(arg)'")
             }
@@ -164,5 +171,6 @@ enum LaunchOptionsParser {
       --audio-continuity <true|false>
       --extended-logging <true|false>
       --auto-start
+      --no-auto-start
     """
 }
