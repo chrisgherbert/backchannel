@@ -17,8 +17,8 @@
     </div>
     <nav class="header-nav">
       <a href="#features">Features</a>
-      <a href="#download">Download</a>
       <a href="#requirements">Requirements</a>
+      <a href="#download">Download</a>
     </nav>
   </header>
 
@@ -38,8 +38,8 @@
     </section>
 
     <section id="screenshot" class="screenshot-section panel">
-      <h2>App Preview</h2>
-      <p class="section-copy">A focused pro workflow for ingest, transport, output mode, and monitoring in one place.</p>
+      <h2>Back Channel</h2>
+      <p class="section-copy">Back Channel is a small app that converts livestreams to RTMP or HLS.</p>
       <div class="screenshot-frame">
         <img src="./assets/screenshot.png" alt="Back Channel app screenshot placeholder" />
       </div>
@@ -60,9 +60,13 @@
         <li>macOS 13 Ventura or later</li>
         <li>Apple Silicon Mac</li>
       </ul>
-      <p class="section-copy">
-        Back Channel is <strong>very</strong> early and has not been extensively tested. Use at your own risk.
-      </p>
+      <div class="danger-callout" role="alert" aria-live="polite">
+        <span class="danger-icon" aria-hidden="true">!</span>
+        <div>
+          <p class="danger-title">Early Development Warning</p>
+          <p class="danger-copy">Back Channel is very early and has not been extensively tested. Use at your own risk.</p>
+        </div>
+      </div>
     </section>
 
     <section id="download" class="download panel">
@@ -71,7 +75,7 @@
         Downloads are served from GitHub Releases. The button above automatically targets the latest
         <code>Back-Channel-&lt;version&gt;.zip</code> asset.
       </p>
-      <a id="download-btn-secondary" class="btn-primary" href="#" target="_blank" rel="noopener noreferrer">Download Latest</a>
+      <a id="download-btn-secondary" class="btn-primary bottom-download-btn" href="#" target="_blank" rel="noopener noreferrer">Download Latest</a>
     </section>
   </main>
 
