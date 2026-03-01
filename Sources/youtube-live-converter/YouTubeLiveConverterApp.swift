@@ -23,10 +23,19 @@ struct YouTubeLiveConverterApp: App {
                     appDelegate.pipeline = pipeline
                 }
         }
+        .commands {
+            AppHelpCommands()
+        }
 
         Settings {
             SettingsView()
         }
+
+        Window("Back Channel Help", id: "help") {
+            HelpView()
+                .preferredColorScheme(preferredColorScheme)
+        }
+        .windowResizability(.contentSize)
     }
 
     private var preferredColorScheme: ColorScheme? {
@@ -38,6 +47,19 @@ struct YouTubeLiveConverterApp: App {
             return .light
         case .dark:
             return .dark
+        }
+    }
+}
+
+struct AppHelpCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(replacing: .help) {
+            Button("Back Channel Help") {
+                openWindow(id: "help")
+            }
+            .keyboardShortcut("?", modifiers: .command)
         }
     }
 }
