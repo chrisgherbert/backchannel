@@ -44,6 +44,20 @@ brew install yt-dlp ffmpeg
 swift run
 ```
 
+## Website (GitHub Pages)
+
+The marketing site lives in `website/` and deploys automatically via GitHub Actions.
+
+- Workflow: `.github/workflows/pages.yml`
+- Hosting: GitHub Pages (default repository Pages URL)
+- Auto download target: latest `Back-Channel-<version>.zip` asset from GitHub Releases
+
+How it updates:
+
+1. Edit files under `website/`.
+2. Push to `main`.
+3. GitHub Actions deploys site automatically.
+
 ## Build & Release Workflows
 
 ### 1. Local Development Build

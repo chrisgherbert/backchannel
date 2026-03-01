@@ -1,0 +1,247 @@
+:root {
+  --bg: #060708;
+  --bg-elev: #0e1012;
+  --bg-elev-2: #14181c;
+  --text: #f7f8fa;
+  --muted: #a6adb7;
+  --line: #232932;
+  --brand: #ff8519;
+  --brand-soft: rgba(255, 133, 25, 0.24);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: "SF Pro Display", "SF Pro Text", -apple-system, BlinkMacSystemFont, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.page-bg {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 18% 14%, rgba(255, 133, 25, 0.18), transparent 42%),
+    radial-gradient(circle at 84% 4%, rgba(255, 133, 25, 0.1), transparent 26%),
+    linear-gradient(180deg, #07090b 0%, #050607 45%, #040506 100%);
+  z-index: -1;
+}
+
+.site-header {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 24px 22px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+}
+
+.brand-name {
+  font-weight: 600;
+  font-size: 1.05rem;
+  letter-spacing: 0.01em;
+}
+
+.header-nav {
+  display: flex;
+  gap: 20px;
+}
+
+.header-nav a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.93rem;
+}
+
+.header-nav a:hover {
+  color: var(--text);
+}
+
+main {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 10px 22px 64px;
+}
+
+.hero {
+  padding: 68px 6px 44px;
+}
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: var(--brand);
+  text-transform: uppercase;
+  letter-spacing: 0.13em;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(2.1rem, 5vw, 4rem);
+  line-height: 1.03;
+  letter-spacing: -0.03em;
+  max-width: 900px;
+}
+
+.hero-copy {
+  margin: 22px 0 0;
+  color: var(--muted);
+  font-size: 1.08rem;
+  line-height: 1.55;
+  max-width: 760px;
+}
+
+.hero-actions {
+  margin-top: 30px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.btn-primary,
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  text-decoration: none;
+  font-weight: 600;
+  min-height: 44px;
+  padding: 0 20px;
+  transition: transform 140ms ease, filter 160ms ease, background 160ms ease;
+}
+
+.btn-primary {
+  color: #14181d;
+  background: linear-gradient(180deg, #ff9f47, var(--brand));
+}
+
+.btn-secondary {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.11);
+}
+
+.btn-primary:hover,
+.btn-secondary:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.04);
+}
+
+.release-meta {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.panel {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.015));
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 24px;
+  margin-top: 24px;
+}
+
+h2 {
+  margin: 0 0 8px;
+  letter-spacing: -0.015em;
+}
+
+.section-copy {
+  color: var(--muted);
+  margin: 0;
+}
+
+.screenshot-frame {
+  margin-top: 18px;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #2c333d;
+  box-shadow: 0 22px 44px rgba(0, 0, 0, 0.35);
+}
+
+.screenshot-frame img {
+  width: 100%;
+  display: block;
+}
+
+ul {
+  margin: 12px 0 0;
+  padding-left: 20px;
+}
+
+li {
+  margin: 8px 0;
+  color: #d9dde3;
+}
+
+.muted {
+  color: var(--muted);
+  margin-top: 10px;
+}
+
+code {
+  color: #ffd7b0;
+  background: var(--brand-soft);
+  padding: 0.15em 0.45em;
+  border-radius: 6px;
+  font-size: 0.92em;
+}
+
+.site-footer {
+  max-width: 1160px;
+  margin: 0 auto;
+  padding: 4px 22px 34px;
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.site-footer a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.site-footer a:hover {
+  color: var(--text);
+}
+
+@media (max-width: 760px) {
+  .site-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .hero {
+    padding-top: 36px;
+  }
+
+  .site-footer {
+    flex-direction: column;
+    gap: 8px;
+  }
+}
