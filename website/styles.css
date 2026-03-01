@@ -208,6 +208,83 @@ h2 {
   margin: 0;
 }
 
+.docs-grid {
+  margin-top: 18px;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.doc-card {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), rgba(255, 255, 255, 0.01));
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.doc-card h3 {
+  margin: 0;
+  font-size: 1.02rem;
+  letter-spacing: -0.01em;
+}
+
+.doc-copy {
+  margin: 10px 0 0;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.doc-card ul,
+.doc-card ol {
+  margin-top: 10px;
+}
+
+.doc-card li {
+  margin: 7px 0;
+}
+
+.docs-subsection {
+  margin-top: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(255, 255, 255, 0.012));
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.docs-subsection h3 {
+  margin: 0 0 8px;
+  font-size: 1.12rem;
+  letter-spacing: -0.01em;
+}
+
+.docs-subsection h4 {
+  margin: 14px 0 6px;
+  font-size: 0.96rem;
+  color: #f0f3f7;
+  letter-spacing: 0.01em;
+}
+
+.docs-subsection pre {
+  margin: 8px 0 0;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.docs-subsection pre code {
+  background: transparent;
+  padding: 0;
+  color: #f3d2b1;
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.docs-subsection ul {
+  margin-top: 10px;
+}
+
 .danger-callout {
   margin-top: 18px;
   display: flex;
@@ -327,5 +404,9 @@ code {
   .site-footer {
     flex-direction: column;
     gap: 8px;
+  }
+
+  .docs-grid {
+    grid-template-columns: 1fr;
   }
 }

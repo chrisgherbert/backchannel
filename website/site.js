@@ -56,7 +56,7 @@
 
     var releasesUrl = "https://github.com/" + repo.owner + "/" + repo.repo + "/releases";
     var fallback = releasesUrl + "/latest";
-    setDownloadLink(fallback, "Download Back Channel");
+    setDownloadLink(fallback, "Download for macOS");
 
     try {
       var api = "https://api.github.com/repos/" + repo.owner + "/" + repo.repo + "/releases/latest";
@@ -72,7 +72,7 @@
       });
 
       if (zipAsset && zipAsset.browser_download_url) {
-        setDownloadLink(zipAsset.browser_download_url, "Download Back Channel " + release.tag_name);
+        setDownloadLink(zipAsset.browser_download_url, "Download for macOS");
         setMetaText("Latest: " + release.tag_name);
       } else {
         setDownloadLink(fallback, "View Releases");
