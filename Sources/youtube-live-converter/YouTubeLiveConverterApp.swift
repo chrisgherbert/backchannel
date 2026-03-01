@@ -11,6 +11,7 @@ struct YouTubeLiveConverterApp: App {
 
     init() {
         launchOptions = LaunchOptionsParser.parseOrExit(arguments: CommandLine.arguments)
+        AppDelegate.installSignalHandlersInThisRun = launchOptions.hasRuntimeOverrides
     }
 
     var body: some Scene {
@@ -43,6 +44,7 @@ struct YouTubeLiveConverterApp: App {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var installSignalHandlersInThisRun = false
     var pipeline: StreamPipeline?
     private var signalIntSource: DispatchSourceSignal?
     private var signalTermSource: DispatchSourceSignal?
@@ -64,7 +66,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
-        installSignalHandlers()
+        if Self.installSignalHandlersInThisRun {
+            installSignalHandlers()
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

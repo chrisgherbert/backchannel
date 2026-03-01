@@ -834,7 +834,7 @@ struct ContentView: View {
         }
 
         guard let preview = pipeline.preview else {
-            return "Could not verify source metadata. Use Load Info and try again."
+            return nil
         }
 
         if preview.publishState == .published {

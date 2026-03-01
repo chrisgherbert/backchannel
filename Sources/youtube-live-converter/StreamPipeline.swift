@@ -3015,7 +3015,7 @@ private extension StreamPipeline {
         }
 
         guard result.exitCode == 0 else {
-            return (nil, "Could not load source info")
+            return (nil, previewLookupErrorMessage(from: result.stderrData, fallback: "Could not load source info"))
         }
 
         do {
@@ -3055,6 +3055,31 @@ private extension StreamPipeline {
         } catch {
             return (nil, "Could not parse source info")
         }
+    }
+
+    nonisolated private static func previewLookupErrorMessage(from stderrData: Data, fallback: String) -> String {
+        let raw = String(decoding: stderrData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return fallback }
+
+        let firstLine = raw
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .first(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? fallback
+        let lower = firstLine.lowercased()
+
+        if lower.contains("failed to initialize sync semaphore") || lower.contains("semctl: operation not permitted") {
+            return "yt-dlp failed to initialize. Rebuild/update bundled yt-dlp and try again."
+        }
+        if lower.contains("unable to download api page") || lower.contains("failed to resolve") {
+            return "Could not reach source service. Check network/DNS and try again."
+        }
+        if lower.contains("http error 429") || lower.contains("too many requests") {
+            return "Source temporarily rate-limited requests (429). Try again shortly."
+        }
+
+        return firstLine.count > 180 ? String(firstLine.prefix(180)) + "..." : firstLine
     }
 
     nonisolated private static func parseQuickPreview(from data: Data) -> StreamPreview? {
