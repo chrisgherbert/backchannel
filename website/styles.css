@@ -55,6 +55,7 @@ body {
   width: 64px;
   height: 64px;
   border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.18);
   filter:
     drop-shadow(0 16px 24px rgba(0, 0, 0, 0.62))
     drop-shadow(0 6px 10px rgba(0, 0, 0, 0.38))
@@ -375,6 +376,24 @@ code {
 .site-footer a {
   color: var(--muted);
   text-decoration: none;
+}
+
+.footer-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.footer-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.github-icon {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
 }
 
 .site-footer a:hover {
