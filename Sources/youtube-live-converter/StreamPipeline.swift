@@ -2652,6 +2652,18 @@ private final class ProcessCaptureState: @unchecked Sendable {
 }
 
 private extension StreamPipeline {
+    nonisolated private static let toolProbeCacheKey = "tool_probe_cache_v1"
+
+    nonisolated private struct ToolProbeCache: Codable {
+        let ytDlpPath: String
+        let ytDlpSignature: String
+        let ffmpegPath: String
+        let ffmpegSignature: String
+        let ffprobePath: String
+        let ffprobeSignature: String
+        let supportsVideoToolboxH264: Bool
+    }
+
     nonisolated private struct ToolResolution {
         let paths: ToolPaths?
         let logLines: [String]
@@ -2679,29 +2691,59 @@ private extension StreamPipeline {
             return ToolResolution(paths: nil, logLines: logLines)
         }
 
-        guard verifyExecutable(ytDlp, probeArgument: "--version") else {
-            logLines.append("[app] Found yt-dlp at \(ytDlp.path) but it cannot run. Use a standalone yt-dlp binary for distribution.")
-            return ToolResolution(paths: nil, logLines: logLines)
-        }
-        guard verifyExecutable(ffmpeg, probeArgument: "-version") else {
-            logLines.append("[app] Found ffmpeg at \(ffmpeg.path) but it cannot run.")
-            return ToolResolution(paths: nil, logLines: logLines)
-        }
-        guard verifyExecutable(ffprobe, probeArgument: "-version") else {
-            logLines.append("[app] Found ffprobe at \(ffprobe.path) but it cannot run.")
-            return ToolResolution(paths: nil, logLines: logLines)
-        }
-
         var denoURL: URL?
         if let deno = resolveTool(named: "deno", resourceURL: resourceURL) {
-            if verifyExecutable(deno, probeArgument: "--version") {
-                denoURL = deno
-            } else {
-                logLines.append("[app] Found deno at \(deno.path) but it cannot run. Continuing without JS runtime.")
+            denoURL = deno
+        }
+
+        let ytDlpSignature = executableSignature(for: ytDlp)
+        let ffmpegSignature = executableSignature(for: ffmpeg)
+        let ffprobeSignature = executableSignature(for: ffprobe)
+        let canUseProbeCache = (ytDlpSignature != nil && ffmpegSignature != nil && ffprobeSignature != nil)
+
+        var supportsVideoToolboxH264: Bool
+        if canUseProbeCache,
+           let cached = loadToolProbeCache(),
+           cached.ytDlpPath == ytDlp.path,
+           cached.ytDlpSignature == ytDlpSignature,
+           cached.ffmpegPath == ffmpeg.path,
+           cached.ffmpegSignature == ffmpegSignature,
+           cached.ffprobePath == ffprobe.path,
+           cached.ffprobeSignature == ffprobeSignature {
+            supportsVideoToolboxH264 = cached.supportsVideoToolboxH264
+        } else {
+            guard verifyExecutable(ytDlp, probeArgument: "--version") else {
+                logLines.append("[app] Found yt-dlp at \(ytDlp.path) but it cannot run. Use a standalone yt-dlp binary for distribution.")
+                return ToolResolution(paths: nil, logLines: logLines)
+            }
+            guard verifyExecutable(ffmpeg, probeArgument: "-version") else {
+                logLines.append("[app] Found ffmpeg at \(ffmpeg.path) but it cannot run.")
+                return ToolResolution(paths: nil, logLines: logLines)
+            }
+            guard verifyExecutable(ffprobe, probeArgument: "-version") else {
+                logLines.append("[app] Found ffprobe at \(ffprobe.path) but it cannot run.")
+                return ToolResolution(paths: nil, logLines: logLines)
+            }
+
+            supportsVideoToolboxH264 = supportsFFmpegEncoder(ffmpeg, encoderName: "h264_videotoolbox")
+
+            if let ytDlpSignature,
+               let ffmpegSignature,
+               let ffprobeSignature {
+                storeToolProbeCache(
+                    ToolProbeCache(
+                        ytDlpPath: ytDlp.path,
+                        ytDlpSignature: ytDlpSignature,
+                        ffmpegPath: ffmpeg.path,
+                        ffmpegSignature: ffmpegSignature,
+                        ffprobePath: ffprobe.path,
+                        ffprobeSignature: ffprobeSignature,
+                        supportsVideoToolboxH264: supportsVideoToolboxH264
+                    )
+                )
             }
         }
 
-        let supportsVideoToolboxH264 = supportsFFmpegEncoder(ffmpeg, encoderName: "h264_videotoolbox")
         if !supportsVideoToolboxH264 {
             logLines.append("[app] Hardware H.264 encoder not available; falling back to software x264.")
         }
@@ -2749,6 +2791,32 @@ private extension StreamPipeline {
         } catch {
             return false
         }
+    }
+
+    nonisolated private static func loadToolProbeCache() -> ToolProbeCache? {
+        guard let data = UserDefaults.standard.data(forKey: toolProbeCacheKey) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ToolProbeCache.self, from: data)
+    }
+
+    nonisolated private static func storeToolProbeCache(_ cache: ToolProbeCache) {
+        guard let data = try? JSONEncoder().encode(cache) else { return }
+        UserDefaults.standard.set(data, forKey: toolProbeCacheKey)
+    }
+
+    nonisolated private static func executableSignature(for url: URL) -> String? {
+        let path = url.path
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: path)
+        } catch {
+            return nil
+        }
+
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return "\(path)|\(size)|\(Int64(modifiedAt))"
     }
 
     nonisolated private static func supportsFFmpegEncoder(_ ffmpegURL: URL, encoderName: String) -> Bool {

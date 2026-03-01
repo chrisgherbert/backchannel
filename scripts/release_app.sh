@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="${1:-$ROOT_DIR/.release.env}"
 YTDLP_ENTITLEMENTS="$ROOT_DIR/scripts/entitlements.ytdlp.plist"
+DENO_ENTITLEMENTS="$ROOT_DIR/scripts/entitlements.deno.plist"
+NOTARIZE="${NOTARIZE:-1}"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Error: release config not found: $CONFIG_FILE" >&2
@@ -61,7 +63,9 @@ fi
 echo "==> Signing embedded binaries (Mach-O) with hardened runtime + timestamp"
 find "$APP_PATH" -type f | while read -r f; do
   if file "$f" | grep -q "Mach-O"; then
-    if [[ "$f" == */Contents/Resources/bin/yt-dlp ]] || [[ "$f" == */Contents/Resources/bin/ffmpeg ]] || [[ "$f" == */Contents/Resources/bin/ffprobe ]]; then
+    if [[ "$f" == */Contents/Resources/bin/deno ]]; then
+      codesign --force --options runtime --timestamp --entitlements "$DENO_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$f"
+    elif [[ "$f" == */Contents/Resources/bin/yt-dlp ]] || [[ "$f" == */Contents/Resources/bin/ffmpeg ]] || [[ "$f" == */Contents/Resources/bin/ffprobe ]]; then
       codesign --force --options runtime --timestamp --entitlements "$YTDLP_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$f"
     else
       codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$f"
@@ -91,6 +95,16 @@ ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 if [[ ! -f "$ZIP_PATH" ]]; then
   echo "Error: notarization archive was not created: $ZIP_PATH" >&2
   exit 1
+fi
+
+if [[ "$NOTARIZE" == "0" ]]; then
+  echo "==> Skipping notarization and stapling (NOTARIZE=0)"
+  echo "==> Optional local Gatekeeper assessment (expected: Unnotarized Developer ID)"
+  spctl --assess --type execute --verbose=4 "$APP_PATH" || true
+  echo "==> Release build ready (unsigned ticket)"
+  echo "App: $APP_PATH"
+  echo "Zip: $ZIP_PATH"
+  exit 0
 fi
 
 echo "==> Submitting for notarization (wait)"

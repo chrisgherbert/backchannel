@@ -132,6 +132,40 @@ bundle_macho_dependencies() {
   rm -f "$queue_file" "$seen_file"
 }
 
+resolve_rpath_dependencies_in_bundle() {
+  local dep dep_name dep_path found original_source_path original_source_dir
+  while IFS= read -r dep_path; do
+    if ! is_macho_binary "$dep_path"; then
+      continue
+    fi
+
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      [[ "$dep" == @rpath/* ]] || continue
+      dep_name="${dep#@rpath/}"
+
+      if [[ -f "$(dirname "$dep_path")/$dep_name" ]]; then
+        install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
+        continue
+      fi
+
+      found="$(find "$RES_LIB_DIR" -name "$dep_name" -type f | head -n 1 || true)"
+      if [[ -z "$found" ]] && [[ "$dep_path" == "$RES_LIB_DIR/"* ]]; then
+        original_source_path="/${dep_path#$RES_LIB_DIR/}"
+        original_source_dir="$(dirname "$original_source_path")"
+        if [[ -f "$original_source_dir/$dep_name" ]]; then
+          found="$original_source_dir/$dep_name"
+        fi
+      fi
+      if [[ -n "$found" ]]; then
+        cp -fL "$found" "$(dirname "$dep_path")/$dep_name"
+        chmod u+w "$(dirname "$dep_path")/$dep_name" >/dev/null 2>&1 || true
+        install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
+      fi
+    done < <(otool -L "$dep_path" | tail -n +2 | awk '{print $1}')
+  done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
+}
+
 create_icns_from_png() {
   local png_source="$1"
   local icns_target="$2"
@@ -705,14 +739,17 @@ rm -rf "$RES_LIB_DIR"
 cp "$YTDLP_PATH" "$RES_BIN_DIR/yt-dlp"
 cp "$FFMPEG_PATH" "$RES_BIN_DIR/ffmpeg"
 cp "$FFPROBE_PATH" "$RES_BIN_DIR/ffprobe"
+bundle_roots=("$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe")
 if [[ -n "$DENO_PATH" ]]; then
   cp "$DENO_PATH" "$RES_BIN_DIR/deno"
   chmod +x "$RES_BIN_DIR/deno"
+  bundle_roots+=("$RES_BIN_DIR/deno")
 fi
 chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 
-echo "Bundling ffmpeg/ffprobe shared libraries into app..."
-bundle_macho_dependencies "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
+echo "Bundling ffmpeg/ffprobe/deno shared libraries into app..."
+bundle_macho_dependencies "${bundle_roots[@]}"
+resolve_rpath_dependencies_in_bundle
 
 echo "Bundled:"
 echo "  yt-dlp: $YTDLP_PATH"
