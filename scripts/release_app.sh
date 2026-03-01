@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="${1:-$ROOT_DIR/.release.env}"
+YTDLP_ENTITLEMENTS="$ROOT_DIR/scripts/entitlements.ytdlp.plist"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Error: release config not found: $CONFIG_FILE" >&2
@@ -60,7 +61,11 @@ fi
 echo "==> Signing embedded binaries (Mach-O) with hardened runtime + timestamp"
 find "$APP_PATH" -type f | while read -r f; do
   if file "$f" | grep -q "Mach-O"; then
-    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$f"
+    if [[ "$f" == */Contents/Resources/bin/yt-dlp ]] || [[ "$f" == */Contents/Resources/bin/ffmpeg ]] || [[ "$f" == */Contents/Resources/bin/ffprobe ]]; then
+      codesign --force --options runtime --timestamp --entitlements "$YTDLP_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$f"
+    else
+      codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$f"
+    fi
   fi
 done
 

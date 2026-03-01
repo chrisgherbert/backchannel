@@ -11,6 +11,7 @@ PREVIOUS_APP_DIR="$ROOT_DIR/dist/Backchannel.app"
 BIN_DIR="$APP_DIR/Contents/MacOS"
 RES_DIR="$APP_DIR/Contents/Resources"
 RES_BIN_DIR="$RES_DIR/bin"
+RES_LIB_DIR="$RES_DIR/lib"
 CLI_LAUNCHER_NAME="backchannel"
 CLI_INSTALLER_NAME="install-cli.sh"
 APP_ICON_NAME="AppIcon"
@@ -58,6 +59,77 @@ is_macho_binary() {
   local file_desc
   file_desc="$(file -b "$file" 2>/dev/null || true)"
   [[ "$file_desc" == *"Mach-O"* ]]
+}
+
+is_bundleable_dependency() {
+  local dep="$1"
+  case "$dep" in
+    /opt/homebrew/*|/usr/local/*|/opt/local/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bundle_macho_dependencies() {
+  mkdir -p "$RES_LIB_DIR"
+
+  local queue_file seen_file tmp_queue
+  queue_file="$(mktemp "${TMPDIR:-/tmp}/backchannel-dep-queue.XXXXXX")"
+  seen_file="$(mktemp "${TMPDIR:-/tmp}/backchannel-dep-seen.XXXXXX")"
+
+  for root_macho in "$@"; do
+    [[ -n "$root_macho" ]] || continue
+    if [[ -f "$root_macho" ]]; then
+      echo "$root_macho" >> "$queue_file"
+    fi
+  done
+
+  while [[ -s "$queue_file" ]]; do
+    local macho dep_list dep dest new_ref rel_path
+    macho="$(head -n 1 "$queue_file")"
+    tmp_queue="$(mktemp "${TMPDIR:-/tmp}/backchannel-dep-queue-next.XXXXXX")"
+    tail -n +2 "$queue_file" > "$tmp_queue" || true
+    mv "$tmp_queue" "$queue_file"
+
+    [[ -n "$macho" ]] || continue
+    [[ -f "$macho" ]] || continue
+
+    if grep -Fxq "$macho" "$seen_file"; then
+      continue
+    fi
+    echo "$macho" >> "$seen_file"
+
+    dep_list="$(otool -L "$macho" | tail -n +2 | awk '{print $1}')"
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+      if ! is_bundleable_dependency "$dep"; then
+        continue
+      fi
+
+      dest="$RES_LIB_DIR$dep"
+      mkdir -p "$(dirname "$dest")"
+      if [[ ! -f "$dest" ]]; then
+        cp -fL "$dep" "$dest"
+      fi
+      chmod u+w "$dest" >/dev/null 2>&1 || true
+      if ! grep -Fxq "$dest" "$queue_file"; then
+        echo "$dest" >> "$queue_file"
+      fi
+
+      new_ref="@executable_path/../lib$dep"
+      install_name_tool -change "$dep" "$new_ref" "$macho" >/dev/null 2>&1 || true
+    done <<< "$dep_list"
+
+    if [[ "$macho" == "$RES_LIB_DIR/"* ]] && [[ "$macho" == *.dylib ]]; then
+      rel_path="${macho#$RES_LIB_DIR/}"
+      install_name_tool -id "@executable_path/../lib/$rel_path" "$macho" >/dev/null 2>&1 || true
+    fi
+  done
+
+  rm -f "$queue_file" "$seen_file"
 }
 
 create_icns_from_png() {
@@ -629,6 +701,7 @@ if ! is_macho_binary "$YTDLP_PATH"; then
 fi
 
 rm -f "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe" "$RES_BIN_DIR/deno"
+rm -rf "$RES_LIB_DIR"
 cp "$YTDLP_PATH" "$RES_BIN_DIR/yt-dlp"
 cp "$FFMPEG_PATH" "$RES_BIN_DIR/ffmpeg"
 cp "$FFPROBE_PATH" "$RES_BIN_DIR/ffprobe"
@@ -637,6 +710,9 @@ if [[ -n "$DENO_PATH" ]]; then
   chmod +x "$RES_BIN_DIR/deno"
 fi
 chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
+
+echo "Bundling ffmpeg/ffprobe shared libraries into app..."
+bundle_macho_dependencies "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 
 echo "Bundled:"
 echo "  yt-dlp: $YTDLP_PATH"
