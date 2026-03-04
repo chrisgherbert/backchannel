@@ -13,7 +13,12 @@ struct ContentView: View {
     @State private var selectedSourcePresetID = ""
     @State private var selectedPanel: PanelTab = .status
     @State private var isStartPending = false
+    @State private var upcomingWatcherTask: Task<Void, Never>?
+    @State private var upcomingWatcherSourceURL = ""
+    @State private var upcomingWatcherStatus = ""
+    @State private var upcomingWatcherNextCheckAt: Date?
     @AppStorage("show_inspector") private var showInspector = true
+    @AppStorage("auto_start_when_live_enabled") private var autoStartWhenLiveEnabled = false
     @AppStorage(AppPreferenceKeys.runtimeLogMonitoringEnabled) private var logMonitoringEnabled = true
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
@@ -80,6 +85,7 @@ struct ContentView: View {
         .onDisappear {
             autoLoadInfoTask?.cancel()
             autoLoadInfoTask = nil
+            stopUpcomingWatcher()
         }
         .onChange(of: logMonitoringEnabled) { newValue in
             pipeline.setLogMonitoringEnabled(newValue)
@@ -87,6 +93,7 @@ struct ContentView: View {
         .onChange(of: config.sourceURL) { _ in
             scheduleAutoLoadInfo()
             syncSelectedSourcePreset()
+            refreshUpcomingWatcherState()
         }
         .onChange(of: config.outputType) { _ in
             syncSelectedRtmpPreset()
@@ -116,11 +123,18 @@ struct ContentView: View {
             if isRunning {
                 isStartPending = false
             }
+            refreshUpcomingWatcherState()
         }
         .onChange(of: pipeline.status) { _ in
             if shouldClearStartPending {
                 isStartPending = false
             }
+        }
+        .onChange(of: pipeline.preview?.publishState) { _ in
+            refreshUpcomingWatcherState()
+        }
+        .onChange(of: autoStartWhenLiveEnabled) { _ in
+            refreshUpcomingWatcherState()
         }
     }
 
@@ -314,6 +328,20 @@ struct ContentView: View {
                 validationLabel(message)
             }
 
+            if shouldShowAutoStartToggle {
+                HStack(spacing: 8) {
+                    Toggle("Auto-start when live", isOn: $autoStartWhenLiveEnabled)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                    if !upcomingWatcherStatus.isEmpty {
+                        Text(upcomingWatcherStatus)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+
             if let preview = pipeline.preview {
                 HStack(alignment: .top, spacing: 10) {
                     previewThumbnailView(for: preview)
@@ -323,6 +351,9 @@ struct ContentView: View {
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(2)
                         HStack(spacing: 10) {
+                            if isMeaningfulPreviewValue(preview.scheduledStartLabel) {
+                                previewStatPill(preview.scheduledStartLabel)
+                            }
                             if isMeaningfulPreviewValue(preview.resolutionLabel) {
                                 previewStatPill(preview.resolutionLabel)
                             }
@@ -880,7 +911,18 @@ struct ContentView: View {
             outputValidationMessage == nil &&
             !pipeline.isRunning &&
             !isLoadingSourceInfo &&
+            !isAutoStartArmedForUpcoming &&
             !isStartPending
+    }
+
+    private var shouldShowAutoStartToggle: Bool {
+        guard pipeline.previewSourceURL == sourceURLTrimmed else { return false }
+        guard let preview = pipeline.preview else { return false }
+        return preview.publishState == .upcoming
+    }
+
+    private var isAutoStartArmedForUpcoming: Bool {
+        shouldShowAutoStartToggle && autoStartWhenLiveEnabled
     }
 
     private var startButtonLabel: some View {
@@ -1071,6 +1113,7 @@ struct ContentView: View {
     }
 
     private func startStream() {
+        stopUpcomingWatcher()
         autoLoadInfoTask?.cancel()
         autoLoadInfoTask = nil
         lastAutoLoadedSourceURL = sourceURLTrimmed
@@ -1143,6 +1186,120 @@ struct ContentView: View {
         } else {
             selectedSourcePresetID = ""
         }
+    }
+
+    private func refreshUpcomingWatcherState() {
+        let trimmed = sourceURLTrimmed
+        guard autoStartWhenLiveEnabled else {
+            stopUpcomingWatcher()
+            return
+        }
+        guard !trimmed.isEmpty else {
+            stopUpcomingWatcher()
+            return
+        }
+        guard !pipeline.isRunning, !isStartPending else {
+            stopUpcomingWatcher()
+            return
+        }
+
+        let currentState = pipeline.preview?.publishState ?? .unknown
+        guard currentState == .upcoming || (pipeline.previewSourceURL != trimmed && !isLoadingSourceInfo) else {
+            if currentState == .live {
+                stopUpcomingWatcher()
+            }
+            return
+        }
+
+        if upcomingWatcherTask != nil, upcomingWatcherSourceURL == trimmed {
+            return
+        }
+
+        stopUpcomingWatcher()
+        upcomingWatcherSourceURL = trimmed
+        upcomingWatcherStatus = "Armed"
+        upcomingWatcherTask = Task { [trimmed] in
+            await runUpcomingWatcher(for: trimmed)
+        }
+    }
+
+    private func stopUpcomingWatcher() {
+        upcomingWatcherTask?.cancel()
+        upcomingWatcherTask = nil
+        upcomingWatcherSourceURL = ""
+        upcomingWatcherStatus = ""
+        upcomingWatcherNextCheckAt = nil
+    }
+
+    @MainActor
+    private func runUpcomingWatcher(for sourceURL: String) async {
+        var timeoutStreak = 0
+        var nextDelay: TimeInterval = 15
+
+        while !Task.isCancelled {
+            guard autoStartWhenLiveEnabled else { break }
+            guard !pipeline.isRunning, !isStartPending else { break }
+            guard sourceURLTrimmed == sourceURL else { break }
+
+            while isLoadingSourceInfo && !Task.isCancelled {
+                upcomingWatcherStatus = "Waiting for active check..."
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            if Task.isCancelled { break }
+
+            upcomingWatcherStatus = "Checking for go-live..."
+            loadInfo()
+
+            var waitedSeconds = 0
+            while isLoadingSourceInfo && waitedSeconds < 45 && !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                waitedSeconds += 1
+            }
+            if Task.isCancelled { break }
+
+            guard sourceURLTrimmed == sourceURL else { break }
+
+            let latestState = pipeline.preview?.publishState ?? .unknown
+            if latestState == .live {
+                upcomingWatcherStatus = "Live detected. Starting..."
+                startStream()
+                break
+            }
+
+            let timedOut = pipeline.previewStatus.lowercased().contains("timed out")
+            if timedOut {
+                timeoutStreak += 1
+                nextDelay = min(300, 30 * pow(2, Double(max(0, timeoutStreak - 1))))
+            } else {
+                timeoutStreak = 0
+                nextDelay = 45
+            }
+
+            let jitter = Double(Int.random(in: 0...8))
+            nextDelay += jitter
+            let nextCheck = Date().addingTimeInterval(nextDelay)
+            upcomingWatcherNextCheckAt = nextCheck
+
+            var remaining = Int(nextDelay.rounded())
+            while remaining > 0 && !Task.isCancelled {
+                upcomingWatcherStatus = "Waiting for live (\(remaining)s)"
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                remaining -= 1
+                if sourceURLTrimmed != sourceURL || pipeline.isRunning || isStartPending || !autoStartWhenLiveEnabled {
+                    break
+                }
+            }
+            if sourceURLTrimmed != sourceURL || pipeline.isRunning || isStartPending || !autoStartWhenLiveEnabled {
+                break
+            }
+        }
+
+        if sourceURLTrimmed == sourceURL && !pipeline.isRunning && autoStartWhenLiveEnabled {
+            upcomingWatcherStatus = "Armed"
+        }
+        upcomingWatcherTask = nil
+        upcomingWatcherSourceURL = ""
+        upcomingWatcherNextCheckAt = nil
     }
 
     private static func makeInitialConfig(overrides: LaunchOptions = LaunchOptions()) -> StreamConfig {

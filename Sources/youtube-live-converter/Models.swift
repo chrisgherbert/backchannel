@@ -72,6 +72,7 @@ struct StreamPreview {
     var descriptionExcerpt: String
     var thumbnailURL: URL?
     var publishState: PublishState
+    var scheduledStartLabel: String
     var resolutionLabel: String
     var frameRateLabel: String
     var bitrateLabel: String

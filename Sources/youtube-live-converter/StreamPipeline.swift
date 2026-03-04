@@ -436,6 +436,9 @@ final class StreamPipeline: ObservableObject {
         if !incoming.descriptionExcerpt.isEmpty {
             merged.descriptionExcerpt = incoming.descriptionExcerpt
         }
+        if Self.hasMeaningfulPreviewValue(incoming.scheduledStartLabel) {
+            merged.scheduledStartLabel = incoming.scheduledStartLabel
+        }
         if Self.hasMeaningfulPreviewValue(incoming.resolutionLabel) {
             merged.resolutionLabel = incoming.resolutionLabel
         }
@@ -2611,6 +2614,9 @@ final class StreamPipeline: ObservableObject {
         }
 
         guard result.exitCode == 0 else {
+            if let upcomingPreview = parseUpcomingPreviewFromError(stderrData: result.stderrData, sourceURL: sourceURL) {
+                return (upcomingPreview, "Source is upcoming")
+            }
             return (nil, previewLookupErrorMessage(from: result.stderrData, fallback: "Could not load source info"))
         }
 
@@ -2706,6 +2712,7 @@ private extension StreamPipeline {
         let descriptionExcerpt: String
         let thumbnailURLString: String?
         let publishStateRaw: String
+        let scheduledStartLabel: String?
         let resolutionLabel: String
         let frameRateLabel: String
         let bitrateLabel: String
@@ -2717,6 +2724,7 @@ private extension StreamPipeline {
                 descriptionExcerpt: descriptionExcerpt,
                 thumbnailURL: thumbnailURLString.flatMap { URL(string: $0) },
                 publishState: PublishState(rawValue: publishStateRaw) ?? .unknown,
+                scheduledStartLabel: scheduledStartLabel ?? "Unknown",
                 resolutionLabel: resolutionLabel,
                 frameRateLabel: frameRateLabel,
                 bitrateLabel: bitrateLabel,
@@ -2773,6 +2781,7 @@ private extension StreamPipeline {
             descriptionExcerpt: preview.descriptionExcerpt,
             thumbnailURLString: preview.thumbnailURL?.absoluteString,
             publishStateRaw: preview.publishState.rawValue,
+            scheduledStartLabel: preview.scheduledStartLabel,
             resolutionLabel: preview.resolutionLabel,
             frameRateLabel: preview.frameRateLabel,
             bitrateLabel: preview.bitrateLabel,
@@ -3242,6 +3251,7 @@ private extension StreamPipeline {
                     descriptionExcerpt: shortExcerpt,
                     thumbnailURL: URL(string: thumbnailString),
                     publishState: publishState,
+                    scheduledStartLabel: parseScheduledStartLabel(fromJSON: object),
                     resolutionLabel: streamTechnical.resolution,
                     frameRateLabel: streamTechnical.fps,
                     bitrateLabel: streamTechnical.bitrate,
@@ -3275,8 +3285,30 @@ private extension StreamPipeline {
         if lower.contains("http error 429") || lower.contains("too many requests") {
             return "Source temporarily rate-limited requests (429). Try again shortly."
         }
+        if lower.contains("this live event will begin in a few moments") {
+            return "Source is upcoming"
+        }
 
         return firstLine.count > 180 ? String(firstLine.prefix(180)) + "..." : firstLine
+    }
+
+    nonisolated private static func parseUpcomingPreviewFromError(stderrData: Data, sourceURL: String) -> StreamPreview? {
+        let raw = String(decoding: stderrData, as: UTF8.self).lowercased()
+        guard raw.contains("this live event will begin in a few moments") else {
+            return nil
+        }
+
+        return StreamPreview(
+            title: sourceLabel(from: sourceURL),
+            descriptionExcerpt: "",
+            thumbnailURL: nil,
+            publishState: .upcoming,
+            scheduledStartLabel: "Unknown",
+            resolutionLabel: "Unknown",
+            frameRateLabel: "Unknown",
+            bitrateLabel: "Unknown",
+            codecLabel: "Unknown"
+        )
     }
 
     nonisolated private static func parseQuickPreview(from data: Data, sourceURL: String) -> StreamPreview? {
@@ -3284,6 +3316,7 @@ private extension StreamPipeline {
         let title = (fields["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let publishState = parsePublishState(fromQuickFields: fields)
         let technical = parseTechnicalSummary(fromQuickFields: fields)
+        let scheduledStart = parseScheduledStartLabel(fromQuickFields: fields)
 
         guard !title.isEmpty || publishState != .unknown else { return nil }
 
@@ -3292,6 +3325,7 @@ private extension StreamPipeline {
             descriptionExcerpt: "",
             thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
             publishState: publishState,
+            scheduledStartLabel: scheduledStart,
             resolutionLabel: technical.resolution,
             frameRateLabel: technical.fps,
             bitrateLabel: technical.bitrate,
@@ -3310,6 +3344,7 @@ private extension StreamPipeline {
             descriptionExcerpt: "",
             thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
             publishState: publishState,
+            scheduledStartLabel: parseScheduledStartLabel(fromQuickFields: fields),
             resolutionLabel: "Unknown",
             frameRateLabel: "Unknown",
             bitrateLabel: "Unknown",
@@ -3408,6 +3443,13 @@ private extension StreamPipeline {
         return (resolutionText, fpsText, bitrateText, codecText)
     }
 
+    nonisolated private static func parseScheduledStartLabel(fromQuickFields fields: [String: String]) -> String {
+        guard let releaseTimestamp = intValue(from: fields["release_timestamp"]), releaseTimestamp > 0 else {
+            return "Unknown"
+        }
+        return formatScheduledStartLabel(unixTimestamp: releaseTimestamp)
+    }
+
     nonisolated private static func parseTechnicalSummary(from object: [String: Any]) -> (resolution: String, fps: String, bitrate: String, codec: String) {
         var width = intValue(from: object["width"])
         var height = intValue(from: object["height"])
@@ -3482,6 +3524,22 @@ private extension StreamPipeline {
         let codecText = codec ?? "Unknown"
 
         return (resolutionText, fpsText, bitrateText, codecText)
+    }
+
+    nonisolated private static func parseScheduledStartLabel(fromJSON object: [String: Any]) -> String {
+        guard let releaseTs = intValue(from: object["release_timestamp"]), releaseTs > 0 else {
+            return "Unknown"
+        }
+        return formatScheduledStartLabel(unixTimestamp: releaseTs)
+    }
+
+    nonisolated private static func formatScheduledStartLabel(unixTimestamp: Int) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(unixTimestamp))
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.timeZone = TimeZone.current
+        formatter.setLocalizedDateFormatFromTemplate("MMM d, h:mm a")
+        return formatter.string(from: date)
     }
 
     nonisolated private static func pixelCount(of format: [String: Any]) -> Int {
