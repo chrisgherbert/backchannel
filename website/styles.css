@@ -55,7 +55,7 @@ body {
   width: 64px;
   height: 64px;
   border-radius: 12px;
-  border: 1px solid rgba(255,255,255,0.18);
+  border: 3px solid rgba(255,255,255,0.18);
   filter:
     drop-shadow(0 16px 24px rgba(0, 0, 0, 0.62))
     drop-shadow(0 6px 10px rgba(0, 0, 0, 0.38))
