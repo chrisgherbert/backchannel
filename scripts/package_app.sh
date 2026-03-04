@@ -666,10 +666,14 @@ fi
 echo "Bundling yt-dlp, ffmpeg, ffprobe, and deno..."
 YTDLP_PATH="${YTDLP_BINARY:-}"
 if [[ -z "$YTDLP_PATH" ]]; then
-  YTDLP_PATH="$(find_tool yt-dlp)" || {
-    echo "Error: yt-dlp not found. Install it first (brew install yt-dlp)." >&2
-    exit 1
-  }
+  if [[ -x "$HOME/.local/bin/yt-dlp" ]]; then
+    YTDLP_PATH="$HOME/.local/bin/yt-dlp"
+  else
+    YTDLP_PATH="$(find_tool yt-dlp)" || {
+      echo "Error: yt-dlp not found. Install it first (brew install yt-dlp)." >&2
+      exit 1
+    }
+  fi
 fi
 
 FFMPEG_PATH="${FFMPEG_BINARY:-}"
@@ -722,10 +726,18 @@ if [[ -n "$DENO_PATH" ]] && [[ ! -x "$DENO_PATH" ]]; then
 fi
 
 if is_python_wrapper "$YTDLP_PATH"; then
-  echo "Error: yt-dlp appears to be a Python wrapper script: $YTDLP_PATH" >&2
-  echo "Use a standalone yt-dlp binary (Mach-O) for portable distribution." >&2
-  echo "Set YTDLP_BINARY to that file path and rerun package_app.sh." >&2
-  exit 1
+  if [[ -x "$HOME/.local/bin/yt-dlp" ]] && is_macho_binary "$HOME/.local/bin/yt-dlp"; then
+    echo "Detected Homebrew yt-dlp wrapper at: $YTDLP_PATH" >&2
+    echo "Using standalone yt-dlp binary at: $HOME/.local/bin/yt-dlp" >&2
+    YTDLP_PATH="$HOME/.local/bin/yt-dlp"
+  else
+    echo "Error: yt-dlp appears to be a Python wrapper script: $YTDLP_PATH" >&2
+    echo "Use a standalone yt-dlp binary (Mach-O) for portable distribution." >&2
+    echo "Install one with:" >&2
+    echo "  mkdir -p \"$HOME/.local/bin\" && curl -L \"https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos\" -o \"$HOME/.local/bin/yt-dlp\" && chmod +x \"$HOME/.local/bin/yt-dlp\"" >&2
+    echo "Or set YTDLP_BINARY=/absolute/path/to/yt-dlp and rerun package_app.sh." >&2
+    exit 1
+  fi
 fi
 
 if ! is_macho_binary "$YTDLP_PATH"; then

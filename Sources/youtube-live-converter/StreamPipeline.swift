@@ -366,22 +366,49 @@ final class StreamPipeline: ObservableObject {
 
         previewRequestID += 1
         let requestID = previewRequestID
-        previewStatus = "Loading source info..."
+        let previousSourceURL = previewSourceURL
+        previewSourceURL = trimmed
+
+        // Clear stale preview immediately when switching to a different source URL.
+        if !previousSourceURL.isEmpty, previousSourceURL != trimmed {
+            preview = nil
+        }
+
+        let cachedPreview = Self.loadCachedPreview(for: trimmed)
+        if let cachedPreview {
+            preview = cachedPreview
+            previewStatus = "\(previewStatusText(for: cachedPreview.publishState)) (cached, refreshing...)"
+        } else {
+            previewStatus = "Checking live status..."
+        }
 
         Task.detached(priority: .userInitiated) {
-            let metadata = await StreamPipeline.fetchPreviewMetadata(for: trimmed)
+            let loadStartedAt = Date()
+
+            let liveStageStartedAt = Date()
+            let liveStatusMetadata = await StreamPipeline.fetchInitialPreviewMetadata(for: trimmed)
+            let liveStageDuration = Date().timeIntervalSince(liveStageStartedAt)
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 guard requestID == self.previewRequestID else { return }
-                self.previewSourceURL = trimmed
+                guard self.previewSourceURL == trimmed else { return }
 
-                if let preview = metadata.preview {
-                    self.preview = preview
-                    self.previewStatus = self.previewStatusText(for: preview.publishState)
+                if let liveStatusPreview = liveStatusMetadata.preview {
+                    let mergedPreview = self.mergePreview(current: self.preview, incoming: liveStatusPreview)
+                    self.preview = mergedPreview
+                    self.previewStatus = "\(self.previewStatusText(for: mergedPreview.publishState)) (basic info \(Self.formatSeconds(liveStageDuration)))"
+                    StreamPipeline.storeCachedPreview(mergedPreview, for: trimmed)
+                    self.appendLog("[app] Load info: basic info ready in \(Self.formatSeconds(liveStageDuration)).")
                 } else {
-                    self.preview = nil
-                    self.previewStatus = metadata.message
+                    if self.preview == nil {
+                        self.preview = nil
+                        self.previewStatus = liveStatusMetadata.message
+                    }
+                    self.appendLog("[app] Load info: basic info failed in \(Self.formatSeconds(liveStageDuration)) (\(liveStatusMetadata.message)).")
                 }
+
+                let totalDuration = Date().timeIntervalSince(loadStartedAt)
+                self.appendLog("[app] Load info: total \(Self.formatSeconds(totalDuration)).")
             }
         }
     }
@@ -397,6 +424,31 @@ final class StreamPipeline: ObservableObject {
         case .unknown:
             return "Source info loaded (live status unknown)"
         }
+    }
+
+    private func mergePreview(current: StreamPreview?, incoming: StreamPreview) -> StreamPreview {
+        guard var merged = current else { return incoming }
+        merged.title = incoming.title
+        merged.publishState = incoming.publishState
+        if let thumbnailURL = incoming.thumbnailURL {
+            merged.thumbnailURL = thumbnailURL
+        }
+        if !incoming.descriptionExcerpt.isEmpty {
+            merged.descriptionExcerpt = incoming.descriptionExcerpt
+        }
+        if Self.hasMeaningfulPreviewValue(incoming.resolutionLabel) {
+            merged.resolutionLabel = incoming.resolutionLabel
+        }
+        if Self.hasMeaningfulPreviewValue(incoming.frameRateLabel) {
+            merged.frameRateLabel = incoming.frameRateLabel
+        }
+        if Self.hasMeaningfulPreviewValue(incoming.bitrateLabel) {
+            merged.bitrateLabel = incoming.bitrateLabel
+        }
+        if Self.hasMeaningfulPreviewValue(incoming.codecLabel) {
+            merged.codecLabel = incoming.codecLabel
+        }
+        return merged
     }
 
     private func launchPipeline() {
@@ -2517,33 +2569,18 @@ final class StreamPipeline: ObservableObject {
         )
     }
 
-    nonisolated private static func fetchPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
-        guard
-            let ytDlp = resolveToolForPreview(named: "yt-dlp"),
-            let ffmpeg = resolveToolForPreview(named: "ffmpeg")
-        else {
+    nonisolated private struct PreviewLookupContext {
+        let ytDlp: URL
+    }
+
+    nonisolated private static func fetchInitialPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
+        guard let context = preparePreviewLookupContext() else {
             return (nil, "Tools unavailable")
         }
 
-        let deno = resolveToolForPreview(named: "deno")
-        let ffmpegToolsDir = ffmpeg.deletingLastPathComponent().path
-        let ytDlpWorkDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("youtube-live-converter", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(
-                at: ytDlpWorkDir,
-                withIntermediateDirectories: true
-            )
-        } catch {
-            return (nil, "Failed to prepare temp directory")
-        }
-
-        // Fast path: ask yt-dlp for only the fields the UI needs.
-        var fastArgs = ["--skip-download", "--no-warnings", "--no-playlist"]
-        if let deno {
-            fastArgs += ["--js-runtimes", "deno:\(deno.path)"]
-        }
-        fastArgs += [
+        // Single request path for initial source data (same style as CLI).
+        var args = ["--skip-download", "--no-warnings", "--no-playlist"]
+        args += [
             "--print", "title=%(title)s",
             "--print", "thumbnail=%(thumbnail)s",
             "--print", "live_status=%(live_status)s",
@@ -2556,35 +2593,41 @@ final class StreamPipeline: ObservableObject {
             "--print", "fps=%(fps)s",
             "--print", "tbr=%(tbr)s",
             "--print", "vcodec=%(vcodec)s",
-            "--paths", "home:\(ytDlpWorkDir.path)",
-            "--paths", "temp:\(ytDlpWorkDir.path)",
-            "--ffmpeg-location", ffmpegToolsDir,
             sourceURL
         ]
 
-        if let fastResult = await runProcessCaptureForPreview(
-            executableURL: ytDlp,
-            arguments: fastArgs,
-            environment: mergedEnvironmentForPreview(prependingPath: ffmpegToolsDir),
-            currentDirectoryURL: ytDlpWorkDir,
-            timeoutSeconds: 12
-        ) {
-            if fastResult.exitCode == Self.processTimeoutExitCode {
-                return (nil, "Source info lookup timed out")
-            }
-            if fastResult.exitCode == 0,
-               let quickPreview = parseQuickPreview(from: fastResult.stdoutData) {
-                return (quickPreview, "Source info loaded")
-            }
+        guard let result = await runProcessCaptureForPreview(
+            executableURL: context.ytDlp,
+            arguments: args,
+            environment: ProcessInfo.processInfo.environment,
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            timeoutSeconds: 20
+        ) else {
+            return (nil, "Failed to run live-status lookup")
         }
 
-        // Fallback for providers/templates that don't expose quick fields reliably.
-        return await fetchPreviewMetadataViaJSON(
-            sourceURL: sourceURL,
-            ytDlp: ytDlp,
-            ffmpegToolsDir: ffmpegToolsDir,
-            deno: deno,
-            ytDlpWorkDir: ytDlpWorkDir
+        if result.exitCode == Self.processTimeoutExitCode {
+            return (nil, "Live-status lookup timed out")
+        }
+
+        guard result.exitCode == 0 else {
+            return (nil, previewLookupErrorMessage(from: result.stderrData, fallback: "Could not load source info"))
+        }
+
+        guard let preview = parseQuickPreview(from: result.stdoutData, sourceURL: sourceURL) else {
+            return (nil, "Source info response was incomplete")
+        }
+
+        return (preview, "Source info loaded")
+    }
+
+    nonisolated private static func preparePreviewLookupContext() -> PreviewLookupContext? {
+        guard let ytDlp = resolveToolForPreview(named: "yt-dlp") else {
+            return nil
+        }
+
+        return PreviewLookupContext(
+            ytDlp: ytDlp
         )
     }
 }
@@ -2653,6 +2696,34 @@ private final class ProcessCaptureState: @unchecked Sendable {
 
 private extension StreamPipeline {
     nonisolated private static let toolProbeCacheKey = "tool_probe_cache_v1"
+    nonisolated private static let previewCacheKey = "preview_metadata_cache_v1"
+    nonisolated private static let previewCacheTTLSeconds: TimeInterval = 180
+    nonisolated private static let maxPreviewCacheEntries = 32
+
+    nonisolated private struct PreviewCacheEntry: Codable {
+        let cachedAt: TimeInterval
+        let title: String
+        let descriptionExcerpt: String
+        let thumbnailURLString: String?
+        let publishStateRaw: String
+        let resolutionLabel: String
+        let frameRateLabel: String
+        let bitrateLabel: String
+        let codecLabel: String
+
+        func toPreview() -> StreamPreview {
+            StreamPreview(
+                title: title,
+                descriptionExcerpt: descriptionExcerpt,
+                thumbnailURL: thumbnailURLString.flatMap { URL(string: $0) },
+                publishState: PublishState(rawValue: publishStateRaw) ?? .unknown,
+                resolutionLabel: resolutionLabel,
+                frameRateLabel: frameRateLabel,
+                bitrateLabel: bitrateLabel,
+                codecLabel: codecLabel
+            )
+        }
+    }
 
     nonisolated private struct ToolProbeCache: Codable {
         let ytDlpPath: String
@@ -2662,6 +2733,72 @@ private extension StreamPipeline {
         let ffprobePath: String
         let ffprobeSignature: String
         let supportsVideoToolboxH264: Bool
+    }
+
+    nonisolated private static func hasMeaningfulPreviewValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        return lower != "unknown" && lower != "-"
+    }
+
+    nonisolated private static func formatSeconds(_ seconds: TimeInterval) -> String {
+        String(format: "%.1fs", max(0, seconds))
+    }
+
+    nonisolated private static func loadCachedPreview(for sourceURL: String) -> StreamPreview? {
+        guard
+            let data = UserDefaults.standard.data(forKey: previewCacheKey),
+            let cache = try? JSONDecoder().decode([String: PreviewCacheEntry].self, from: data),
+            let entry = cache[sourceURL]
+        else {
+            return nil
+        }
+
+        let age = Date().timeIntervalSince1970 - entry.cachedAt
+        guard age >= 0, age <= previewCacheTTLSeconds else {
+            return nil
+        }
+        return entry.toPreview()
+    }
+
+    nonisolated private static func storeCachedPreview(_ preview: StreamPreview, for sourceURL: String) {
+        var cache = loadPreviewCacheDictionary()
+        let now = Date().timeIntervalSince1970
+        cache = cache.filter { now - $0.value.cachedAt <= previewCacheTTLSeconds }
+
+        cache[sourceURL] = PreviewCacheEntry(
+            cachedAt: now,
+            title: preview.title,
+            descriptionExcerpt: preview.descriptionExcerpt,
+            thumbnailURLString: preview.thumbnailURL?.absoluteString,
+            publishStateRaw: preview.publishState.rawValue,
+            resolutionLabel: preview.resolutionLabel,
+            frameRateLabel: preview.frameRateLabel,
+            bitrateLabel: preview.bitrateLabel,
+            codecLabel: preview.codecLabel
+        )
+
+        if cache.count > maxPreviewCacheEntries {
+            let sortedByAge = cache.sorted { $0.value.cachedAt < $1.value.cachedAt }
+            let overflow = cache.count - maxPreviewCacheEntries
+            for (key, _) in sortedByAge.prefix(overflow) {
+                cache.removeValue(forKey: key)
+            }
+        }
+
+        guard let encoded = try? JSONEncoder().encode(cache) else { return }
+        UserDefaults.standard.set(encoded, forKey: previewCacheKey)
+    }
+
+    nonisolated private static func loadPreviewCacheDictionary() -> [String: PreviewCacheEntry] {
+        guard
+            let data = UserDefaults.standard.data(forKey: previewCacheKey),
+            let decoded = try? JSONDecoder().decode([String: PreviewCacheEntry].self, from: data)
+        else {
+            return [:]
+        }
+        return decoded
     }
 
     nonisolated private struct ToolResolution {
@@ -3053,27 +3190,19 @@ private extension StreamPipeline {
     nonisolated private static func fetchPreviewMetadataViaJSON(
         sourceURL: String,
         ytDlp: URL,
-        ffmpegToolsDir: String,
-        deno: URL?,
-        ytDlpWorkDir: URL
+        timeoutSeconds: TimeInterval
     ) async -> (preview: StreamPreview?, message: String) {
         var args = ["--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist"]
-        if let deno {
-            args += ["--js-runtimes", "deno:\(deno.path)"]
-        }
         args += [
-            "--paths", "home:\(ytDlpWorkDir.path)",
-            "--paths", "temp:\(ytDlpWorkDir.path)",
-            "--ffmpeg-location", ffmpegToolsDir,
             sourceURL
         ]
 
         guard let result = await runProcessCaptureForPreview(
             executableURL: ytDlp,
             arguments: args,
-            environment: mergedEnvironmentForPreview(prependingPath: ffmpegToolsDir),
-            currentDirectoryURL: ytDlpWorkDir,
-            timeoutSeconds: 20
+            environment: ProcessInfo.processInfo.environment,
+            currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
+            timeoutSeconds: timeoutSeconds
         ) else {
             return (nil, "Failed to run metadata lookup")
         }
@@ -3150,7 +3279,45 @@ private extension StreamPipeline {
         return firstLine.count > 180 ? String(firstLine.prefix(180)) + "..." : firstLine
     }
 
-    nonisolated private static func parseQuickPreview(from data: Data) -> StreamPreview? {
+    nonisolated private static func parseQuickPreview(from data: Data, sourceURL: String) -> StreamPreview? {
+        let fields = parsePrintedFields(from: data)
+        let title = (fields["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let publishState = parsePublishState(fromQuickFields: fields)
+        let technical = parseTechnicalSummary(fromQuickFields: fields)
+
+        guard !title.isEmpty || publishState != .unknown else { return nil }
+
+        return StreamPreview(
+            title: title.isEmpty ? sourceLabel(from: sourceURL) : title,
+            descriptionExcerpt: "",
+            thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
+            publishState: publishState,
+            resolutionLabel: technical.resolution,
+            frameRateLabel: technical.fps,
+            bitrateLabel: technical.bitrate,
+            codecLabel: technical.codec
+        )
+    }
+
+    nonisolated private static func parseLiveStatusPreview(from data: Data, sourceURL: String) -> StreamPreview? {
+        let fields = parsePrintedFields(from: data)
+        let publishState = parsePublishState(fromQuickFields: fields)
+        guard publishState != .unknown else { return nil }
+        let title = (fields["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return StreamPreview(
+            title: title.isEmpty ? sourceLabel(from: sourceURL) : title,
+            descriptionExcerpt: "",
+            thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
+            publishState: publishState,
+            resolutionLabel: "Unknown",
+            frameRateLabel: "Unknown",
+            bitrateLabel: "Unknown",
+            codecLabel: "Unknown"
+        )
+    }
+
+    nonisolated private static func parsePrintedFields(from data: Data) -> [String: String] {
         let output = String(decoding: data, as: UTF8.self)
         let lines = output.split(whereSeparator: \.isNewline)
         var fields: [String: String] = [:]
@@ -3164,23 +3331,15 @@ private extension StreamPipeline {
             guard !key.isEmpty else { continue }
             fields[key] = value
         }
+        return fields
+    }
 
-        let title = (fields["title"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return nil }
-
-        let publishState = parsePublishState(fromQuickFields: fields)
-        let streamTechnical = parseTechnicalSummary(fromQuickFields: fields)
-
-        return StreamPreview(
-            title: title,
-            descriptionExcerpt: "",
-            thumbnailURL: URL(string: fields["thumbnail"] ?? ""),
-            publishState: publishState,
-            resolutionLabel: streamTechnical.resolution,
-            frameRateLabel: streamTechnical.fps,
-            bitrateLabel: streamTechnical.bitrate,
-            codecLabel: streamTechnical.codec
-        )
+    nonisolated private static func sourceLabel(from sourceURL: String) -> String {
+        if let url = URL(string: sourceURL),
+           let host = url.host, !host.isEmpty {
+            return host
+        }
+        return "Source"
     }
 
     nonisolated private static func parsePublishState(fromQuickFields fields: [String: String]) -> PublishState {

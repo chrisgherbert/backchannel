@@ -323,16 +323,38 @@ struct ContentView: View {
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(2)
                         HStack(spacing: 10) {
-                            previewStatPill(preview.resolutionLabel)
-                            previewStatPill(preview.frameRateLabel)
-                            previewStatPill(preview.bitrateLabel)
-                            previewStatPill(preview.codecLabel)
+                            if isMeaningfulPreviewValue(preview.resolutionLabel) {
+                                previewStatPill(preview.resolutionLabel)
+                            }
+                            if isMeaningfulPreviewValue(preview.frameRateLabel) {
+                                previewStatPill(preview.frameRateLabel)
+                            }
+                            if isMeaningfulPreviewValue(preview.bitrateLabel) {
+                                previewStatPill(preview.bitrateLabel)
+                            }
+                            if isMeaningfulPreviewValue(preview.codecLabel) {
+                                previewStatPill(preview.codecLabel)
+                            }
+                        }
+                        if !isMeaningfulPreviewValue(preview.resolutionLabel) ||
+                            !isMeaningfulPreviewValue(preview.frameRateLabel) ||
+                            !isMeaningfulPreviewValue(preview.bitrateLabel) ||
+                            !isMeaningfulPreviewValue(preview.codecLabel) {
+                            if isLoadingSourceInfo {
+                                Text("Loading technical details...")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         if !preview.descriptionExcerpt.isEmpty {
                             Text(preview.descriptionExcerpt)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(4)
+                        } else if isLoadingSourceInfo {
+                            Text("Loading description...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                         if !pipeline.previewStatus.isEmpty {
                             Text(pipeline.previewStatus)
@@ -544,6 +566,7 @@ struct ContentView: View {
                 .frame(width: 220)
                 Spacer()
             }
+            .padding(.bottom, 4)
 
             if selectedPanel == .status {
                 statusPanel
@@ -758,6 +781,13 @@ struct ContentView: View {
         .clipShape(Capsule())
     }
 
+    private func isMeaningfulPreviewValue(_ value: String) -> Bool {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        return lower != "unknown" && lower != "-"
+    }
+
     private var sourceURLTrimmed: String {
         config.sourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -915,7 +945,8 @@ struct ContentView: View {
     }
 
     private var isLoadingSourceInfo: Bool {
-        pipeline.previewStatus == "Loading source info..."
+        let status = pipeline.previewStatus.lowercased()
+        return status.contains("loading") || status.contains("checking")
     }
 
     private var footerPrimaryStateText: String {
@@ -1000,6 +1031,7 @@ struct ContentView: View {
 
     private func scheduleAutoLoadInfo() {
         if shouldSkipSourceInfoGate { return }
+        if isStartPending || pipeline.isRunning { return }
 
         autoLoadInfoTask?.cancel()
         autoLoadInfoTask = nil
@@ -1025,6 +1057,8 @@ struct ContentView: View {
             await MainActor.run {
                 guard sourceURLTrimmed == trimmed else { return }
                 guard sourceValidationMessage == nil else { return }
+                guard !isStartPending else { return }
+                guard !pipeline.isRunning else { return }
                 guard !isLoadingSourceInfo else { return }
                 guard pipeline.previewSourceURL != trimmed else {
                     lastAutoLoadedSourceURL = trimmed
@@ -1037,6 +1071,9 @@ struct ContentView: View {
     }
 
     private func startStream() {
+        autoLoadInfoTask?.cancel()
+        autoLoadInfoTask = nil
+        lastAutoLoadedSourceURL = sourceURLTrimmed
         var runtimeConfig = config
         runtimeConfig.outputTarget = runtimeConfig.resolvedOutputTarget()
         isStartPending = true
