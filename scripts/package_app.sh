@@ -73,6 +73,18 @@ is_bundleable_dependency() {
   esac
 }
 
+otool_dependencies() {
+  local macho="$1"
+  otool -L "$macho" | awk '
+    /^[[:space:]]/ {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/ \(compatibility version.*$/, "", line)
+      print line
+    }
+  '
+}
+
 bundle_macho_dependencies() {
   mkdir -p "$RES_LIB_DIR"
 
@@ -102,7 +114,7 @@ bundle_macho_dependencies() {
     fi
     echo "$macho" >> "$seen_file"
 
-    dep_list="$(otool -L "$macho" | tail -n +2 | awk '{print $1}')"
+    dep_list="$(otool_dependencies "$macho")"
     while IFS= read -r dep; do
       [[ -n "$dep" ]] || continue
       if ! is_bundleable_dependency "$dep"; then
@@ -162,7 +174,45 @@ resolve_rpath_dependencies_in_bundle() {
         chmod u+w "$(dirname "$dep_path")/$dep_name" >/dev/null 2>&1 || true
         install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
       fi
-    done < <(otool -L "$dep_path" | tail -n +2 | awk '{print $1}')
+    done < <(otool_dependencies "$dep_path")
+  done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
+}
+
+normalize_bundled_library_install_names() {
+  local dep_path dep rel_path dep_dest new_ref dep_name
+
+  while IFS= read -r dep_path; do
+    if ! is_macho_binary "$dep_path"; then
+      continue
+    fi
+
+    if [[ "$dep_path" == "$RES_LIB_DIR/"* ]] && [[ "$dep_path" == *.dylib ]]; then
+      rel_path="${dep_path#$RES_LIB_DIR/}"
+      install_name_tool -id "@executable_path/../lib/$rel_path" "$dep_path"
+    fi
+
+    while IFS= read -r dep; do
+      [[ -n "$dep" ]] || continue
+
+      if is_bundleable_dependency "$dep"; then
+        dep_dest="$RES_LIB_DIR$dep"
+        if [[ -f "$dep_dest" ]]; then
+          new_ref="@executable_path/../lib$dep"
+          install_name_tool -change "$dep" "$new_ref" "$dep_path"
+        fi
+        continue
+      fi
+
+      if [[ "$dep" == @rpath/* ]]; then
+        dep_name="${dep#@rpath/}"
+        dep_dest="$(find "$RES_LIB_DIR" -name "$dep_name" -type f | head -n 1 || true)"
+        if [[ -n "$dep_dest" ]]; then
+          rel_path="${dep_dest#$RES_LIB_DIR/}"
+          new_ref="@executable_path/../lib/$rel_path"
+          install_name_tool -change "$dep" "$new_ref" "$dep_path"
+        fi
+      fi
+    done < <(otool_dependencies "$dep_path")
   done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
 }
 
@@ -741,6 +791,7 @@ chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 echo "Bundling ffmpeg/ffprobe shared libraries into app..."
 bundle_macho_dependencies "${bundle_roots[@]}"
 resolve_rpath_dependencies_in_bundle
+normalize_bundled_library_install_names
 
 echo "Bundled:"
 echo "  yt-dlp: $YTDLP_PATH"

@@ -91,6 +91,18 @@ is_macho() {
   file -b "$1" 2>/dev/null | grep -q "Mach-O"
 }
 
+otool_dependencies() {
+  local macho="$1"
+  otool -L "$macho" | awk '
+    /^[[:space:]]/ {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/ \(compatibility version.*$/, "", line)
+      print line
+    }
+  '
+}
+
 audit_portability() {
   echo "==> Running dependency/portability audit"
   local failures=0
@@ -112,7 +124,7 @@ audit_portability() {
         *)
           ;;
       esac
-    done < <(otool -L "$file_path" | tail -n +2 | awk '{print $1}')
+    done < <(otool_dependencies "$file_path")
   done < <(find "$APP_PATH/Contents" -type f -print)
 
   if [[ "$failures" -ne 0 ]]; then
