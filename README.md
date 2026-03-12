@@ -12,16 +12,23 @@ It is designed to keep `yt-dlp` active for the full stream session, with automat
 ```bash
 mkdir -p "$HOME/.local/bin" && curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" -o "$HOME/.local/bin/yt-dlp" && chmod +x "$HOME/.local/bin/yt-dlp"
 ```
-2. Create/update private release config:
+2. Ensure standalone `deno` exists for managed support payloads.
+3. Create/update private release config:
 ```bash
-cp -n .release.env.example .release.env
+cp -n scripts/release.env.example scripts/release.env
 ```
-3. Fill `.release.env` required values (`SIGNING_IDENTITY`, `TEAM_ID`, `NOTARY_KEYCHAIN_PROFILE`, `YTDLP_BINARY`).
-4. Run full signed + notarized release:
+4. Fill `scripts/release.env` required values (`DEV_ID_APP`, `AC_PROFILE`, `YTDLP_BINARY`, `DENO_BINARY`).
+5. Run full signed + notarized GitHub release:
 ```bash
-./scripts/release_app.sh
+./scripts/github_release.sh --version 1.1.1 --notes-file /absolute/path/to/release-notes.md
 ```
-5. Distribute:
+6. Confirm the GitHub release includes:
+- app zip
+- app zip checksum
+- `backchannel-managed-support.json`
+- managed `yt-dlp` archive + checksum
+- managed `deno` archive + checksum
+7. Distribute:
 ```bash
 open dist
 ```
@@ -29,13 +36,16 @@ open dist
 ## Prerequisites
 
 - macOS 13+
-- `yt-dlp` installed and available in `PATH`
-- `ffmpeg` installed and available in `PATH`
+- standalone `yt-dlp` binary available for packaging
+- portable `ffmpeg` / `ffprobe` binaries available for packaging
+- standalone `deno` binary available for managed support packaging
 
-Example installs:
+These are release-time/build-time requirements, not end-user runtime requirements. The shipped app bundles or manages its own dependencies.
+
+Example `yt-dlp` install:
 
 ```bash
-brew install yt-dlp ffmpeg
+mkdir -p "$HOME/.local/bin" && curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" -o "$HOME/.local/bin/yt-dlp" && chmod +x "$HOME/.local/bin/yt-dlp"
 ```
 
 ## Run
@@ -137,40 +147,42 @@ It will:
 3. Bundle required tools into `Contents/Resources/bin`.
 4. Apply ad-hoc signing (for local execution).
 
-### 3. One-Command Signed + Notarized Release
+### 3. Signed + Notarized Release
 
-Use the release script for update distribution:
+Use the current release pipeline scripts:
+
+First-time setup:
 
 ```bash
-./scripts/release_app.sh
+cp scripts/release.env.example scripts/release.env
 ```
 
-Before first run:
+Fill required values in `scripts/release.env`:
+- `DEV_ID_APP`
+- `AC_PROFILE`
+- `YTDLP_BINARY` (standalone Mach-O binary)
+- `DENO_BINARY` (standalone Mach-O binary for managed support payloads)
 
-1. Copy example config:
+Create a notarized local release build:
+
 ```bash
-cp .release.env.example .release.env
+./scripts/notarize_release.sh
 ```
-2. Fill required values in `.release.env`:
-   - `SIGNING_IDENTITY`
-   - `TEAM_ID`
-   - `NOTARY_KEYCHAIN_PROFILE`
-   - `YTDLP_BINARY` (standalone Mach-O binary)
 
-The release script runs:
+Create or update the GitHub release, including managed support assets:
 
-1. `package_app.sh`
-2. Developer ID signing for embedded binaries (`--options runtime --timestamp`)
-3. App bundle signing
-4. Signature verification
-5. Zip creation
-6. Notarization submission (`notarytool --wait`)
-7. Stapling + validation
+```bash
+./scripts/github_release.sh --version 1.1.1 --notes-file /absolute/path/to/release-notes.md
+```
 
-Output:
+The GitHub release script uploads:
+- notarized app zip
+- app zip checksum
+- managed support manifest
+- managed yt-dlp archive + checksum
+- managed deno archive + checksum
 
-- App: `dist/Back Channel.app`
-- Zip: `dist/Back-Channel-<version>.zip` (or `dist/Back-Channel.zip`)
+It also verifies that those assets actually exist on the GitHub release after upload. If any are missing, the script fails.
 
 ### 4. Standalone `yt-dlp` Binary
 
@@ -182,7 +194,7 @@ Example install:
 mkdir -p "$HOME/.local/bin" && curl -L "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos" -o "$HOME/.local/bin/yt-dlp" && chmod +x "$HOME/.local/bin/yt-dlp"
 ```
 
-Set in `.release.env`:
+Set in `scripts/release.env`:
 
 ```bash
 YTDLP_BINARY="$HOME/.local/bin/yt-dlp"
@@ -190,7 +202,7 @@ YTDLP_BINARY="$HOME/.local/bin/yt-dlp"
 
 ### 5. Manual Notarization (Reference)
 
-If you need to run manually instead of `release_app.sh`:
+If you need to run manual notarization steps instead of `scripts/notarize_release.sh`:
 
 ```bash
 codesign --force --options runtime --timestamp --sign "Developer ID Application: <Name> (<TEAMID>)" "dist/Back Channel.app"

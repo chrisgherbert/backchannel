@@ -3,6 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @ObservedObject var pipeline: StreamPipeline
+    @EnvironmentObject private var externalTools: ExternalToolsManager
     private let launchOptions: LaunchOptions
     @State private var config: StreamConfig
     @State private var autoLoadInfoTask: Task<Void, Never>?
@@ -17,8 +18,10 @@ struct ContentView: View {
     @State private var upcomingWatcherSourceURL = ""
     @State private var upcomingWatcherStatus = ""
     @State private var upcomingWatcherNextCheckAt: Date?
+    @State private var showManagedSupportSetupSheet = false
     @AppStorage("show_inspector") private var showInspector = true
     @AppStorage("auto_start_when_live_enabled") private var autoStartWhenLiveEnabled = false
+    @AppStorage(AppPreferenceKeys.managedSupportSetupDismissedVersion) private var managedSupportSetupDismissedVersion = ""
     @AppStorage(AppPreferenceKeys.runtimeLogMonitoringEnabled) private var logMonitoringEnabled = true
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
@@ -75,12 +78,14 @@ struct ContentView: View {
             }
             pipeline.setCliLogMirroringEnabled(launchOptions.hasRuntimeOverrides)
             pipeline.setLogMonitoringEnabled(logMonitoringEnabled)
+            externalTools.refreshStatus()
             syncSelectedRtmpPreset()
             syncSelectedSourcePreset()
             if launchOptions.shouldAutoStart && !didAutoStart {
                 didAutoStart = true
                 startStream()
             }
+            maybePresentManagedSupportSetup()
         }
         .onDisappear {
             autoLoadInfoTask?.cancel()
@@ -135,6 +140,25 @@ struct ContentView: View {
         }
         .onChange(of: autoStartWhenLiveEnabled) { _ in
             refreshUpcomingWatcherState()
+        }
+        .onReceive(externalTools.$managedStatuses) { _ in
+            maybePresentManagedSupportSetup()
+        }
+        .onReceive(externalTools.$managedSupportAvailability) { _ in
+            maybePresentManagedSupportSetup()
+        }
+        .sheet(isPresented: $showManagedSupportSetupSheet) {
+            ManagedSupportSetupSheet(
+                onDismiss: {
+                    managedSupportSetupDismissedVersion = ""
+                    showManagedSupportSetupSheet = false
+                },
+                onDeferred: {
+                    managedSupportSetupDismissedVersion = currentAppVersion
+                    showManagedSupportSetupSheet = false
+                }
+            )
+            .environmentObject(externalTools)
         }
     }
 
@@ -1397,6 +1421,24 @@ struct ContentView: View {
         }
 
         return config
+    }
+
+    private var currentAppVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+    }
+
+    private func maybePresentManagedSupportSetup() {
+        guard !launchOptions.hasRuntimeOverrides else { return }
+        guard externalTools.canInstallManagedSupport else {
+            showManagedSupportSetupSheet = false
+            return
+        }
+        guard externalTools.requiresInitialSetup else {
+            showManagedSupportSetupSheet = false
+            return
+        }
+        guard managedSupportSetupDismissedVersion != currentAppVersion else { return }
+        showManagedSupportSetupSheet = true
     }
 
     private func copyAllLogs() {

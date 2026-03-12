@@ -494,9 +494,7 @@ final class StreamPipeline: ObservableObject {
             config.sourceURL
         ]
         ytDlp.arguments = ytDlpArguments
-        ytDlp.environment = mergedEnvironment(
-            prependingPath: ffmpegToolsDir
-        )
+        ytDlp.environment = paths.environment
 
         let mediaPipe = Pipe()
         // Always capture stderr to keep process IO drained and telemetry behavior consistent.
@@ -654,7 +652,7 @@ final class StreamPipeline: ObservableObject {
         let ffmpeg = Process()
         ffmpeg.executableURL = paths.ffmpeg
         ffmpeg.arguments = ffmpegArguments(for: config)
-        ffmpeg.environment = mergedEnvironment(prependingPath: ffmpegToolsDir)
+        ffmpeg.environment = paths.environment
         ffmpeg.standardInput = input
         ffmpeg.standardOutput = FileHandle.nullDevice
         if let ffError {
@@ -708,7 +706,7 @@ final class StreamPipeline: ObservableObject {
             playlistURL: playlistURL,
             segmentPattern: segmentPattern
         )
-        normalizer.environment = mergedEnvironment(prependingPath: ffmpegToolsDir)
+        normalizer.environment = paths.environment
         normalizer.standardInput = input
         normalizer.standardOutput = FileHandle.nullDevice
         if let normalizerError {
@@ -739,7 +737,7 @@ final class StreamPipeline: ObservableObject {
         let ffmpeg = Process()
         ffmpeg.executableURL = paths.ffmpeg
         ffmpeg.arguments = dvrPublisherArguments(for: config, playlistURL: playlistURL)
-        ffmpeg.environment = mergedEnvironment(prependingPath: ffmpegToolsDir)
+        ffmpeg.environment = paths.environment
         ffmpeg.standardInput = FileHandle.nullDevice
         ffmpeg.standardOutput = FileHandle.nullDevice
         if let ffError {
@@ -2574,6 +2572,7 @@ final class StreamPipeline: ObservableObject {
 
     nonisolated private struct PreviewLookupContext {
         let ytDlp: URL
+        let environment: [String: String]
     }
 
     nonisolated private static func fetchInitialPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
@@ -2602,7 +2601,7 @@ final class StreamPipeline: ObservableObject {
         guard let result = await runProcessCaptureForPreview(
             executableURL: context.ytDlp,
             arguments: args,
-            environment: ProcessInfo.processInfo.environment,
+            environment: context.environment,
             currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
             timeoutSeconds: 20
         ) else {
@@ -2628,12 +2627,13 @@ final class StreamPipeline: ObservableObject {
     }
 
     nonisolated private static func preparePreviewLookupContext() -> PreviewLookupContext? {
-        guard let ytDlp = resolveToolForPreview(named: "yt-dlp") else {
+        guard let previewTools = ExternalToolResolver.resolvePreviewTools(resourceURL: Bundle.main.resourceURL) else {
             return nil
         }
 
         return PreviewLookupContext(
-            ytDlp: ytDlp
+            ytDlp: previewTools.ytDlp,
+            environment: previewTools.environment
         )
     }
 }
@@ -2643,6 +2643,7 @@ private struct ToolPaths: Sendable {
     let ffmpeg: URL
     let ffprobe: URL
     let deno: URL?
+    let environment: [String: String]
     let supportsVideoToolboxH264: Bool
 }
 
@@ -2822,25 +2823,16 @@ private extension StreamPipeline {
     }
 
     nonisolated private static func resolveToolPathsBlocking(resourceURL: URL?) -> ToolResolution {
-        var logLines: [String] = []
-
-        guard let ytDlp = resolveTool(named: "yt-dlp", resourceURL: resourceURL) else {
-            logLines.append("[app] Could not find yt-dlp. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
-            return ToolResolution(paths: nil, logLines: logLines)
-        }
-        guard let ffmpeg = resolveTool(named: "ffmpeg", resourceURL: resourceURL) else {
-            logLines.append("[app] Could not find ffmpeg. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
-            return ToolResolution(paths: nil, logLines: logLines)
-        }
-        guard let ffprobe = resolveTool(named: "ffprobe", resourceURL: resourceURL) else {
-            logLines.append("[app] Could not find ffprobe. Bundle it in Contents/Resources/bin or install it in /opt/homebrew/bin or /usr/local/bin.")
+        let resolved = ExternalToolResolver.resolveCurrentToolchain(resourceURL: resourceURL)
+        var logLines = resolved.logLines
+        guard let toolchain = resolved.toolchain else {
             return ToolResolution(paths: nil, logLines: logLines)
         }
 
-        var denoURL: URL?
-        if let deno = resolveTool(named: "deno", resourceURL: resourceURL) {
-            denoURL = deno
-        }
+        let ytDlp = toolchain.ytDlp.url
+        let ffmpeg = toolchain.ffmpeg.url
+        let ffprobe = toolchain.ffprobe.url
+        let denoURL = toolchain.deno?.url
 
         let ytDlpSignature = executableSignature(for: ytDlp)
         let ffmpegSignature = executableSignature(for: ffmpeg)
@@ -2899,28 +2891,10 @@ private extension StreamPipeline {
             ffmpeg: ffmpeg,
             ffprobe: ffprobe,
             deno: denoURL,
+            environment: toolchain.environment,
             supportsVideoToolboxH264: supportsVideoToolboxH264
         )
         return ToolResolution(paths: paths, logLines: logLines)
-    }
-
-    nonisolated private static func resolveTool(named name: String, resourceURL: URL?) -> URL? {
-        let fm = FileManager.default
-        var candidates: [URL] = []
-
-        if let bundleURL = resourceURL {
-            candidates.append(bundleURL.appendingPathComponent("bin/\(name)"))
-            candidates.append(bundleURL.appendingPathComponent(name))
-        }
-
-        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/\(name)"))
-        candidates.append(URL(fileURLWithPath: "/usr/local/bin/\(name)"))
-        candidates.append(URL(fileURLWithPath: "/usr/bin/\(name)"))
-
-        for candidate in candidates where fm.isExecutableFile(atPath: candidate.path) {
-            return candidate
-        }
-        return nil
     }
 
     nonisolated private static func verifyExecutable(_ url: URL, probeArgument: String) -> Bool {
@@ -2987,13 +2961,6 @@ private extension StreamPipeline {
         } catch {
             return false
         }
-    }
-
-    func mergedEnvironment(prependingPath: String) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        let existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = "\(prependingPath):\(existing)"
-        return env
     }
 
     func runProcessCapture(
@@ -3068,29 +3035,6 @@ private extension StreamPipeline {
                 )
             }
         }
-    }
-
-    nonisolated private static func resolveToolForPreview(named name: String) -> URL? {
-        let fm = FileManager.default
-        var candidates: [URL] = []
-
-        if let bundleURL = Bundle.main.resourceURL {
-            candidates.append(bundleURL.appendingPathComponent("bin/\(name)"))
-            candidates.append(bundleURL.appendingPathComponent(name))
-        }
-
-        candidates.append(URL(fileURLWithPath: "/opt/homebrew/bin/\(name)"))
-        candidates.append(URL(fileURLWithPath: "/usr/local/bin/\(name)"))
-        candidates.append(URL(fileURLWithPath: "/usr/bin/\(name)"))
-
-        return candidates.first(where: { fm.isExecutableFile(atPath: $0.path) })
-    }
-
-    nonisolated private static func mergedEnvironmentForPreview(prependingPath: String) -> [String: String] {
-        var env = ProcessInfo.processInfo.environment
-        let existing = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        env["PATH"] = "\(prependingPath):\(existing)"
-        return env
     }
 
     nonisolated private static func runProcessCaptureForPreview(

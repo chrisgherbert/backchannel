@@ -4,6 +4,7 @@ import AppKit
 private enum SettingsPane: Hashable {
     case general
     case outputDefaults
+    case tools
     case rtmpPresets
     case sourcePresets
 }
@@ -44,6 +45,10 @@ struct SettingsView: View {
             outputDefaultsPane
                 .tabItem { Label("Output Defaults", systemImage: "slider.horizontal.3") }
                 .tag(SettingsPane.outputDefaults)
+
+            ToolsSettingsPane()
+                .tabItem { Label("Tools", systemImage: "shippingbox") }
+                .tag(SettingsPane.tools)
 
             rtmpPresetsPane
                 .tabItem { Label("RTMP Presets", systemImage: "antenna.radiowaves.left.and.right") }

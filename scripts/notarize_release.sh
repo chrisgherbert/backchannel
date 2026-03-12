@@ -9,7 +9,9 @@ on_err() {
 trap on_err ERR
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIG_FILE="$ROOT_DIR/scripts/release.env"
+DEFAULT_CONFIG_FILE="$ROOT_DIR/scripts/release.env"
+LEGACY_CONFIG_FILE="$ROOT_DIR/.release.env"
+CONFIG_FILE="$DEFAULT_CONFIG_FILE"
 SKIP_BUILD=0
 
 usage() {
@@ -40,6 +42,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ ! -f "$CONFIG_FILE" && -f "$LEGACY_CONFIG_FILE" ]]; then
+  echo "Warning: using legacy config file $LEGACY_CONFIG_FILE" >&2
+  CONFIG_FILE="$LEGACY_CONFIG_FILE"
+fi
 
 [[ -f "$CONFIG_FILE" ]] || { echo "Error: missing config file: $CONFIG_FILE" >&2; echo "Create from scripts/release.env.example" >&2; exit 1; }
 

@@ -663,14 +663,14 @@ else
   echo "Or set APP_ICON_FILE=/absolute/path/icon.icon (or .png/.icns)."
 fi
 
-echo "Bundling yt-dlp, ffmpeg, ffprobe, and deno..."
+echo "Bundling yt-dlp, ffmpeg, and ffprobe..."
 YTDLP_PATH="${YTDLP_BINARY:-}"
 if [[ -z "$YTDLP_PATH" ]]; then
   if [[ -x "$HOME/.local/bin/yt-dlp" ]]; then
     YTDLP_PATH="$HOME/.local/bin/yt-dlp"
   else
     YTDLP_PATH="$(find_tool yt-dlp)" || {
-      echo "Error: yt-dlp not found. Install it first (brew install yt-dlp)." >&2
+      echo "Error: yt-dlp not found. Set YTDLP_BINARY to a standalone yt-dlp macOS binary." >&2
       exit 1
     }
   fi
@@ -679,7 +679,7 @@ fi
 FFMPEG_PATH="${FFMPEG_BINARY:-}"
 if [[ -z "$FFMPEG_PATH" ]]; then
   FFMPEG_PATH="$(find_tool ffmpeg)" || {
-    echo "Error: ffmpeg not found. Install it first (brew install ffmpeg)." >&2
+    echo "Error: ffmpeg not found. Set FFMPEG_BINARY to a portable FFmpeg binary." >&2
     exit 1
   }
 fi
@@ -691,21 +691,10 @@ if [[ -z "$FFPROBE_PATH" ]]; then
     if [[ -x "$probe_next_to_ffmpeg" ]]; then
       FFPROBE_PATH="$probe_next_to_ffmpeg"
     else
-      echo "Error: ffprobe not found. Install ffmpeg package with ffprobe included." >&2
+      echo "Error: ffprobe not found. Set FFPROBE_BINARY to a portable FFprobe binary." >&2
       exit 1
     fi
   }
-fi
-
-DENO_PATH="${DENO_BINARY:-}"
-if [[ -z "$DENO_PATH" ]]; then
-  DENO_PATH="$(find_tool deno || true)"
-fi
-
-if [[ -z "$DENO_PATH" ]] && [[ "$DENO_REQUIRED" == "1" ]]; then
-  echo "Error: deno not found. Release builds require deno to be bundled." >&2
-  echo "Install deno (e.g. brew install deno) or set DENO_BINARY=/absolute/path/to/deno." >&2
-  exit 1
 fi
 
 if [[ ! -x "$YTDLP_PATH" ]]; then
@@ -720,11 +709,6 @@ if [[ ! -x "$FFPROBE_PATH" ]]; then
   echo "Error: FFPROBE_BINARY is not executable: $FFPROBE_PATH" >&2
   exit 1
 fi
-if [[ -n "$DENO_PATH" ]] && [[ ! -x "$DENO_PATH" ]]; then
-  echo "Error: DENO_BINARY is not executable: $DENO_PATH" >&2
-  exit 1
-fi
-
 if is_python_wrapper "$YTDLP_PATH"; then
   if [[ -x "$HOME/.local/bin/yt-dlp" ]] && is_macho_binary "$HOME/.local/bin/yt-dlp"; then
     echo "Detected Homebrew yt-dlp wrapper at: $YTDLP_PATH" >&2
@@ -752,14 +736,9 @@ cp "$YTDLP_PATH" "$RES_BIN_DIR/yt-dlp"
 cp "$FFMPEG_PATH" "$RES_BIN_DIR/ffmpeg"
 cp "$FFPROBE_PATH" "$RES_BIN_DIR/ffprobe"
 bundle_roots=("$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe")
-if [[ -n "$DENO_PATH" ]]; then
-  cp "$DENO_PATH" "$RES_BIN_DIR/deno"
-  chmod +x "$RES_BIN_DIR/deno"
-  bundle_roots+=("$RES_BIN_DIR/deno")
-fi
 chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 
-echo "Bundling ffmpeg/ffprobe/deno shared libraries into app..."
+echo "Bundling ffmpeg/ffprobe shared libraries into app..."
 bundle_macho_dependencies "${bundle_roots[@]}"
 resolve_rpath_dependencies_in_bundle
 
@@ -767,11 +746,7 @@ echo "Bundled:"
 echo "  yt-dlp: $YTDLP_PATH"
 echo "  ffmpeg: $FFMPEG_PATH"
 echo "  ffprobe: $FFPROBE_PATH"
-if [[ -n "$DENO_PATH" ]]; then
-  echo "  deno: $DENO_PATH"
-else
-  echo "  deno: not bundled (optional)"
-fi
+echo "  deno: managed outside the app bundle"
 
 echo "Signing app bundle..."
 codesign --force --deep --sign - "$APP_DIR"

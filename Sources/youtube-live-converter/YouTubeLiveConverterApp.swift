@@ -5,6 +5,7 @@ import Darwin
 @main
 struct YouTubeLiveConverterApp: App {
     @StateObject private var pipeline = StreamPipeline()
+    @StateObject private var externalTools = ExternalToolsManager()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
     private let launchOptions: LaunchOptions
@@ -19,6 +20,7 @@ struct YouTubeLiveConverterApp: App {
             ContentView(pipeline: pipeline, launchOptions: launchOptions)
                 .frame(minWidth: 1080, minHeight: 700)
                 .preferredColorScheme(preferredColorScheme)
+                .environmentObject(externalTools)
                 .onAppear {
                     appDelegate.pipeline = pipeline
                 }
@@ -29,6 +31,7 @@ struct YouTubeLiveConverterApp: App {
 
         Settings {
             SettingsView()
+                .environmentObject(externalTools)
         }
 
         Window("Back Channel Help", id: "help") {

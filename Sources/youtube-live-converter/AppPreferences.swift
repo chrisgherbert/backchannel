@@ -13,6 +13,7 @@ enum AppPreferenceKeys {
     static let defaultLogMonitoringEnabled = "log_monitoring_enabled"
     static let runtimeLogMonitoringEnabled = "runtime_log_monitoring_enabled"
     static let appearanceMode = "appearance_mode"
+    static let managedSupportSetupDismissedVersion = "managed_support_setup_dismissed_version"
 }
 
 enum AppearanceMode: String, CaseIterable, Identifiable {
