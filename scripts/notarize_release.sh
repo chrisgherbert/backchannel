@@ -55,6 +55,14 @@ set -a
 source "$CONFIG_FILE"
 set +a
 
+if [[ -z "${DEV_ID_APP:-}" && -n "${SIGNING_IDENTITY:-}" ]]; then
+  DEV_ID_APP="$SIGNING_IDENTITY"
+fi
+
+if [[ -z "${AC_PROFILE:-}" && -n "${NOTARY_KEYCHAIN_PROFILE:-}" ]]; then
+  AC_PROFILE="$NOTARY_KEYCHAIN_PROFILE"
+fi
+
 require_var() {
   local name="$1"
   [[ -n "${!name:-}" ]] || { echo "Error: required variable '$name' is not set in $CONFIG_FILE" >&2; exit 1; }
