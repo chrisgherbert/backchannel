@@ -142,7 +142,10 @@ done < <(find "$MANAGED_SUPPORT_DIR" -maxdepth 1 -type f | sort)
 
 gh release upload "$TAG" "${UPLOAD_ASSETS[@]}" --clobber
 
-mapfile -t PUBLISHED_ASSETS < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+PUBLISHED_ASSETS=()
+while IFS= read -r published_asset; do
+  PUBLISHED_ASSETS+=("$published_asset")
+done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
 declare -A PUBLISHED_LOOKUP=()
 for asset_name in "${PUBLISHED_ASSETS[@]}"; do
   PUBLISHED_LOOKUP["$asset_name"]=1

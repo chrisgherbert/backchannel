@@ -791,7 +791,10 @@ chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 echo "Bundling ffmpeg/ffprobe shared libraries into app..."
 bundle_macho_dependencies "${bundle_roots[@]}"
 resolve_rpath_dependencies_in_bundle
-mapfile -t bundled_lib_roots < <(find "$RES_LIB_DIR" -type f -print)
+bundled_lib_roots=()
+while IFS= read -r bundled_lib; do
+  bundled_lib_roots+=("$bundled_lib")
+done < <(find "$RES_LIB_DIR" -type f -print)
 if [[ "${#bundled_lib_roots[@]}" -gt 0 ]]; then
   bundle_macho_dependencies "${bundled_lib_roots[@]}"
   resolve_rpath_dependencies_in_bundle
