@@ -146,15 +146,18 @@ PUBLISHED_ASSETS=()
 while IFS= read -r published_asset; do
   PUBLISHED_ASSETS+=("$published_asset")
 done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
-declare -A PUBLISHED_LOOKUP=()
-for asset_name in "${PUBLISHED_ASSETS[@]}"; do
-  PUBLISHED_LOOKUP["$asset_name"]=1
-done
 
 MISSING_ASSETS=()
 for asset_path in "${UPLOAD_ASSETS[@]}"; do
   asset_name="$(basename "$asset_path")"
-  if [[ -z "${PUBLISHED_LOOKUP[$asset_name]:-}" ]]; then
+  asset_found=0
+  for published_asset in "${PUBLISHED_ASSETS[@]}"; do
+    if [[ "$published_asset" == "$asset_name" ]]; then
+      asset_found=1
+      break
+    fi
+  done
+  if [[ "$asset_found" -eq 0 ]]; then
     MISSING_ASSETS+=("$asset_name")
   fi
 done
