@@ -39,6 +39,17 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
             return ["--version"]
         }
     }
+
+    var validationTimeout: TimeInterval {
+        switch self {
+        case .ytDlp:
+            return 8
+        case .deno:
+            return 4
+        case .ffmpeg, .ffprobe:
+            return 3
+        }
+    }
 }
 
 enum ManagedComponentKind: String, CaseIterable, Identifiable, Codable {
@@ -58,6 +69,10 @@ enum ManagedComponentKind: String, CaseIterable, Identifiable, Codable {
 
     var executableName: String {
         rawValue
+    }
+
+    var managedExecutableRelativePath: String {
+        "\(rawValue)/\(rawValue)"
     }
 
     var toolKind: ExternalToolKind {
@@ -95,14 +110,34 @@ struct ExternalToolResolution: Sendable {
     let logLines: [String]
 }
 
+enum BundledToolHealth {
+    case verified
+    case present
+    case missing
+}
+
 struct BundledToolStatus: Identifiable {
     let kind: ExternalToolKind
     let path: URL?
     let version: String?
-    let isAvailable: Bool
+    let health: BundledToolHealth
     let message: String
 
     var id: String { kind.rawValue }
+
+    var payloadExists: Bool {
+        switch health {
+        case .verified, .present:
+            return true
+        case .missing:
+            return false
+        }
+    }
+}
+
+private struct ProcessRunResult {
+    let terminationStatus: Int32
+    let output: String
 }
 
 struct ManagedComponentStateRecord: Codable {
@@ -204,7 +239,7 @@ enum ExternalSupportPaths {
     }
 
     static func managedCurrentExecutable(_ kind: ManagedComponentKind) -> URL {
-        managedCurrentLink(kind).appendingPathComponent(kind.executableName)
+        managedCurrentLink(kind).appendingPathComponent(kind.managedExecutableRelativePath)
     }
 
     static func stateStoreURL() -> URL {
@@ -239,7 +274,8 @@ enum ExternalToolResolver {
     static func resolvePreviewTools(resourceURL: URL?) -> (ytDlp: URL, environment: [String: String], logLines: [String])? {
         var logLines: [String] = []
 
-        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
+        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines)
+            ?? resolvePreferredToolBestEffort(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
             logLines.append("[app] Could not find yt-dlp in managed support or bundled resources.")
             return nil
         }
@@ -252,7 +288,8 @@ enum ExternalToolResolver {
     static func resolveCurrentToolchain(resourceURL: URL?) -> ExternalToolResolution {
         var logLines: [String] = []
 
-        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
+        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines)
+            ?? resolvePreferredToolBestEffort(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
             logLines.append("[app] Could not find yt-dlp in managed support or bundled resources.")
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
@@ -288,17 +325,40 @@ enum ExternalToolResolver {
             .map { kind in
                 let url = ExternalSupportPaths.bundledExecutable(for: kind, resourceURL: resourceURL)
                 guard let url else {
-                    return BundledToolStatus(kind: kind, path: nil, version: nil, isAvailable: false, message: "Not bundled")
+                    return BundledToolStatus(kind: kind, path: nil, version: nil, health: .missing, message: "Not bundled")
                 }
 
                 let version = detectedVersion(for: kind, url: url)
                 let isValid = verifyExecutable(url, versionArguments: kind.versionArguments)
+                let health: BundledToolHealth = if isValid {
+                    .verified
+                } else if hasExecutablePayload(url) {
+                    .present
+                } else {
+                    .missing
+                }
                 return BundledToolStatus(
                     kind: kind,
                     path: url,
                     version: version,
-                    isAvailable: isValid,
-                    message: isValid ? "Ready" : "Found but cannot run"
+                    health: health,
+                    message: isValid ? "Ready" : "Present"
+                )
+            }
+    }
+
+    static func quickBundledStatuses(resourceURL: URL?) -> [BundledToolStatus] {
+        ExternalToolKind.allCases
+            .filter(\.bundledByDefault)
+            .map { kind in
+                let url = ExternalSupportPaths.bundledExecutable(for: kind, resourceURL: resourceURL)
+                let health: BundledToolHealth = url == nil ? .missing : .present
+                return BundledToolStatus(
+                    kind: kind,
+                    path: url,
+                    version: nil,
+                    health: health,
+                    message: url == nil ? "Not bundled" : "Checking..."
                 )
             }
     }
@@ -329,46 +389,40 @@ enum ExternalToolResolver {
     }
 
     static func verifyExecutable(_ url: URL, versionArguments: [String]) -> Bool {
-        let process = Process()
-        process.executableURL = url
-        process.arguments = versionArguments
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
+        verifyExecutable(url, versionArguments: versionArguments, timeout: 2.5)
+    }
 
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
+    static func verifyExecutable(_ url: URL, versionArguments: [String], timeout: TimeInterval) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
             return false
         }
+        return runProcess(executable: url, arguments: versionArguments, timeout: timeout)?.terminationStatus == 0
+    }
+
+    static func hasExecutablePayload(_ url: URL) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return false
+        }
+        return FileManager.default.isExecutableFile(atPath: url.path)
     }
 
     static func detectedVersion(for kind: ExternalToolKind, url: URL) -> String? {
-        let process = Process()
-        process.executableURL = url
-        process.arguments = kind.versionArguments
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            var data = stdout.fileHandleForReading.readDataToEndOfFile()
-            data.append(stderr.fileHandleForReading.readDataToEndOfFile())
-            let output = String(decoding: data, as: UTF8.self)
-                .split(whereSeparator: \.isNewline)
-                .first
-                .map(String.init)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return output?.isEmpty == false ? output : nil
-        } catch {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue else {
             return nil
         }
+        guard let result = runProcess(executable: url, arguments: kind.versionArguments, timeout: kind.validationTimeout),
+              result.terminationStatus == 0 else {
+            return nil
+        }
+        let output = result.output
+            .split(whereSeparator: \.isNewline)
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return output?.isEmpty == false ? output : nil
     }
 
     static func loadManagedStateStore() -> ManagedComponentStateStore {
@@ -404,13 +458,26 @@ enum ExternalToolResolver {
         return resolveBundledTool(kind, resourceURL: resourceURL, logLines: &logLines)
     }
 
+    private static func resolvePreferredToolBestEffort(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
+        if let bundled = resolveBundledToolBestEffort(kind, resourceURL: resourceURL, logLines: &logLines) {
+            return bundled
+        }
+
+        if let managedKind = ManagedComponentKind(rawValue: kind.rawValue),
+           let managed = resolveManagedToolBestEffort(managedKind, logLines: &logLines) {
+            return managed
+        }
+
+        return nil
+    }
+
     private static func resolveManagedTool(_ kind: ManagedComponentKind, logLines: inout [String]) -> ResolvedExternalTool? {
         let executable = ExternalSupportPaths.managedCurrentExecutable(kind)
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
             return nil
         }
 
-        guard verifyExecutable(executable, versionArguments: kind.toolKind.versionArguments) else {
+        guard verifyExecutable(executable, versionArguments: kind.toolKind.versionArguments, timeout: kind.toolKind.validationTimeout) else {
             logLines.append("[app] Managed \(kind.displayName) found at \(executable.path) but it cannot run.")
             return nil
         }
@@ -423,12 +490,27 @@ enum ExternalToolResolver {
         )
     }
 
+    private static func resolveManagedToolBestEffort(_ kind: ManagedComponentKind, logLines: inout [String]) -> ResolvedExternalTool? {
+        let executable = ExternalSupportPaths.managedCurrentExecutable(kind)
+        guard hasExecutablePayload(executable) else {
+            return nil
+        }
+
+        logLines.append("[app] Managed \(kind.displayName) at \(executable.path) did not pass preflight verification. Attempting to use it anyway.")
+        return ResolvedExternalTool(
+            kind: kind.toolKind,
+            url: executable,
+            source: .managed,
+            version: nil
+        )
+    }
+
     private static func resolveBundledTool(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
         guard let executable = ExternalSupportPaths.bundledExecutable(for: kind, resourceURL: resourceURL) else {
             return nil
         }
 
-        guard verifyExecutable(executable, versionArguments: kind.versionArguments) else {
+        guard verifyExecutable(executable, versionArguments: kind.versionArguments, timeout: kind.validationTimeout) else {
             logLines.append("[app] Bundled \(kind.displayName) found at \(executable.path) but it cannot run.")
             return nil
         }
@@ -441,7 +523,60 @@ enum ExternalToolResolver {
         )
     }
 
+    private static func resolveBundledToolBestEffort(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
+        guard let executable = ExternalSupportPaths.bundledExecutable(for: kind, resourceURL: resourceURL),
+              hasExecutablePayload(executable) else {
+            return nil
+        }
+
+        logLines.append("[app] Bundled \(kind.displayName) at \(executable.path) did not pass preflight verification. Attempting to use it anyway.")
+        return ResolvedExternalTool(
+            kind: kind,
+            url: executable,
+            source: .bundled,
+            version: nil
+        )
+    }
+
     private static func resolveBundledOptionalTool(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
         resolveBundledTool(kind, resourceURL: resourceURL, logLines: &logLines)
+    }
+
+    private static func runProcess(executable: URL, arguments: [String], timeout: TimeInterval) -> ProcessRunResult? {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in
+            semaphore.signal()
+        }
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            if process.isRunning {
+                process.terminate()
+            }
+            _ = semaphore.wait(timeout: .now() + 1)
+            return nil
+        }
+
+        var data = stdout.fileHandleForReading.readDataToEndOfFile()
+        data.append(stderr.fileHandleForReading.readDataToEndOfFile())
+
+        return ProcessRunResult(
+            terminationStatus: process.terminationStatus,
+            output: String(decoding: data, as: UTF8.self)
+        )
     }
 }

@@ -6,6 +6,7 @@ import Darwin
 struct YouTubeLiveConverterApp: App {
     @StateObject private var pipeline = StreamPipeline()
     @StateObject private var externalTools = ExternalToolsManager()
+    @StateObject private var updater = AppUpdater()
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
     private let launchOptions: LaunchOptions
@@ -21,17 +22,24 @@ struct YouTubeLiveConverterApp: App {
                 .frame(minWidth: 1080, minHeight: 700)
                 .preferredColorScheme(preferredColorScheme)
                 .environmentObject(externalTools)
+                .environmentObject(updater)
                 .onAppear {
                     appDelegate.pipeline = pipeline
+                    updater.scheduleAutomaticCheck()
+                }
+                .sheet(isPresented: $updater.shouldPresentUpdateSheet) {
+                    UpdateAvailableSheet()
+                        .environmentObject(updater)
                 }
         }
         .commands {
-            AppHelpCommands()
+            AppCommands(updater: updater)
         }
 
         Settings {
             SettingsView()
                 .environmentObject(externalTools)
+                .environmentObject(updater)
         }
 
         Window("Back Channel Help", id: "help") {
@@ -64,6 +72,30 @@ struct AppHelpCommands: Commands {
             }
             .keyboardShortcut("?", modifiers: .command)
         }
+    }
+}
+
+struct AppUpdateCommands: Commands {
+    @ObservedObject var updater: AppUpdater
+
+    var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("Check for Updates…") {
+                Task {
+                    await updater.checkForUpdates(userInitiated: true)
+                }
+            }
+            .disabled(!updater.canCheckForUpdates)
+        }
+    }
+}
+
+struct AppCommands: Commands {
+    let updater: AppUpdater
+
+    var body: some Commands {
+        AppUpdateCommands(updater: updater)
+        AppHelpCommands()
     }
 }
 

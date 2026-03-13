@@ -14,6 +14,9 @@ enum AppPreferenceKeys {
     static let runtimeLogMonitoringEnabled = "runtime_log_monitoring_enabled"
     static let appearanceMode = "appearance_mode"
     static let managedSupportSetupDismissedVersion = "managed_support_setup_dismissed_version"
+    static let automaticUpdateChecksEnabled = "automatic_update_checks_enabled"
+    static let skippedUpdateVersion = "skipped_update_version"
+    static let lastUpdateCheckTimeInterval = "last_update_check_time_interval"
 }
 
 enum AppearanceMode: String, CaseIterable, Identifiable {

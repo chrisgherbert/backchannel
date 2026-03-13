@@ -84,18 +84,28 @@ final class ExternalToolsManager: ObservableObject {
         let resourceURL = resourceURLProvider()
         let manifest = latestManifest
 
+        bundledStatuses = ExternalToolResolver.quickBundledStatuses(resourceURL: resourceURL)
+
         statusRefreshTask?.cancel()
         statusRefreshTask = Task.detached(priority: .utility) {
             let bundled = ExternalToolResolver.bundledStatuses(resourceURL: resourceURL)
+            let bundledByKind = Dictionary(uniqueKeysWithValues: bundled.map { ($0.kind, $0) })
             let store = ExternalToolResolver.loadManagedStateStore()
             let managed = ManagedComponentKind.allCases.map { kind in
-                Self.status(for: kind, store: store, manifest: manifest, resourceURL: resourceURL)
+                Self.status(
+                    for: kind,
+                    store: store,
+                    manifest: manifest,
+                    resourceURL: resourceURL,
+                    bundledFallbackStatus: bundledByKind[kind.toolKind]
+                )
             }
 
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 self.bundledStatuses = bundled
                 self.managedStatuses = managed
+                self.statusRefreshTask = nil
             }
         }
 
@@ -144,6 +154,10 @@ final class ExternalToolsManager: ObservableObject {
     }
 
     func refreshManifestAvailability(force: Bool = false) {
+        if !force, manifestRefreshTask != nil {
+            return
+        }
+
         if !force,
            let lastManifestSyncAt,
            Date().timeIntervalSince(lastManifestSyncAt) < manifestRefreshInterval {
@@ -151,15 +165,25 @@ final class ExternalToolsManager: ObservableObject {
         }
 
         let resourceURL = resourceURLProvider()
+        let bundledSnapshot = bundledStatuses
         manifestRefreshTask?.cancel()
         managedSupportAvailability = .checking
 
         manifestRefreshTask = Task.detached(priority: .utility) {
             do {
-                let manifestAndAssets = try await Self.fetchManifestAndAssets()
+                let manifestAndAssets = try await Self.withTimeout(seconds: 12, operationDescription: "Managed support check") {
+                    try await Self.fetchManifestAndAssets()
+                }
+                let bundledByKind = Dictionary(uniqueKeysWithValues: bundledSnapshot.map { ($0.kind, $0) })
                 let store = ExternalToolResolver.loadManagedStateStore()
                 let managed = ManagedComponentKind.allCases.map { kind in
-                    Self.status(for: kind, store: store, manifest: manifestAndAssets.manifest, resourceURL: resourceURL)
+                    Self.status(
+                        for: kind,
+                        store: store,
+                        manifest: manifestAndAssets.manifest,
+                        resourceURL: resourceURL,
+                        bundledFallbackStatus: bundledByKind[kind.toolKind]
+                    )
                 }
 
                 guard !Task.isCancelled else { return }
@@ -168,6 +192,7 @@ final class ExternalToolsManager: ObservableObject {
                     self.lastManifestSyncAt = Date()
                     self.managedSupportAvailability = .available
                     self.managedStatuses = managed
+                    self.manifestRefreshTask = nil
                 }
             } catch {
                 guard !Task.isCancelled else { return }
@@ -175,6 +200,7 @@ final class ExternalToolsManager: ObservableObject {
                     self.latestManifest = nil
                     self.lastManifestSyncAt = Date()
                     self.managedSupportAvailability = .unavailable(error.localizedDescription)
+                    self.manifestRefreshTask = nil
                 }
             }
         }
@@ -216,13 +242,21 @@ final class ExternalToolsManager: ObservableObject {
         for kind: ManagedComponentKind,
         store: ManagedComponentStateStore,
         manifest: ManagedSupportManifest? = nil,
-        resourceURL: URL?
+        resourceURL: URL?,
+        bundledFallbackStatus: BundledToolStatus? = nil
     ) -> ManagedComponentStatus {
         let record = store.record(for: kind)
         let currentExecutable = ExternalSupportPaths.managedCurrentExecutable(kind)
-        let executableExists = FileManager.default.isExecutableFile(atPath: currentExecutable.path)
-        let bundledFallback = ExternalSupportPaths.bundledExecutable(for: kind.toolKind, resourceURL: resourceURL)
-        let bundledFallbackExists = bundledFallback.map { FileManager.default.isExecutableFile(atPath: $0.path) } ?? false
+        let payloadExists = ExternalToolResolver.hasExecutablePayload(currentExecutable)
+        let executableExists = payloadExists && ExternalToolResolver.verifyExecutable(
+            currentExecutable,
+            versionArguments: kind.toolKind.versionArguments,
+            timeout: kind.toolKind.validationTimeout
+        )
+        let bundledFallback = bundledFallbackStatus?.path ?? ExternalSupportPaths.bundledExecutable(for: kind.toolKind, resourceURL: resourceURL)
+        let bundledFallbackExists = bundledFallbackStatus?.payloadExists ?? bundledFallback.map {
+            ExternalToolResolver.hasExecutablePayload($0)
+        } ?? false
         let availableVersion = manifest?.components.first(where: { $0.componentKind == kind })?.version
 
         if executableExists {
@@ -239,6 +273,38 @@ final class ExternalToolsManager: ObservableObject {
                 executableURL: currentExecutable,
                 health: .ready,
                 message: "Installed and ready",
+                lastError: record.lastError,
+                canRollback: canRollback
+            )
+        }
+
+        if payloadExists {
+            let canRollback = record.previousVersion.flatMap { previous in
+                let path = ExternalSupportPaths.managedVersionDirectory(kind, version: previous).path
+                return FileManager.default.fileExists(atPath: path) ? previous : nil
+            } != nil
+            let installedVersion = record.currentVersion ?? availableVersion
+
+            if bundledFallbackExists {
+                return ManagedComponentStatus(
+                    kind: kind,
+                    installedVersion: installedVersion,
+                    availableVersion: availableVersion,
+                    executableURL: currentExecutable,
+                    health: .bundledFallback,
+                    message: "Installed, using bundled fallback",
+                    lastError: record.lastError,
+                    canRollback: canRollback
+                )
+            }
+
+            return ManagedComponentStatus(
+                kind: kind,
+                installedVersion: installedVersion,
+                availableVersion: availableVersion,
+                executableURL: currentExecutable,
+                health: .error,
+                message: "Installed but could not be validated",
                 lastError: record.lastError,
                 canRollback: canRollback
             )
@@ -349,10 +415,7 @@ final class ExternalToolsManager: ObservableObject {
         )
 
         let executableURL = extractedDirectory.appendingPathComponent(component.executableRelativePath)
-        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
-            throw ExternalToolsManagerError.invalidPayload(kind.displayName)
-        }
-        guard ExternalToolResolver.verifyExecutable(executableURL, versionArguments: kind.toolKind.versionArguments) else {
+        guard ExternalToolResolver.hasExecutablePayload(executableURL) else {
             throw ExternalToolsManagerError.invalidPayload(kind.displayName)
         }
 
@@ -448,6 +511,27 @@ final class ExternalToolsManager: ObservableObject {
         configuration.timeoutIntervalForResource = 20
         return URLSession(configuration: configuration)
     }
+
+    nonisolated private static func withTimeout<T: Sendable>(
+        seconds: TimeInterval,
+        operationDescription: String,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                let duration = UInt64(max(seconds, 0.1) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: duration)
+                throw ExternalToolsManagerError.timeout(operationDescription)
+            }
+
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
+        }
+    }
 }
 
 enum ExternalToolsManagerError: LocalizedError {
@@ -459,6 +543,7 @@ enum ExternalToolsManagerError: LocalizedError {
     case rollbackUnavailable(String)
     case http(Int)
     case systemToolFailed(String)
+    case timeout(String)
 
     var errorDescription: String? {
         switch self {
@@ -478,6 +563,8 @@ enum ExternalToolsManagerError: LocalizedError {
             return "Server request failed with HTTP \(statusCode)."
         case .systemToolFailed(let name):
             return "\(name) failed while preparing managed support."
+        case .timeout(let context):
+            return "\(context) timed out."
         }
     }
 }

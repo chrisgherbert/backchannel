@@ -39,6 +39,13 @@ struct HelpView: View {
                     Bullet("Source issues: Try another live URL to rule out upstream instability.")
                 }
 
+                HelpSection(title: "Updates") {
+                    Bullet("Back Channel can check GitHub Releases for newer stable versions.")
+                    Bullet("Use Back Channel > Check for Updates to run a manual check at any time.")
+                    Bullet("When an update is available, Back Channel downloads the release zip, verifies its checksum, and stages it before install.")
+                    Bullet("Use Install and Relaunch to replace the current app in place after Back Channel quits.")
+                }
+
                 HelpSection(title: "CLI Guide") {
                     Text("Use the CLI for repeatable runs, remote operation, and scripted diagnostics. It runs the same core pipeline as the app.")
                         .foregroundStyle(.secondary)

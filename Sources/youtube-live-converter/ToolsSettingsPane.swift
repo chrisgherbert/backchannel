@@ -7,7 +7,7 @@ struct ToolsSettingsPane: View {
         ScrollView {
             Form {
                 Section("Bundled Tools") {
-                    Text("These ship inside the app and are used automatically when available.")
+                    Text("These ship inside the app. Managed support takes precedence when an installed managed version is available.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -16,10 +16,7 @@ struct ToolsSettingsPane: View {
                             HStack {
                                 Text(status.kind.displayName)
                                     .frame(width: 170, alignment: .leading)
-                                statusBadge(
-                                    text: status.isAvailable ? "Ready" : "Missing",
-                                    color: status.isAvailable ? .green : .orange
-                                )
+                                bundledStatusBadge(for: status)
                                 if let version = status.version {
                                     Text(version)
                                         .foregroundStyle(.secondary)
@@ -188,7 +185,7 @@ struct ToolsSettingsPane: View {
         case .ready:
             return statusBadge(text: "Installed", color: .green)
         case .bundledFallback:
-            return statusBadge(text: "Bundled Fallback", color: .orange)
+            return statusBadge(text: status.installedVersion == nil ? "Bundled Fallback" : "Installed (Fallback)", color: .orange)
         case .missing:
             return statusBadge(text: "Missing", color: .orange)
         case .installing:
@@ -196,6 +193,27 @@ struct ToolsSettingsPane: View {
         case .error:
             return statusBadge(text: "Needs Repair", color: .red)
         }
+    }
+
+    private func bundledStatusBadge(for status: BundledToolStatus) -> some View {
+        if managedOverride(for: status.kind) != nil {
+            return statusBadge(text: "Managed Override", color: .blue)
+        }
+
+        switch status.health {
+        case .verified:
+            return statusBadge(text: "Ready", color: .green)
+        case .present:
+            return statusBadge(text: "Present", color: .orange)
+        case .missing:
+            return statusBadge(text: "Missing", color: .orange)
+        }
+    }
+
+    private func managedOverride(for kind: ExternalToolKind) -> ManagedComponentStatus? {
+        externalTools.managedStatuses.first(where: { status in
+            status.kind.toolKind == kind && status.health == .ready
+        })
     }
 
     private func statusBadge(text: String, color: Color) -> some View {

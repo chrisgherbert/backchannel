@@ -1,10 +1,26 @@
-# Backchannel (macOS MVP)
+# Back Channel
 
-This app runs a persistent pipeline:
+> Bridge livestreams to RTMP & HLS on macOS.
 
-`yt-dlp (stdout) -> ffmpeg (stdin) -> RTMP or HLS output`
+[Website](https://chrisgherbert.github.io/backchannel/) · [GitHub Releases](https://github.com/chrisgherbert/backchannel/releases) · [Issues](https://github.com/chrisgherbert/backchannel/issues)
 
-It is designed to keep `yt-dlp` active for the full stream session, with automatic reconnect attempts.
+Back Channel is a macOS app for turning livestream URLs into RTMP or HLS outputs that fit into production workflows. It is designed for producers, newsroom teams, and technical creators who need a dependable bridge between web livestreams and downstream ingest systems.
+
+## At a Glance
+
+- Converts livestream URLs into RTMP or HLS output
+- Supports both GUI and CLI workflows
+- Bundles its own core native tooling for end-user installs
+- Offers managed support components for broader compatibility and updates
+- Built for Apple Silicon Macs running macOS 13 or later
+
+## Website
+
+- GitHub Pages: [chrisgherbert.github.io/backchannel](https://chrisgherbert.github.io/backchannel/)
+- Source: [`website/`](/Users/herbert/web/youtube-live-converter/website)
+- Workflow: [pages.yml](/Users/herbert/web/youtube-live-converter/.github/workflows/pages.yml)
+
+The marketing/documentation site deploys automatically through GitHub Actions when changes under `website/` are pushed to `main`.
 
 ## Release Checklist
 
@@ -20,7 +36,7 @@ cp -n scripts/release.env.example scripts/release.env
 4. Fill `scripts/release.env` required values (`DEV_ID_APP`, `AC_PROFILE`, `YTDLP_BINARY`, `DENO_BINARY`).
 5. Run full signed + notarized GitHub release:
 ```bash
-./scripts/github_release.sh --version 1.1.1 --notes-file /absolute/path/to/release-notes.md
+./scripts/github_release.sh --version X.Y.Z --notes-file /absolute/path/to/release-notes.md
 ```
 6. Confirm the GitHub release includes:
 - app zip
@@ -54,20 +70,6 @@ mkdir -p "$HOME/.local/bin" && curl -L "https://github.com/yt-dlp/yt-dlp/release
 swift run
 ```
 
-## Website (GitHub Pages)
-
-The marketing site lives in `website/` and deploys automatically via GitHub Actions.
-
-- Workflow: `.github/workflows/pages.yml`
-- Hosting: GitHub Pages (default repository Pages URL)
-- Auto download target: latest `Back-Channel-<version>.zip` asset from GitHub Releases
-
-How it updates:
-
-1. Edit files under `website/`.
-2. Push to `main`.
-3. GitHub Actions deploys site automatically.
-
 ## Build & Release Workflows
 
 ### 1. Local Development Build
@@ -86,7 +88,7 @@ swift run
 
 ## Build Self-Contained `.app`
 
-This creates `dist/Back Channel.app` and bundles `yt-dlp` + `ffmpeg` + `ffprobe` (and `deno` when available) into:
+This creates `dist/Back Channel.app` and bundles `yt-dlp`, `ffmpeg`, and `ffprobe` into:
 
 `Contents/Resources/bin/`
 
@@ -130,7 +132,7 @@ backchannel --help
 ```
 
 For distribution to other Macs, use a standalone `yt-dlp` binary. Some Homebrew installs provide a Python wrapper script, which is not portable by itself.
-Bundling `deno` is recommended for YouTube extraction reliability.
+`deno` is managed separately as an app support component rather than being sealed inside the `.app` bundle.
 
 ### 2. Packaging For Local Testing
 
@@ -172,7 +174,7 @@ Create a notarized local release build:
 Create or update the GitHub release, including managed support assets:
 
 ```bash
-./scripts/github_release.sh --version 1.1.1 --notes-file /absolute/path/to/release-notes.md
+./scripts/github_release.sh --version X.Y.Z --notes-file /absolute/path/to/release-notes.md
 ```
 
 The GitHub release script uploads:
@@ -224,18 +226,25 @@ xcrun stapler validate "dist/Back Channel.app"
    - paste a full RTMP URL in `Full RTMP URL (optional override)`
 5. Choose mode:
    - `Stream Copy` for lowest CPU (best-effort passthrough)
-   - `High Compatibility` for stricter ingest-friendly output (`libx264` + `aac`, fixed GOP/CFR)
-6. Set `Buffer Delay` in High Compatibility mode (`No buffer`, `5s`, `15s`, `30s`, `60s`, `120s`; default `30s`) to smooth short source stalls.
+   - `Compatible` for stricter ingest-friendly output (`libx264` + `aac`, fixed GOP/CFR)
+6. Set `Buffer Delay` in Compatible mode (`No buffer`, `5s`, `15s`, `30s`, `60s`, `120s`; default `30s`) to smooth short source stalls.
    - On start, the app shows an explicit startup buffer countdown in `Status`.
 7. Click `Start`.
 8. Use `Status` tab for parsed health/progress (including buffer state), and `Advanced` tab for raw console logs.
+
+## Repository Layout
+
+- [`Sources/youtube-live-converter/`](/Users/herbert/web/youtube-live-converter/Sources/youtube-live-converter): Swift app source
+- [`scripts/`](/Users/herbert/web/youtube-live-converter/scripts): build, packaging, notarization, and release scripts
+- [`website/`](/Users/herbert/web/youtube-live-converter/website): GitHub Pages site
+- [`dist/`](/Users/herbert/web/youtube-live-converter/dist): local build outputs
 
 ## Notes
 
 - The app captures `yt-dlp` and `ffmpeg` stderr logs in the UI.
 - On process failure, it retries with exponential backoff (up to 30 seconds).
-- `Stream Copy` may fail if target/container codec compatibility does not match. Use `High Compatibility` in that case.
-- Tool lookup order is:
-  - bundled (`.app/Contents/Resources/bin`)
-  - `/opt/homebrew/bin`
-  - `/usr/local/bin`
+- `Stream Copy` may fail if target/container codec compatibility does not match. Use `Compatible` mode in that case.
+- Runtime tool resolution prefers:
+  - app-managed support components in `~/Library/Application Support/Back Channel/`
+  - bundled app resources in `.app/Contents/Resources/bin`
+- End users do not need Homebrew, Python, Xcode command line tools, or manually installed runtimes.

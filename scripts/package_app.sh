@@ -216,6 +216,27 @@ normalize_bundled_library_install_names() {
   done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
 }
 
+sign_macho_tree_ad_hoc() {
+  local target="$1"
+  local nested
+
+  while IFS= read -r nested; do
+    [[ -f "$nested" ]] || continue
+    if ! is_macho_binary "$nested"; then
+      continue
+    fi
+
+    codesign --remove-signature "$nested" >/dev/null 2>&1 || true
+    codesign --force --sign - "$nested"
+  done < <(find "$target/Contents/Resources/lib" "$target/Contents/Resources/bin" -type f -print 2>/dev/null | sort)
+
+  codesign --remove-signature "$target/Contents/MacOS/$APP_EXECUTABLE_NAME" >/dev/null 2>&1 || true
+  codesign --force --sign - "$target/Contents/MacOS/$APP_EXECUTABLE_NAME"
+
+  codesign --remove-signature "$target" >/dev/null 2>&1 || true
+  codesign --force --sign - "$target"
+}
+
 create_icns_from_png() {
   local png_source="$1"
   local icns_target="$2"
@@ -808,8 +829,12 @@ echo "  ffprobe: $FFPROBE_PATH"
 echo "  deno: managed outside the app bundle"
 
 echo "Signing app bundle..."
-codesign --force --deep --sign - "$APP_DIR"
-codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+sign_macho_tree_ad_hoc "$APP_DIR"
+codesign --verify --verbose=2 "$APP_DIR"
+codesign --verify --verbose=2 "$APP_BIN"
+codesign --verify --verbose=2 "$RES_BIN_DIR/yt-dlp"
+codesign --verify --verbose=2 "$RES_BIN_DIR/ffmpeg"
+codesign --verify --verbose=2 "$RES_BIN_DIR/ffprobe"
 
 echo "App bundle ready:"
 echo "  $APP_DIR"

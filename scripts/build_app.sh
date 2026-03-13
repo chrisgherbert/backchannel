@@ -174,6 +174,19 @@ quick_rebundle_needed() {
   [[ "$m_ffprobe_path" == "$FFPROBE_PATH" && "$m_ffprobe_sha" == "$FFPROBE_SHA" ]] || return 0
   [[ "$m_icon_sha" == "$ICON_SHA" ]] || return 0
 
+  if ! codesign --verify --verbose=2 "$APP_PATH" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! codesign --verify --verbose=2 "$APP_PATH/Contents/Resources/bin/yt-dlp" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! codesign --verify --verbose=2 "$APP_PATH/Contents/Resources/bin/ffmpeg" >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! codesign --verify --verbose=2 "$APP_PATH/Contents/Resources/bin/ffprobe" >/dev/null 2>&1; then
+    return 0
+  fi
+
   return 1
 }
 
@@ -183,6 +196,10 @@ quick_copy_binary_only() {
   [[ -x "$PRODUCT_BIN" ]] || { echo "Error: built executable missing: $PRODUCT_BIN" >&2; exit 1; }
   cp -f "$PRODUCT_BIN" "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME"
   chmod +x "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME"
+  codesign --remove-signature "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME" >/dev/null 2>&1 || true
+  codesign --force --sign - "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME"
+  codesign --remove-signature "$APP_PATH" >/dev/null 2>&1 || true
+  codesign --force --sign - "$APP_PATH"
   echo "App ready: $APP_PATH"
 }
 
