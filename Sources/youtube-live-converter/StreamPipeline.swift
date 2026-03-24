@@ -145,6 +145,7 @@ final class StreamPipeline: ObservableObject {
         parsedStatus.outputState = "Stopped"
         parsedStatus.bufferState = "Stopped"
         parsedStatus.bufferProgress = 0
+        parsedStatus.stagedBufferSeconds = 0
         stallRecoveryTriggered = false
         freezeRecoveryTriggered = false
         hasSeenFfmpegProgress = false
@@ -196,6 +197,7 @@ final class StreamPipeline: ObservableObject {
             fputs("[cli] Session stopped.\n", stdout)
             fflush(stdout)
         }
+        refreshStreamHealth(now: Date())
     }
 
     func stopForAppTermination() {
@@ -281,6 +283,7 @@ final class StreamPipeline: ObservableObject {
         parsedStatus.outputState = "Starting"
         parsedStatus.bufferState = bufferStateText(for: config)
         parsedStatus.bufferProgress = initialBufferProgress(for: config)
+        parsedStatus.stagedBufferSeconds = 0
         parsedStatus.avSyncState = avSyncStateText(for: config)
         lastFfmpegProgressSeconds = 0
         lastFfmpegProgressAt = Date()
@@ -325,6 +328,7 @@ final class StreamPipeline: ObservableObject {
         lastPublishStartedAt = Date.distantPast
         publisherRestartScheduled = false
 
+        refreshStreamHealth(now: Date())
         launchPipeline()
     }
 
@@ -350,6 +354,7 @@ final class StreamPipeline: ObservableObject {
             parsedStatus.ffmpegBitrate = ""
             parsedStatus.ffmpegSpeed = ""
         }
+        refreshStreamHealth(now: Date())
     }
 
     func setCliLogMirroringEnabled(_ enabled: Bool) {
@@ -745,7 +750,11 @@ final class StreamPipeline: ObservableObject {
     ) -> Process {
         let ffmpeg = Process()
         ffmpeg.executableURL = paths.ffmpeg
-        ffmpeg.arguments = dvrPublisherArguments(for: config, playlistURL: playlistURL)
+        ffmpeg.arguments = dvrPublisherArguments(
+            for: config,
+            playlistURL: playlistURL,
+            useRealtimePacing: !isCatchUpActive()
+        )
         ffmpeg.environment = paths.environment
         ffmpeg.standardInput = FileHandle.nullDevice
         ffmpeg.standardOutput = FileHandle.nullDevice
@@ -804,6 +813,7 @@ final class StreamPipeline: ObservableObject {
                             self.parsedStatus.outputState = "Publishing"
                             self.startupReprimeActive = false
                             self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            self.refreshStreamHealth(now: Date())
                             startedPublishing = true
                         } catch {
                             let nsError = error as NSError
@@ -998,6 +1008,7 @@ final class StreamPipeline: ObservableObject {
 
         publisherRestartScheduled = true
         parsedStatus.outputState = "Reconnecting Output"
+        refreshStreamHealth(now: Date())
         appendLog("[app] Restarting publisher stage (\(reason)).")
 
         ffmpegProcess?.terminationHandler = nil
@@ -1041,6 +1052,7 @@ final class StreamPipeline: ObservableObject {
                 self.highSpeedSince = Date.distantPast
                 self.parsedStatus.outputState = "Publishing"
                 self.appendLog("[app] Publisher restarted from staged DVR playlist.")
+                self.refreshStreamHealth(now: Date())
             } catch {
                 self.appendLog("[app] Publisher restart failed: \(error.localizedDescription)")
                 self.terminatePipeline()
@@ -1341,13 +1353,23 @@ final class StreamPipeline: ObservableObject {
         return args
     }
 
-    private func dvrPublisherArguments(for config: StreamConfig, playlistURL: URL) -> [String] {
+    private func dvrPublisherArguments(
+        for config: StreamConfig,
+        playlistURL: URL,
+        useRealtimePacing: Bool
+    ) -> [String] {
         var args = [
             "-hide_banner",
             "-loglevel", "info",
             "-stats_period", "1",
-            "-progress", "pipe:2",
-            "-re",
+            "-progress", "pipe:2"
+        ]
+
+        if useRealtimePacing {
+            args += ["-re"]
+        }
+
+        args += [
             "-thread_queue_size", "8192",
             "-fflags", "+genpts+discardcorrupt+igndts+sortdts",
             "-err_detect", "ignore_err",
@@ -1770,6 +1792,7 @@ final class StreamPipeline: ObservableObject {
         let isFrameStatsLine = message.contains("frame=") &&
             (message.contains("[ffmpeg]") || message.contains("[yt-dlp]"))
         let now = Date()
+        defer { refreshStreamHealth(now: now) }
         updateDiagnosticSignals(from: message, now: now)
         if !isFrameStatsLine {
             updateSourceEvent(source: source, message: message, now: now, throttleFrameLines: false)
@@ -2166,11 +2189,13 @@ final class StreamPipeline: ObservableObject {
         parsedStatus.outputState = "Buffering"
         parsedStatus.bufferState = startupReprimeActive ? "Re-priming (target \(total)s)" : "Filling (target \(total)s)"
         parsedStatus.bufferProgress = 0
+        parsedStatus.stagedBufferSeconds = 0
         if startupReprimeActive {
             appendLog("[app] Buffer re-priming started (target \(total)s).")
         } else {
             appendLog("[app] Buffer priming started (target \(total)s).")
         }
+        refreshStreamHealth(now: Date())
     }
 
     nonisolated private static func readPlaylistDurationSecondsOffMain(from playlistURL: URL) async -> Double {
@@ -2203,6 +2228,7 @@ final class StreamPipeline: ObservableObject {
     ) {
         guard config.encodeMode == .transcode else { return }
         let now = Date()
+        parsedStatus.stagedBufferSeconds = max(0, availableSeconds)
         guard now.timeIntervalSince(lastBufferUiUpdate) >= 0.25 else { return }
         lastBufferUiUpdate = now
 
@@ -2236,6 +2262,7 @@ final class StreamPipeline: ObservableObject {
                 parsedStatus.bufferState = targetDelay > 0 ? "Primed (\(config.bufferSeconds)s delay)" : "Primed"
             }
             parsedStatus.bufferProgress = targetDelay > 0 ? fill : 1.0
+            refreshStreamHealth(now: now)
             return
         }
 
@@ -2243,6 +2270,7 @@ final class StreamPipeline: ObservableObject {
             parsedStatus.outputState = "Buffering"
             parsedStatus.bufferState = "Exhausted (\(Int(availableSeconds.rounded()))s/\(config.bufferSeconds)s)"
             parsedStatus.bufferProgress = fill
+            refreshStreamHealth(now: now)
             return
         }
 
@@ -2257,6 +2285,145 @@ final class StreamPipeline: ObservableObject {
             parsedStatus.bufferState = "Buffered (\(Int(availableSeconds.rounded()))s/\(config.bufferSeconds)s)"
             parsedStatus.bufferProgress = fill
         }
+        refreshStreamHealth(now: now)
+    }
+
+    private func refreshStreamHealth(now: Date) {
+        guard let config = currentConfig else {
+            parsedStatus.health = StreamHealthSnapshot()
+            return
+        }
+
+        let outputLower = parsedStatus.outputState.lowercased()
+        let isPublishing = outputLower.contains("publish") || outputLower.contains("running")
+        let isBuffering = outputLower.contains("buffer")
+        let stagedSeconds = max(0, parsedStatus.stagedBufferSeconds)
+        let outputStallSeconds = hasSeenFfmpegProgress ? max(0, now.timeIntervalSince(lastFfmpegProgressAt)) : 0
+        let videoStallSeconds = lastVideoFrameAdvanceAt == Date.distantPast
+            ? 0
+            : max(0, now.timeIntervalSince(lastVideoFrameAdvanceAt))
+        let speed = parseSpeedFactor(parsedStatus.ffmpegSpeed)
+
+        let bufferMetric: StreamHealthMetric
+        if config.encodeMode != .transcode || config.bufferSeconds <= 0 {
+            bufferMetric = healthMetric("Buffer", detail: "Bypassed", level: .neutral)
+        } else if bufferExhausted {
+            bufferMetric = healthMetric("Buffer", detail: "Exhausted", level: .critical)
+        } else {
+            let target = Double(max(config.bufferSeconds, 1))
+            let redThreshold = min(2.0, target * 0.25)
+            let yellowThreshold = min(8.0, target * 0.60)
+            let detail = "\(formatHealthSeconds(stagedSeconds)) staged"
+            if isBuffering && stagedSeconds < target {
+                bufferMetric = healthMetric("Buffer", detail: detail, level: .warning)
+            } else if stagedSeconds < redThreshold {
+                bufferMetric = healthMetric("Buffer", detail: detail, level: .critical)
+            } else if stagedSeconds < yellowThreshold {
+                bufferMetric = healthMetric("Buffer", detail: detail, level: .warning)
+            } else {
+                bufferMetric = healthMetric("Buffer", detail: detail, level: .good)
+            }
+        }
+
+        let timelineMetric: StreamHealthMetric
+        if !isRunning {
+            timelineMetric = healthMetric("Timeline", detail: "Idle", level: .neutral)
+        } else if outputLower.contains("reconnect") {
+            timelineMetric = healthMetric("Timeline", detail: "Recovering", level: .warning)
+        } else if !isPublishing {
+            let detail = isBuffering ? "Priming" : parsedStatus.outputState
+            timelineMetric = healthMetric("Timeline", detail: detail, level: isBuffering ? .warning : .neutral)
+        } else if outputFreezeActive || outputStallSeconds >= Self.outputFreezeRestartThreshold {
+            timelineMetric = healthMetric("Timeline", detail: "Stalled \(formatHealthSeconds(outputStallSeconds))", level: .critical)
+        } else if outputStallSeconds >= Self.outputFreezeLogThreshold {
+            timelineMetric = healthMetric("Timeline", detail: "Gap \(formatHealthSeconds(outputStallSeconds))", level: .warning)
+        } else if hasSeenFfmpegProgress {
+            timelineMetric = healthMetric("Timeline", detail: parsedStatus.ffmpegTime.isEmpty ? "Moving" : parsedStatus.ffmpegTime, level: .good)
+        } else {
+            timelineMetric = healthMetric("Timeline", detail: "Awaiting output", level: .warning)
+        }
+
+        let videoMetric: StreamHealthMetric
+        if !isRunning {
+            videoMetric = healthMetric("Video", detail: "Idle", level: .neutral)
+        } else if !isPublishing {
+            let detail = isBuffering ? "Priming" : parsedStatus.outputState
+            videoMetric = healthMetric("Video", detail: detail, level: isBuffering ? .warning : .neutral)
+        } else if duplicationFreezeActive {
+            videoMetric = healthMetric("Video", detail: "Duplicating frames", level: .critical)
+        } else if videoCadenceFreezeActive || videoStallSeconds >= Self.videoCadenceRestartThreshold {
+            videoMetric = healthMetric("Video", detail: "Frozen \(formatHealthSeconds(videoStallSeconds))", level: .critical)
+        } else if videoStallSeconds >= Self.videoCadenceLogThreshold {
+            videoMetric = healthMetric("Video", detail: "Paused \(formatHealthSeconds(videoStallSeconds))", level: .warning)
+        } else if lastVideoFrameAdvanceAt == Date.distantPast {
+            videoMetric = healthMetric("Video", detail: "Awaiting frames", level: .warning)
+        } else {
+            videoMetric = healthMetric("Video", detail: "Frames moving", level: .good)
+        }
+
+        let speedMetric: StreamHealthMetric
+        if !isRunning {
+            speedMetric = healthMetric("Speed", detail: "Idle", level: .neutral)
+        } else if !isPublishing {
+            let detail = isBuffering ? "Priming" : parsedStatus.outputState
+            speedMetric = healthMetric("Speed", detail: detail, level: .neutral)
+        } else if let speed {
+            let speedLabel = String(format: "%.2fx", speed)
+            if speed < Self.lowSpeedThreshold || speed > Self.speedDriftThreshold {
+                speedMetric = healthMetric("Speed", detail: speedLabel, level: .critical)
+            } else if speed < Self.catchUpLowSpeedThreshold || speed > Self.highSpeedRestartThreshold || isCatchUpActive(now: now) {
+                let detail = isCatchUpActive(now: now) ? "\(speedLabel) catch-up" : speedLabel
+                speedMetric = healthMetric("Speed", detail: detail, level: .warning)
+            } else {
+                speedMetric = healthMetric("Speed", detail: speedLabel, level: .good)
+            }
+        } else {
+            speedMetric = healthMetric("Speed", detail: "Awaiting speed", level: .warning)
+        }
+
+        let overall = [bufferMetric.level, timelineMetric.level, videoMetric.level, speedMetric.level].max() ?? .neutral
+        let summary: String
+        if !isRunning {
+            summary = "Idle"
+        } else if bufferExhausted {
+            summary = "Buffer Exhausted"
+        } else if outputFreezeActive {
+            summary = "Output Frozen"
+        } else if duplicationFreezeActive || videoCadenceFreezeActive {
+            summary = "Video Frozen"
+        } else if isCatchUpActive(now: now) {
+            summary = "Catching Up"
+        } else if isBuffering {
+            summary = "Buffering"
+        } else if overall == .good {
+            summary = "Healthy"
+        } else if overall == .warning {
+            summary = "Watch"
+        } else if overall == .critical {
+            summary = "Unstable"
+        } else {
+            summary = parsedStatus.outputState
+        }
+
+        parsedStatus.health = StreamHealthSnapshot(
+            overall: overall,
+            summary: summary,
+            buffer: bufferMetric,
+            timeline: timelineMetric,
+            video: videoMetric,
+            speed: speedMetric
+        )
+    }
+
+    private func healthMetric(_ title: String, detail: String, level: StreamHealthLevel) -> StreamHealthMetric {
+        StreamHealthMetric(title: title, detail: detail, level: level)
+    }
+
+    private func formatHealthSeconds(_ seconds: Double) -> String {
+        if seconds >= 10 {
+            return "\(Int(seconds.rounded()))s"
+        }
+        return String(format: "%.1fs", seconds)
     }
 
     private func cleanupDvrSessionFiles() {
@@ -2384,6 +2551,10 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func estimatedBufferedSeconds() -> Double {
+        let stagedSeconds = max(0, parsedStatus.stagedBufferSeconds)
+        if stagedSeconds > 0 {
+            return stagedSeconds
+        }
         guard let config = currentConfig,
               config.encodeMode == .transcode,
               config.bufferSeconds > 0 else {
@@ -2407,6 +2578,7 @@ final class StreamPipeline: ObservableObject {
                 guard outputState.contains("publish") || outputState.contains("running") else { continue }
 
                 let now = Date()
+                defer { self.refreshStreamHealth(now: now) }
                 let stalledFor = now.timeIntervalSince(self.lastFfmpegProgressAt)
                 let frameStalledFor = self.lastVideoFrameAdvanceAt == Date.distantPast
                     ? 0

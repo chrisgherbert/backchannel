@@ -169,6 +169,9 @@ struct ContentView: View {
                 if shouldShowRetryChip {
                     badge("Retry \(pipeline.parsedStatus.reconnectDelay)", .warning)
                 }
+                if shouldShowHealthChip {
+                    badge("Health \(pipeline.parsedStatus.health.summary)", healthStatusTone)
+                }
                 if let bufferChipText {
                     badge(bufferChipText, bufferChipTone)
                 }
@@ -182,7 +185,7 @@ struct ContentView: View {
                             .controlSize(.small)
                             .tint(bufferStatusColor)
                             .frame(width: 220)
-                        Text("Buffer \(Int(pipeline.parsedStatus.bufferProgress * 100))%")
+                        Text(bufferProgressText)
                             .font(.caption2.monospacedDigit())
                             .foregroundStyle(bufferStatusColor)
                     }
@@ -634,6 +637,7 @@ struct ContentView: View {
 
     private var statusPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
+            streamHealthPanel
             statusRow("Source", pipeline.parsedStatus.sourceState)
             statusRow("Output", pipeline.parsedStatus.outputState)
             statusRow("Reconnect", pipeline.parsedStatus.reconnectDelay.isEmpty ? "None" : pipeline.parsedStatus.reconnectDelay)
@@ -647,6 +651,34 @@ struct ContentView: View {
             statusRow("yt-dlp Event", pipeline.parsedStatus.lastYtDlpEvent, truncateTail: true)
             statusRow("Last Error", pipeline.parsedStatus.lastError.isEmpty ? "None" : pipeline.parsedStatus.lastError, truncateTail: true)
         }
+    }
+
+    private var streamHealthPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("Stream Health")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                badge(pipeline.parsedStatus.health.summary, healthStatusTone)
+            }
+
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
+                healthMetricCard(pipeline.parsedStatus.health.buffer)
+                healthMetricCard(pipeline.parsedStatus.health.timeline)
+                healthMetricCard(pipeline.parsedStatus.health.video)
+                healthMetricCard(pipeline.parsedStatus.health.speed)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+        )
     }
 
     private var advancedPanel: some View {
@@ -790,6 +822,28 @@ struct ContentView: View {
             Spacer()
         }
         .font(.system(.caption, design: .monospaced))
+    }
+
+    private func healthMetricCard(_ metric: StreamHealthMetric) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(statusTone(for: metric.level).foreground)
+                    .frame(width: 7, height: 7)
+                Text(metric.title)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            Text(metric.detail)
+                .font(.caption.monospaced())
+                .lineLimit(2)
+                .foregroundStyle(.primary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(statusTone(for: metric.level).background)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private var bufferStatusRow: some View {
@@ -997,7 +1051,7 @@ struct ContentView: View {
             return .secondary
         }
 
-        let bufferedSeconds = max(0.0, min(targetSeconds, targetSeconds * pipeline.parsedStatus.bufferProgress))
+        let bufferedSeconds = max(0.0, pipeline.parsedStatus.stagedBufferSeconds)
         let redThreshold = min(2.0, targetSeconds * 0.25)
         let yellowThreshold = min(8.0, targetSeconds * 0.60)
 
@@ -1057,6 +1111,22 @@ struct ContentView: View {
         return !retry.isEmpty && retry.lowercased() != "none"
     }
 
+    private var shouldShowHealthChip: Bool {
+        pipeline.isRunning || pipeline.parsedStatus.health.summary != "Idle"
+    }
+
+    private var healthStatusTone: StatusTone {
+        statusTone(for: pipeline.parsedStatus.health.overall)
+    }
+
+    private var bufferProgressText: String {
+        let percent = Int((pipeline.parsedStatus.bufferProgress * 100).rounded())
+        if config.encodeMode == .transcode && config.bufferSeconds > 0 {
+            return "Buffer \(percent)% · \(formattedStagedBufferSeconds)"
+        }
+        return "Buffer \(percent)%"
+    }
+
     private var bufferChipText: String? {
         guard pipeline.isRunning else { return nil }
         guard config.encodeMode == .transcode && config.bufferSeconds > 0 else {
@@ -1066,8 +1136,7 @@ struct ContentView: View {
         if state.contains("exhausted") {
             return "Buffer Empty"
         }
-        let seconds = Int((Double(config.bufferSeconds) * pipeline.parsedStatus.bufferProgress).rounded())
-        return "Buffer \(max(0, seconds))s"
+        return "Staged \(formattedStagedBufferSeconds)"
     }
 
     private var bufferChipTone: StatusTone {
@@ -1077,7 +1146,7 @@ struct ContentView: View {
         }
         let targetSeconds = Double(config.bufferSeconds)
         guard targetSeconds > 0 else { return .neutral }
-        let bufferedSeconds = max(0.0, min(targetSeconds, targetSeconds * pipeline.parsedStatus.bufferProgress))
+        let bufferedSeconds = max(0.0, pipeline.parsedStatus.stagedBufferSeconds)
         let redThreshold = min(2.0, targetSeconds * 0.25)
         let yellowThreshold = min(8.0, targetSeconds * 0.60)
         if bufferedSeconds < redThreshold {
@@ -1087,6 +1156,14 @@ struct ContentView: View {
             return .warning
         }
         return .good
+    }
+
+    private var formattedStagedBufferSeconds: String {
+        let seconds = max(0.0, pipeline.parsedStatus.stagedBufferSeconds)
+        if seconds >= 10 {
+            return "\(Int(seconds.rounded()))s"
+        }
+        return String(format: "%.1fs", seconds)
     }
 
     private func loadInfo() {
@@ -1473,6 +1550,19 @@ struct ContentView: View {
             return .warning
         }
         return .neutral
+    }
+
+    private func statusTone(for health: StreamHealthLevel) -> StatusTone {
+        switch health {
+        case .good:
+            return .good
+        case .warning:
+            return .warning
+        case .critical:
+            return .critical
+        case .neutral:
+            return .neutral
+        }
     }
 
     private func stateColor(_ state: PublishState) -> Color {

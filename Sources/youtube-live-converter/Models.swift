@@ -64,7 +64,35 @@ struct ParsedStatus {
     var ffmpegSpeed = ""
     var bufferState = "Off"
     var bufferProgress: Double = 0
+    var stagedBufferSeconds: Double = 0
     var avSyncState = "Auto"
+    var health = StreamHealthSnapshot()
+}
+
+enum StreamHealthLevel: Int, Codable, Comparable {
+    case neutral = 0
+    case good = 1
+    case warning = 2
+    case critical = 3
+
+    static func < (lhs: StreamHealthLevel, rhs: StreamHealthLevel) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+struct StreamHealthMetric: Codable {
+    var title: String
+    var detail: String
+    var level: StreamHealthLevel
+}
+
+struct StreamHealthSnapshot: Codable {
+    var overall: StreamHealthLevel = .neutral
+    var summary = "Idle"
+    var buffer = StreamHealthMetric(title: "Buffer", detail: "Off", level: .neutral)
+    var timeline = StreamHealthMetric(title: "Timeline", detail: "No output yet", level: .neutral)
+    var video = StreamHealthMetric(title: "Video", detail: "No frames yet", level: .neutral)
+    var speed = StreamHealthMetric(title: "Speed", detail: "No speed data", level: .neutral)
 }
 
 struct StreamPreview {
