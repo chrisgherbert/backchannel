@@ -143,11 +143,37 @@ sign_nested() {
     [[ -f "$nested" ]] || continue
     is_macho "$nested" || continue
     [[ "$nested" == "$MAIN_EXEC" ]] && continue
+    codesign --remove-signature "$nested" >/dev/null 2>&1 || true
     codesign --force --options runtime --timestamp --sign "$DEV_ID_APP" "$nested"
   done < <(find "$APP_PATH/Contents" -type f -print | sort)
 }
 
 sign_nested
+
+verify_nested_signatures() {
+  echo "==> Verifying nested Mach-O signatures"
+  local details
+  while IFS= read -r nested; do
+    [[ -f "$nested" ]] || continue
+    is_macho "$nested" || continue
+    [[ "$nested" == "$MAIN_EXEC" ]] && continue
+    details="$(codesign -dv --verbose=4 "$nested" 2>&1 || true)"
+    if grep -q "Signature=adhoc" <<<"$details"; then
+      echo "Error: nested Mach-O still has ad-hoc signature: $nested" >&2
+      exit 1
+    fi
+    if ! grep -q "^Authority=" <<<"$details"; then
+      echo "Error: nested Mach-O missing Developer ID authority: $nested" >&2
+      exit 1
+    fi
+    if ! grep -q "^Timestamp=" <<<"$details"; then
+      echo "Error: nested Mach-O missing secure timestamp: $nested" >&2
+      exit 1
+    fi
+  done < <(find "$APP_PATH/Contents" -type f -print | sort)
+}
+
+verify_nested_signatures
 
 echo "==> Codesigning app bundle"
 codesign --force --options runtime --timestamp --sign "$DEV_ID_APP" "$APP_PATH"
