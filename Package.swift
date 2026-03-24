@@ -12,5 +12,9 @@ let package = Package(
         .executableTarget(
             name: "youtube-live-converter"
         ),
+        .testTarget(
+            name: "youtube-live-converterTests",
+            dependencies: ["youtube-live-converter"]
+        ),
     ]
 )

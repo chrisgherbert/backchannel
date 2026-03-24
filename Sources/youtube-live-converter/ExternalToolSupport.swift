@@ -24,10 +24,19 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
 
     var bundledByDefault: Bool {
         switch self {
-        case .ytDlp, .ffmpeg, .ffprobe:
+        case .ffmpeg, .ffprobe:
             return true
-        case .deno:
+        case .ytDlp, .deno:
             return false
+        }
+    }
+
+    var allowsBundledRuntimeFallback: Bool {
+        switch self {
+        case .ytDlp:
+            return false
+        case .ffmpeg, .ffprobe, .deno:
+            return true
         }
     }
 
@@ -61,18 +70,38 @@ enum ManagedComponentKind: String, CaseIterable, Identifiable, Codable {
     var displayName: String {
         switch self {
         case .ytDlp:
-            return "Managed yt-dlp"
+            return "Managed yt-dlp Runtime"
         case .deno:
             return "JavaScript Runtime"
         }
     }
 
-    var executableName: String {
-        rawValue
+    var managedExecutableRelativePath: String {
+        switch self {
+        case .ytDlp:
+            return "yt-dlp/python/bin/python3"
+        case .deno:
+            return "\(rawValue)/\(rawValue)"
+        }
     }
 
-    var managedExecutableRelativePath: String {
-        "\(rawValue)/\(rawValue)"
+    var legacyExecutableRelativePaths: [String] {
+        switch self {
+        case .ytDlp:
+            return ["yt-dlp/yt-dlp"]
+        case .deno:
+            return []
+        }
+    }
+
+    func defaultInvocationPrefix(for executableRelativePath: String?) -> [String] {
+        switch self {
+        case .ytDlp:
+            let path = executableRelativePath ?? managedExecutableRelativePath
+            return path == managedExecutableRelativePath ? ["-m", "yt_dlp"] : []
+        case .deno:
+            return []
+        }
     }
 
     var toolKind: ExternalToolKind {
@@ -92,9 +121,21 @@ enum ExternalToolSource: String, Codable {
 
 struct ResolvedExternalTool: Sendable {
     let kind: ExternalToolKind
-    let url: URL
+    let executableURL: URL
+    let argumentsPrefix: [String]
     let source: ExternalToolSource
     let version: String?
+    let runtimeVersion: String?
+
+    var url: URL { executableURL }
+
+    var launchDescription: String {
+        ([executableURL.path] + argumentsPrefix).joined(separator: " ")
+    }
+
+    func arguments(appending arguments: [String]) -> [String] {
+        argumentsPrefix + arguments
+    }
 }
 
 struct ResolvedToolchain: Sendable {
@@ -173,6 +214,9 @@ struct ManagedSupportComponent: Codable, Identifiable, Hashable {
     var assetName: String
     var sha256: String
     var executableRelativePath: String
+    var argumentsPrefix: [String]?
+    var toolVersion: String?
+    var runtimeVersion: String?
     var minimumAppVersion: String?
 
     var componentKind: ManagedComponentKind? {
@@ -205,9 +249,14 @@ enum ExternalSupportConfiguration {
     static let githubOwner = "chrisgherbert"
     static let githubRepo = "backchannel"
     static let managedSupportManifestAssetName = "backchannel-managed-support.json"
+    static let managedSupportReleaseTag = "managed-support"
 
     static var latestReleaseAPIURL: URL {
         URL(string: "https://api.github.com/repos/\(githubOwner)/\(githubRepo)/releases/latest")!
+    }
+
+    static var managedSupportReleaseAPIURL: URL {
+        URL(string: "https://api.github.com/repos/\(githubOwner)/\(githubRepo)/releases/tags/\(managedSupportReleaseTag)")!
     }
 }
 
@@ -239,7 +288,37 @@ enum ExternalSupportPaths {
     }
 
     static func managedCurrentExecutable(_ kind: ManagedComponentKind) -> URL {
-        managedCurrentLink(kind).appendingPathComponent(kind.managedExecutableRelativePath)
+        let current = managedCurrentLink(kind)
+        let manifestPath = current.appendingPathComponent("component.json")
+        let manifestRelativePath: String? = {
+            guard
+                let data = try? Data(contentsOf: manifestPath),
+                let component = try? JSONDecoder().decode(ManagedSupportComponent.self, from: data)
+            else {
+                return nil
+            }
+            return component.executableRelativePath
+        }()
+
+        let candidates = ([manifestRelativePath, kind.managedExecutableRelativePath] + kind.legacyExecutableRelativePaths)
+            .compactMap { $0 }
+
+        for relativePath in candidates {
+            let candidate = current.appendingPathComponent(relativePath)
+            if FileManager.default.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+
+        return current.appendingPathComponent(manifestRelativePath ?? kind.managedExecutableRelativePath)
+    }
+
+    static func managedCurrentMetadataURL(_ kind: ManagedComponentKind) -> URL {
+        managedCurrentLink(kind).appendingPathComponent("component.json")
+    }
+
+    static func managedVersionMetadataURL(_ kind: ManagedComponentKind, version: String) -> URL {
+        managedVersionDirectory(kind, version: version).appendingPathComponent("component.json")
     }
 
     static func stateStoreURL() -> URL {
@@ -247,6 +326,9 @@ enum ExternalSupportPaths {
     }
 
     static func bundledExecutable(for kind: ExternalToolKind, resourceURL: URL?) -> URL? {
+        guard kind.allowsBundledRuntimeFallback else {
+            return nil
+        }
         guard let resourceURL else { return nil }
         let candidate = resourceURL.appendingPathComponent("bin/\(kind.rawValue)")
         return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate : nil
@@ -271,40 +353,40 @@ enum ExternalSupportPaths {
 }
 
 enum ExternalToolResolver {
-    static func resolvePreviewTools(resourceURL: URL?) -> (ytDlp: URL, environment: [String: String], logLines: [String])? {
+    static func resolvePreviewTools(resourceURL: URL?) -> (ytDlp: ResolvedExternalTool, environment: [String: String], logLines: [String])? {
         var logLines: [String] = []
 
-        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines)
-            ?? resolvePreferredToolBestEffort(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
-            logLines.append("[app] Could not find yt-dlp in managed support or bundled resources.")
+        guard let ytDlp = resolveManagedToolBestEffort(.ytDlp, logLines: &logLines) else {
+            logLines.append("[app] Managed yt-dlp is required. Open Settings > Tools and install managed support.")
             return nil
         }
 
-        let deno = resolveManagedTool(.deno, logLines: &logLines) ?? resolveBundledOptionalTool(.deno, resourceURL: resourceURL, logLines: &logLines)
+        let deno = resolveManagedToolBestEffort(.deno, logLines: &logLines)
+            ?? resolveBundledOptionalToolBestEffort(.deno, resourceURL: resourceURL, logLines: &logLines)
         let environment = runtimeEnvironment(using: [ytDlp] + (deno.map { [$0] } ?? []))
-        return (ytDlp.url, environment, logLines)
+        return (ytDlp, environment, logLines)
     }
 
     static func resolveCurrentToolchain(resourceURL: URL?) -> ExternalToolResolution {
         var logLines: [String] = []
 
-        guard let ytDlp = resolvePreferredTool(.ytDlp, resourceURL: resourceURL, logLines: &logLines)
-            ?? resolvePreferredToolBestEffort(.ytDlp, resourceURL: resourceURL, logLines: &logLines) else {
-            logLines.append("[app] Could not find yt-dlp in managed support or bundled resources.")
+        guard let ytDlp = resolveManagedToolBestEffort(.ytDlp, logLines: &logLines) else {
+            logLines.append("[app] Managed yt-dlp is required. Open Settings > Tools and install managed support.")
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
 
-        guard let ffmpeg = resolveBundledTool(.ffmpeg, resourceURL: resourceURL, logLines: &logLines) else {
+        guard let ffmpeg = resolveBundledToolBestEffort(.ffmpeg, resourceURL: resourceURL, logLines: &logLines) else {
             logLines.append("[app] Could not find bundled FFmpeg.")
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
 
-        guard let ffprobe = resolveBundledTool(.ffprobe, resourceURL: resourceURL, logLines: &logLines) else {
+        guard let ffprobe = resolveBundledToolBestEffort(.ffprobe, resourceURL: resourceURL, logLines: &logLines) else {
             logLines.append("[app] Could not find bundled FFprobe.")
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
 
-        let deno = resolveManagedTool(.deno, logLines: &logLines) ?? resolveBundledOptionalTool(.deno, resourceURL: resourceURL, logLines: &logLines)
+        let deno = resolveManagedToolBestEffort(.deno, logLines: &logLines)
+            ?? resolveBundledOptionalToolBestEffort(.deno, resourceURL: resourceURL, logLines: &logLines)
         let environment = runtimeEnvironment(using: [ytDlp, ffmpeg, ffprobe] + (deno.map { [$0] } ?? []))
 
         return ExternalToolResolution(
@@ -367,7 +449,7 @@ enum ExternalToolResolver {
         var environment = ProcessInfo.processInfo.environment
         let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         let directories = tools
-            .map { $0.url.deletingLastPathComponent().path }
+            .map { $0.executableURL.deletingLastPathComponent().path }
             .reduce(into: [String]()) { partialResult, path in
                 if !partialResult.contains(path) {
                     partialResult.append(path)
@@ -425,6 +507,44 @@ enum ExternalToolResolver {
         return output?.isEmpty == false ? output : nil
     }
 
+    static func verifyExecutable(_ tool: ResolvedExternalTool, timeout: TimeInterval? = nil) -> Bool {
+        verifyExecutable(
+            tool.executableURL,
+            versionArguments: tool.arguments(appending: tool.kind.versionArguments),
+            timeout: timeout ?? tool.kind.validationTimeout
+        )
+    }
+
+    static func detectedVersion(for tool: ResolvedExternalTool) -> String? {
+        guard hasExecutablePayload(tool.executableURL) else {
+            return nil
+        }
+        guard let result = runProcess(
+            executable: tool.executableURL,
+            arguments: tool.arguments(appending: tool.kind.versionArguments),
+            timeout: tool.kind.validationTimeout
+        ), result.terminationStatus == 0 else {
+            return nil
+        }
+        let output = result.output
+            .split(whereSeparator: \.isNewline)
+            .first
+            .map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return output?.isEmpty == false ? output : nil
+    }
+
+    static func loadManagedInstalledComponent(_ kind: ManagedComponentKind) -> ManagedSupportComponent? {
+        let metadataURL = ExternalSupportPaths.managedCurrentMetadataURL(kind)
+        guard
+            let data = try? Data(contentsOf: metadataURL),
+            let component = try? JSONDecoder().decode(ManagedSupportComponent.self, from: data)
+        else {
+            return nil
+        }
+        return component
+    }
+
     static func loadManagedStateStore() -> ManagedComponentStateStore {
         let url = ExternalSupportPaths.stateStoreURL()
         guard
@@ -450,43 +570,27 @@ enum ExternalToolResolver {
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func resolvePreferredTool(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
-        if let managedKind = ManagedComponentKind(rawValue: kind.rawValue),
-           let managed = resolveManagedTool(managedKind, logLines: &logLines) {
-            return managed
-        }
-        return resolveBundledTool(kind, resourceURL: resourceURL, logLines: &logLines)
-    }
-
-    private static func resolvePreferredToolBestEffort(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
-        if let bundled = resolveBundledToolBestEffort(kind, resourceURL: resourceURL, logLines: &logLines) {
-            return bundled
-        }
-
-        if let managedKind = ManagedComponentKind(rawValue: kind.rawValue),
-           let managed = resolveManagedToolBestEffort(managedKind, logLines: &logLines) {
-            return managed
-        }
-
-        return nil
-    }
-
     private static func resolveManagedTool(_ kind: ManagedComponentKind, logLines: inout [String]) -> ResolvedExternalTool? {
         let executable = ExternalSupportPaths.managedCurrentExecutable(kind)
-        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+        guard hasExecutablePayload(executable) else {
             return nil
         }
 
-        guard verifyExecutable(executable, versionArguments: kind.toolKind.versionArguments, timeout: kind.toolKind.validationTimeout) else {
-            logLines.append("[app] Managed \(kind.displayName) found at \(executable.path) but it cannot run.")
+        let installedMetadata = loadManagedInstalledComponent(kind)
+        let tool = makeResolvedManagedTool(kind, executable: executable, component: installedMetadata)
+
+        guard verifyExecutable(tool, timeout: kind.toolKind.validationTimeout) else {
+            logLines.append("[app] \(kind.displayName) found at \(tool.launchDescription) but it cannot run.")
             return nil
         }
 
         return ResolvedExternalTool(
             kind: kind.toolKind,
-            url: executable,
+            executableURL: tool.executableURL,
+            argumentsPrefix: tool.argumentsPrefix,
             source: .managed,
-            version: detectedVersion(for: kind.toolKind, url: executable)
+            version: installedMetadata?.toolVersion ?? detectedVersion(for: tool),
+            runtimeVersion: installedMetadata?.runtimeVersion
         )
     }
 
@@ -496,13 +600,10 @@ enum ExternalToolResolver {
             return nil
         }
 
-        logLines.append("[app] Managed \(kind.displayName) at \(executable.path) did not pass preflight verification. Attempting to use it anyway.")
-        return ResolvedExternalTool(
-            kind: kind.toolKind,
-            url: executable,
-            source: .managed,
-            version: nil
-        )
+        let installedMetadata = loadManagedInstalledComponent(kind)
+        let tool = makeResolvedManagedTool(kind, executable: executable, component: installedMetadata)
+        logLines.append("[app] Using \(kind.displayName): \(tool.launchDescription)")
+        return tool
     }
 
     private static func resolveBundledTool(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
@@ -517,9 +618,11 @@ enum ExternalToolResolver {
 
         return ResolvedExternalTool(
             kind: kind,
-            url: executable,
+            executableURL: executable,
+            argumentsPrefix: [],
             source: .bundled,
-            version: detectedVersion(for: kind, url: executable)
+            version: detectedVersion(for: kind, url: executable),
+            runtimeVersion: nil
         )
     }
 
@@ -529,17 +632,50 @@ enum ExternalToolResolver {
             return nil
         }
 
-        logLines.append("[app] Bundled \(kind.displayName) at \(executable.path) did not pass preflight verification. Attempting to use it anyway.")
+        logLines.append("[app] Using bundled \(kind.displayName): \(executable.path)")
         return ResolvedExternalTool(
             kind: kind,
-            url: executable,
+            executableURL: executable,
+            argumentsPrefix: [],
             source: .bundled,
-            version: nil
+            version: nil,
+            runtimeVersion: nil
         )
     }
 
     private static func resolveBundledOptionalTool(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
         resolveBundledTool(kind, resourceURL: resourceURL, logLines: &logLines)
+    }
+
+    private static func resolveBundledOptionalToolBestEffort(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
+        resolveBundledToolBestEffort(kind, resourceURL: resourceURL, logLines: &logLines)
+    }
+
+    private static func makeResolvedManagedTool(
+        _ kind: ManagedComponentKind,
+        executable: URL,
+        component: ManagedSupportComponent?
+    ) -> ResolvedExternalTool {
+        let inferredRelativePath = component?.executableRelativePath
+            ?? relativePath(of: executable, relativeTo: ExternalSupportPaths.managedCurrentLink(kind))
+        return ResolvedExternalTool(
+            kind: kind.toolKind,
+            executableURL: executable,
+            argumentsPrefix: component?.argumentsPrefix ?? kind.defaultInvocationPrefix(for: inferredRelativePath),
+            source: .managed,
+            version: component?.toolVersion,
+            runtimeVersion: component?.runtimeVersion
+        )
+    }
+
+    private static func relativePath(of url: URL, relativeTo base: URL) -> String? {
+        let urlPath = url.standardizedFileURL.path
+        let basePath = base.standardizedFileURL.path
+        guard urlPath.hasPrefix(basePath) else {
+            return nil
+        }
+        let trimmed = String(urlPath.dropFirst(basePath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func runProcess(executable: URL, arguments: [String], timeout: TimeInterval) -> ProcessRunResult? {

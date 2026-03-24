@@ -25,6 +25,8 @@ struct SettingsView: View {
     @AppStorage(AppPreferenceKeys.defaultAudioContinuityEnabled) private var defaultAudioContinuityEnabled = true
     @AppStorage(AppPreferenceKeys.defaultLogMonitoringEnabled) private var defaultExtendedLogging = true
     @AppStorage(AppPreferenceKeys.appearanceMode) private var appearanceModeRaw = AppearanceMode.automatic.rawValue
+    @AppStorage(AppPreferenceKeys.downloadAuthenticationMode) private var downloadAuthenticationModeRaw = DownloadAuthenticationMode.none.rawValue
+    @AppStorage(AppPreferenceKeys.browserCookiesSource) private var browserCookiesSourceRaw = DownloadAuthenticationSettings.defaultBrowserSource.rawValue
     @AppStorage(AppPreferenceKeys.rtmpPresetsJSON) private var rtmpPresetsJSON = "[]"
     @AppStorage(AppPreferenceKeys.sourcePresetsJSON) private var sourcePresetsJSON = "[]"
 
@@ -108,6 +110,40 @@ struct SettingsView: View {
                         .labelsHidden()
                         Spacer(minLength: 0)
                     }
+                }
+
+                Section("Download Authentication") {
+                    HStack {
+                        Text("Authentication")
+                            .frame(width: 150, alignment: .leading)
+                        Picker("", selection: downloadAuthenticationModeBinding) {
+                            ForEach(DownloadAuthenticationMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
+                        Spacer(minLength: 0)
+                    }
+
+                    if downloadAuthenticationMode == .browserCookies {
+                        HStack {
+                            Text("Browser")
+                                .frame(width: 150, alignment: .leading)
+                            Picker("", selection: browserCookiesSourceBinding) {
+                                ForEach(BrowserCookiesSource.allCases) { source in
+                                    Text(source.title).tag(source)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            Spacer(minLength: 0)
+                        }
+                    }
+
+                    Text(DownloadAuthenticationCopy.helpText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
             .formStyle(.grouped)
@@ -373,6 +409,28 @@ struct SettingsView: View {
         defaultAudioBoostDb = 0
         defaultAudioContinuityEnabled = true
         defaultExtendedLogging = true
+    }
+
+    private var downloadAuthenticationMode: DownloadAuthenticationMode {
+        DownloadAuthenticationMode(rawValue: downloadAuthenticationModeRaw) ?? .none
+    }
+
+    private var downloadAuthenticationModeBinding: Binding<DownloadAuthenticationMode> {
+        Binding(
+            get: { downloadAuthenticationMode },
+            set: { downloadAuthenticationModeRaw = $0.rawValue }
+        )
+    }
+
+    private var browserCookiesSource: BrowserCookiesSource {
+        BrowserCookiesSource(rawValue: browserCookiesSourceRaw) ?? DownloadAuthenticationSettings.defaultBrowserSource
+    }
+
+    private var browserCookiesSourceBinding: Binding<BrowserCookiesSource> {
+        Binding(
+            get: { browserCookiesSource },
+            set: { browserCookiesSourceRaw = $0.rawValue }
+        )
     }
 
     private func addRtmpPreset() {

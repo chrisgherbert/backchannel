@@ -73,22 +73,12 @@ sha256_file() {
 }
 
 resolve_tooling() {
-  YTDLP_PATH="${YTDLP_BINARY:-}"
-  if [[ -z "$YTDLP_PATH" ]]; then
-    if [[ -x "$HOME/.local/bin/yt-dlp" ]]; then
-      YTDLP_PATH="$HOME/.local/bin/yt-dlp"
-    elif command -v yt-dlp >/dev/null 2>&1; then
-      YTDLP_PATH="$(command -v yt-dlp)"
-    fi
-  fi
-
   FFMPEG_PATH="${FFMPEG_BINARY:-}"
   [[ -n "$FFMPEG_PATH" ]] || FFMPEG_PATH="$(find_tool ffmpeg || true)"
 
   FFPROBE_PATH="${FFPROBE_BINARY:-}"
   [[ -n "$FFPROBE_PATH" ]] || FFPROBE_PATH="$(find_tool ffprobe || true)"
 
-  [[ -n "$YTDLP_PATH" && -x "$YTDLP_PATH" ]] || { echo "Error: missing executable yt-dlp (set YTDLP_BINARY)." >&2; exit 1; }
   [[ -n "$FFMPEG_PATH" && -x "$FFMPEG_PATH" ]] || { echo "Error: missing executable ffmpeg (set FFMPEG_BINARY)." >&2; exit 1; }
   [[ -n "$FFPROBE_PATH" && -x "$FFPROBE_PATH" ]] || { echo "Error: missing executable ffprobe (set FFPROBE_BINARY)." >&2; exit 1; }
 
@@ -99,7 +89,6 @@ resolve_tooling() {
     ICON_SOURCE="$ROOT_DIR/assets/AppIcon.png"
   fi
 
-  YTDLP_SHA="$(sha256_file "$YTDLP_PATH")"
   FFMPEG_SHA="$(sha256_file "$FFMPEG_PATH")"
   FFPROBE_SHA="$(sha256_file "$FFPROBE_PATH")"
   ICON_SHA=""
@@ -117,8 +106,6 @@ load_manifest() {
 write_manifest() {
   mkdir -p "$(dirname "$MANIFEST_PATH")"
   cat > "$MANIFEST_PATH" <<MANIFEST
-YTDLP_PATH='${YTDLP_PATH}'
-YTDLP_SHA='${YTDLP_SHA}'
 FFMPEG_PATH='${FFMPEG_PATH}'
 FFMPEG_SHA='${FFMPEG_SHA}'
 FFPROBE_PATH='${FFPROBE_PATH}'
@@ -130,7 +117,6 @@ MANIFEST
 run_full_package() {
   echo "Running full package build ($MODE mode)..."
   env \
-    YTDLP_BINARY="$YTDLP_PATH" \
     FFMPEG_BINARY="$FFMPEG_PATH" \
     FFPROBE_BINARY="$FFPROBE_PATH" \
     APP_DISPLAY_NAME="$APP_DISPLAY_NAME" \
@@ -147,19 +133,21 @@ quick_rebundle_needed() {
   [[ -x "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE_NAME" ]] || return 0
   [[ -d "$APP_PATH/Contents/Resources/bin" ]] || return 0
 
+  if [[ -e "$APP_PATH/Contents/Resources/bin/yt-dlp" ]]; then
+    return 0
+  fi
+
   if [[ -e "$APP_PATH/Contents/Resources/bin/deno" ]]; then
     return 0
   fi
 
-  local m_ytdlp_path m_ytdlp_sha m_ffmpeg_path m_ffmpeg_sha m_ffprobe_path m_ffprobe_sha m_icon_sha
-  m_ytdlp_path=""; m_ytdlp_sha=""; m_ffmpeg_path=""; m_ffmpeg_sha=""; m_ffprobe_path=""; m_ffprobe_sha=""; m_icon_sha=""
+  local m_ffmpeg_path m_ffmpeg_sha m_ffprobe_path m_ffprobe_sha m_icon_sha
+  m_ffmpeg_path=""; m_ffmpeg_sha=""; m_ffprobe_path=""; m_ffprobe_sha=""; m_icon_sha=""
 
   if ! load_manifest; then
     return 0
   fi
 
-  m_ytdlp_path="${YTDLP_PATH:-}"
-  m_ytdlp_sha="${YTDLP_SHA:-}"
   m_ffmpeg_path="${FFMPEG_PATH:-}"
   m_ffmpeg_sha="${FFMPEG_SHA:-}"
   m_ffprobe_path="${FFPROBE_PATH:-}"
@@ -169,15 +157,11 @@ quick_rebundle_needed() {
   # restore current-resolved values that were shadowed by sourcing manifest
   resolve_tooling
 
-  [[ "$m_ytdlp_path" == "$YTDLP_PATH" && "$m_ytdlp_sha" == "$YTDLP_SHA" ]] || return 0
   [[ "$m_ffmpeg_path" == "$FFMPEG_PATH" && "$m_ffmpeg_sha" == "$FFMPEG_SHA" ]] || return 0
   [[ "$m_ffprobe_path" == "$FFPROBE_PATH" && "$m_ffprobe_sha" == "$FFPROBE_SHA" ]] || return 0
   [[ "$m_icon_sha" == "$ICON_SHA" ]] || return 0
 
   if ! codesign --verify --verbose=2 "$APP_PATH" >/dev/null 2>&1; then
-    return 0
-  fi
-  if ! codesign --verify --verbose=2 "$APP_PATH/Contents/Resources/bin/yt-dlp" >/dev/null 2>&1; then
     return 0
   fi
   if ! codesign --verify --verbose=2 "$APP_PATH/Contents/Resources/bin/ffmpeg" >/dev/null 2>&1; then

@@ -10,11 +10,11 @@ struct ManagedSupportSetupSheet: View {
             Text("Set Up Extended Support")
                 .font(.title2.weight(.semibold))
 
-            Text("Back Channel is installed and ready to use. For broader source compatibility and managed updates, we can install a small set of support components in Application Support.")
+            Text("Back Channel is installed and ready to use. For faster source loading, broader compatibility, and managed updates, we can install a small set of support components in Application Support.")
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 8) {
-                Label("Managed yt-dlp updates", systemImage: "shippingbox")
+                Label("Managed Python runtime with fast-start yt-dlp", systemImage: "shippingbox")
                 Label("Managed JavaScript runtime for source extraction", systemImage: "cpu")
                 Label("Automatic repair and rollback controls in Settings", systemImage: "wrench.and.screwdriver")
             }

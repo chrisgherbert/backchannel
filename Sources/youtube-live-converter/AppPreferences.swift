@@ -17,6 +17,8 @@ enum AppPreferenceKeys {
     static let automaticUpdateChecksEnabled = "automatic_update_checks_enabled"
     static let skippedUpdateVersion = "skipped_update_version"
     static let lastUpdateCheckTimeInterval = "last_update_check_time_interval"
+    static let downloadAuthenticationMode = "download_authentication_mode"
+    static let browserCookiesSource = "browser_cookies_source"
 }
 
 enum AppearanceMode: String, CaseIterable, Identifiable {
@@ -25,6 +27,79 @@ enum AppearanceMode: String, CaseIterable, Identifiable {
     case dark = "Dark"
 
     var id: String { rawValue }
+}
+
+enum DownloadAuthenticationMode: String, CaseIterable, Identifiable {
+    case none = "none"
+    case browserCookies = "browser_cookies"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .none:
+            return "None"
+        case .browserCookies:
+            return "Use Browser Cookies"
+        }
+    }
+}
+
+enum BrowserCookiesSource: String, CaseIterable, Identifiable {
+    case firefox
+    case chrome
+    case brave
+    case edge
+    case safari
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .firefox:
+            return "Firefox"
+        case .chrome:
+            return "Chrome"
+        case .brave:
+            return "Brave"
+        case .edge:
+            return "Edge"
+        case .safari:
+            return "Safari"
+        }
+    }
+
+    var ytDLPValue: String { rawValue }
+}
+
+enum DownloadAuthenticationCopy {
+    static let helpText = "Use yt-dlp’s browser cookie import to access an existing signed-in session when needed. Back Channel does not display or store cookie values."
+}
+
+struct DownloadAuthenticationSettings: Equatable {
+    var mode: DownloadAuthenticationMode
+    var browserSource: BrowserCookiesSource
+
+    static let defaultBrowserSource: BrowserCookiesSource = .safari
+
+    static func load(from defaults: UserDefaults = .standard) -> DownloadAuthenticationSettings {
+        let modeRaw = defaults.string(forKey: AppPreferenceKeys.downloadAuthenticationMode) ?? DownloadAuthenticationMode.none.rawValue
+        let browserRaw = defaults.string(forKey: AppPreferenceKeys.browserCookiesSource) ?? defaultBrowserSource.rawValue
+
+        return DownloadAuthenticationSettings(
+            mode: DownloadAuthenticationMode(rawValue: modeRaw) ?? .none,
+            browserSource: BrowserCookiesSource(rawValue: browserRaw) ?? defaultBrowserSource
+        )
+    }
+
+    var ytDLPArguments: [String] {
+        switch mode {
+        case .none:
+            return []
+        case .browserCookies:
+            return ["--cookies-from-browser", browserSource.ytDLPValue]
+        }
+    }
 }
 
 struct RtmpPreset: Identifiable, Codable, Equatable {

@@ -1011,8 +1011,7 @@ struct ContentView: View {
     }
 
     private var isLoadingSourceInfo: Bool {
-        let status = pipeline.previewStatus.lowercased()
-        return status.contains("loading") || status.contains("checking")
+        pipeline.isPreviewLoading
     }
 
     private var footerPrimaryStateText: String {
@@ -1091,6 +1090,8 @@ struct ContentView: View {
     }
 
     private func loadInfo() {
+        autoLoadInfoTask?.cancel()
+        autoLoadInfoTask = nil
         lastAutoLoadedSourceURL = sourceURLTrimmed
         pipeline.loadPreview(for: config.sourceURL)
     }

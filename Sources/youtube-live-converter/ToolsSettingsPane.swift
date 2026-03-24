@@ -37,7 +37,7 @@ struct ToolsSettingsPane: View {
                 }
 
                 Section("Managed Support") {
-                    Text("Back Channel can install and maintain newer support components in Application Support without asking the user to manage tools manually.")
+                    Text("Back Channel can install and maintain a fast-start Python runtime for yt-dlp and other support components in Application Support without asking the user to manage runtimes manually.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
@@ -66,6 +66,12 @@ struct ToolsSettingsPane: View {
                                 managedStatusBadge(for: status)
                                 if let installedVersion = status.installedVersion {
                                     Text(installedVersion)
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                if let runtimeVersion = status.runtimeVersion,
+                                   status.installedVersion != nil {
+                                    Text(runtimeVersion)
                                         .foregroundStyle(.secondary)
                                         .textSelection(.enabled)
                                 }

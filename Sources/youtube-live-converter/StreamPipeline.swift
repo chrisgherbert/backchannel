@@ -10,6 +10,7 @@ final class StreamPipeline: ObservableObject {
     @Published private(set) var preview: StreamPreview?
     @Published private(set) var previewStatus = ""
     @Published private(set) var previewSourceURL = ""
+    @Published private(set) var isPreviewLoading = false
 
     private var ytDlpProcess: Process?
     private var ffmpegProcess: Process?
@@ -361,6 +362,11 @@ final class StreamPipeline: ObservableObject {
             preview = nil
             previewStatus = ""
             previewSourceURL = ""
+            isPreviewLoading = false
+            return
+        }
+
+        if isPreviewLoading, previewSourceURL == trimmed {
             return
         }
 
@@ -368,6 +374,7 @@ final class StreamPipeline: ObservableObject {
         let requestID = previewRequestID
         let previousSourceURL = previewSourceURL
         previewSourceURL = trimmed
+        isPreviewLoading = true
 
         // Clear stale preview immediately when switching to a different source URL.
         if !previousSourceURL.isEmpty, previousSourceURL != trimmed {
@@ -392,6 +399,7 @@ final class StreamPipeline: ObservableObject {
                 guard let self else { return }
                 guard requestID == self.previewRequestID else { return }
                 guard self.previewSourceURL == trimmed else { return }
+                self.isPreviewLoading = false
 
                 if let liveStatusPreview = liveStatusMetadata.preview {
                     let mergedPreview = self.mergePreview(current: self.preview, incoming: liveStatusPreview)
@@ -466,7 +474,7 @@ final class StreamPipeline: ObservableObject {
             return
         }
 
-        ytDlp.executableURL = paths.ytDlp
+        ytDlp.executableURL = paths.ytDlp.executableURL
         let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
         let ytDlpWorkDir = FileManager.default.temporaryDirectory
             .appendingPathComponent("youtube-live-converter", isDirectory: true)
@@ -484,6 +492,7 @@ final class StreamPipeline: ObservableObject {
         if let deno = paths.deno {
             ytDlpArguments += ["--js-runtimes", "deno:\(deno.path)"]
         }
+        ytDlpArguments += DownloadAuthenticationSettings.load().ytDLPArguments
         ytDlpArguments += [
             "--paths", "home:\(ytDlpWorkDir.path)",
             "--paths", "temp:\(ytDlpWorkDir.path)",
@@ -493,7 +502,7 @@ final class StreamPipeline: ObservableObject {
             "-",
             config.sourceURL
         ]
-        ytDlp.arguments = ytDlpArguments
+        ytDlp.arguments = paths.ytDlp.arguments(appending: ytDlpArguments)
         ytDlp.environment = paths.environment
 
         let mediaPipe = Pipe()
@@ -612,7 +621,7 @@ final class StreamPipeline: ObservableObject {
                 appendLog("[app] Pipeline started.")
             }
 
-            appendLog("[app] Using yt-dlp: \(paths.ytDlp.path)")
+            appendLog("[app] Using yt-dlp: \(paths.ytDlp.launchDescription)")
             appendLog("[app] Using ffmpeg: \(paths.ffmpeg.path)")
             appendLog("[app] Using ffprobe: \(paths.ffprobe.path)")
             appendSessionConfigurationLog(config)
@@ -2571,17 +2580,18 @@ final class StreamPipeline: ObservableObject {
     }
 
     nonisolated private struct PreviewLookupContext {
-        let ytDlp: URL
+        let ytDlp: ResolvedExternalTool
         let environment: [String: String]
     }
 
     nonisolated private static func fetchInitialPreviewMetadata(for sourceURL: String) async -> (preview: StreamPreview?, message: String) {
         guard let context = preparePreviewLookupContext() else {
-            return (nil, "Tools unavailable")
+            return (nil, "Set up Managed yt-dlp in Settings > Tools")
         }
 
         // Single request path for initial source data (same style as CLI).
         var args = ["--skip-download", "--no-warnings", "--no-playlist"]
+        args += DownloadAuthenticationSettings.load().ytDLPArguments
         args += [
             "--print", "title=%(title)s",
             "--print", "thumbnail=%(thumbnail)s",
@@ -2599,8 +2609,8 @@ final class StreamPipeline: ObservableObject {
         ]
 
         guard let result = await runProcessCaptureForPreview(
-            executableURL: context.ytDlp,
-            arguments: args,
+            executableURL: context.ytDlp.executableURL,
+            arguments: context.ytDlp.arguments(appending: args),
             environment: context.environment,
             currentDirectoryURL: FileManager.default.homeDirectoryForCurrentUser,
             timeoutSeconds: 20
@@ -2639,7 +2649,7 @@ final class StreamPipeline: ObservableObject {
 }
 
 private struct ToolPaths: Sendable {
-    let ytDlp: URL
+    let ytDlp: ResolvedExternalTool
     let ffmpeg: URL
     let ffprobe: URL
     let deno: URL?
@@ -2829,12 +2839,12 @@ private extension StreamPipeline {
             return ToolResolution(paths: nil, logLines: logLines)
         }
 
-        let ytDlp = toolchain.ytDlp.url
+        let ytDlp = toolchain.ytDlp
         let ffmpeg = toolchain.ffmpeg.url
         let ffprobe = toolchain.ffprobe.url
         let denoURL = toolchain.deno?.url
 
-        let ytDlpSignature = executableSignature(for: ytDlp)
+        let ytDlpSignature = toolInvocationSignature(for: ytDlp)
         let ffmpegSignature = executableSignature(for: ffmpeg)
         let ffprobeSignature = executableSignature(for: ffprobe)
         let canUseProbeCache = (ytDlpSignature != nil && ffmpegSignature != nil && ffprobeSignature != nil)
@@ -2842,27 +2852,14 @@ private extension StreamPipeline {
         var supportsVideoToolboxH264: Bool
         if canUseProbeCache,
            let cached = loadToolProbeCache(),
-           cached.ytDlpPath == ytDlp.path,
+           cached.ytDlpPath == ytDlp.launchDescription,
            cached.ytDlpSignature == ytDlpSignature,
            cached.ffmpegPath == ffmpeg.path,
            cached.ffmpegSignature == ffmpegSignature,
            cached.ffprobePath == ffprobe.path,
-           cached.ffprobeSignature == ffprobeSignature {
+            cached.ffprobeSignature == ffprobeSignature {
             supportsVideoToolboxH264 = cached.supportsVideoToolboxH264
         } else {
-            guard verifyExecutable(ytDlp, probeArgument: "--version") else {
-                logLines.append("[app] Found yt-dlp at \(ytDlp.path) but it cannot run. Use a standalone yt-dlp binary for distribution.")
-                return ToolResolution(paths: nil, logLines: logLines)
-            }
-            guard verifyExecutable(ffmpeg, probeArgument: "-version") else {
-                logLines.append("[app] Found ffmpeg at \(ffmpeg.path) but it cannot run.")
-                return ToolResolution(paths: nil, logLines: logLines)
-            }
-            guard verifyExecutable(ffprobe, probeArgument: "-version") else {
-                logLines.append("[app] Found ffprobe at \(ffprobe.path) but it cannot run.")
-                return ToolResolution(paths: nil, logLines: logLines)
-            }
-
             supportsVideoToolboxH264 = supportsFFmpegEncoder(ffmpeg, encoderName: "h264_videotoolbox")
 
             if let ytDlpSignature,
@@ -2870,7 +2867,7 @@ private extension StreamPipeline {
                let ffprobeSignature {
                 storeToolProbeCache(
                     ToolProbeCache(
-                        ytDlpPath: ytDlp.path,
+                        ytDlpPath: ytDlp.launchDescription,
                         ytDlpSignature: ytDlpSignature,
                         ffmpegPath: ffmpeg.path,
                         ffmpegSignature: ffmpegSignature,
@@ -2897,22 +2894,6 @@ private extension StreamPipeline {
         return ToolResolution(paths: paths, logLines: logLines)
     }
 
-    nonisolated private static func verifyExecutable(_ url: URL, probeArgument: String) -> Bool {
-        let process = Process()
-        process.executableURL = url
-        process.arguments = [probeArgument]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch {
-            return false
-        }
-    }
-
     nonisolated private static func loadToolProbeCache() -> ToolProbeCache? {
         guard let data = UserDefaults.standard.data(forKey: toolProbeCacheKey) else {
             return nil
@@ -2937,6 +2918,16 @@ private extension StreamPipeline {
         let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
         let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
         return "\(path)|\(size)|\(Int64(modifiedAt))"
+    }
+
+    nonisolated private static func toolInvocationSignature(for tool: ResolvedExternalTool) -> String? {
+        guard let executable = executableSignature(for: tool.executableURL) else {
+            return nil
+        }
+        let prefix = tool.argumentsPrefix.joined(separator: "\u{1F}")
+        let version = tool.version ?? "-"
+        let runtime = tool.runtimeVersion ?? "-"
+        return "\(executable)|\(prefix)|\(version)|\(runtime)"
     }
 
     nonisolated private static func supportsFFmpegEncoder(_ ffmpegURL: URL, encoderName: String) -> Bool {
@@ -3221,7 +3212,7 @@ private extension StreamPipeline {
         let lower = firstLine.lowercased()
 
         if lower.contains("failed to initialize sync semaphore") || lower.contains("semctl: operation not permitted") {
-            return "yt-dlp failed to initialize. Rebuild/update bundled yt-dlp and try again."
+            return "yt-dlp failed to initialize. Repair or update Managed yt-dlp Runtime in Settings > Tools and try again."
         }
         if lower.contains("unable to download api page") || lower.contains("failed to resolve") {
             return "Could not reach source service. Check network/DNS and try again."

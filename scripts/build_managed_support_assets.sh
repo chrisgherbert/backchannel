@@ -13,6 +13,9 @@ DEFAULT_CONFIG_FILE="$ROOT_DIR/scripts/release.env"
 LEGACY_CONFIG_FILE="$ROOT_DIR/.release.env"
 CONFIG_FILE="$DEFAULT_CONFIG_FILE"
 OUTPUT_DIR="$ROOT_DIR/dist/managed-support"
+DEFAULT_PYTHON_STANDALONE_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260320/cpython-3.13.12+20260320-aarch64-apple-darwin-install_only_stripped.tar.gz"
+DEFAULT_YTDLP_PACKAGE_SPEC="yt-dlp[default]"
+DEFAULT_YTDLP_EXTRA_PACKAGES="yt-dlp-ejs"
 
 usage() {
   cat <<USAGE
@@ -53,24 +56,28 @@ fi
 
 [[ -f "$CONFIG_FILE" ]] || { echo "Error: missing config file: $CONFIG_FILE" >&2; exit 1; }
 
+ENV_APP_SHORT_VERSION="${APP_SHORT_VERSION:-}"
+ENV_DENO_BINARY="${DENO_BINARY:-}"
+ENV_PYTHON_STANDALONE_URL="${PYTHON_STANDALONE_URL:-}"
+ENV_PYTHON_STANDALONE_ARCHIVE="${PYTHON_STANDALONE_ARCHIVE:-}"
+ENV_YTDLP_PACKAGE_SPEC="${YTDLP_PACKAGE_SPEC:-}"
+ENV_YTDLP_EXTRA_PACKAGES="${YTDLP_EXTRA_PACKAGES:-}"
+
 set -a
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 set +a
 
+[[ -n "$ENV_APP_SHORT_VERSION" ]] && APP_SHORT_VERSION="$ENV_APP_SHORT_VERSION"
+[[ -n "$ENV_DENO_BINARY" ]] && DENO_BINARY="$ENV_DENO_BINARY"
+[[ -n "$ENV_PYTHON_STANDALONE_URL" ]] && PYTHON_STANDALONE_URL="$ENV_PYTHON_STANDALONE_URL"
+[[ -n "$ENV_PYTHON_STANDALONE_ARCHIVE" ]] && PYTHON_STANDALONE_ARCHIVE="$ENV_PYTHON_STANDALONE_ARCHIVE"
+[[ -n "$ENV_YTDLP_PACKAGE_SPEC" ]] && YTDLP_PACKAGE_SPEC="$ENV_YTDLP_PACKAGE_SPEC"
+[[ -n "$ENV_YTDLP_EXTRA_PACKAGES" ]] && YTDLP_EXTRA_PACKAGES="$ENV_YTDLP_EXTRA_PACKAGES"
+
 require_var() {
   local name="$1"
   [[ -n "${!name:-}" ]] || { echo "Error: required variable '$name' is not set in $CONFIG_FILE" >&2; exit 1; }
-}
-
-require_var YTDLP_BINARY
-require_var DENO_BINARY
-
-is_python_wrapper() {
-  local file="$1"
-  local first_line
-  first_line="$(head -n 1 "$file" || true)"
-  [[ "$first_line" == "#!"*python* ]]
 }
 
 is_macho_binary() {
@@ -102,22 +109,95 @@ sha256_file() {
   shasum -a 256 "$1" | awk '{print $1}'
 }
 
-yt_dlp_version() {
-  "$1" --version | head -n 1 | tr -d '[:space:]'
+system_cert_bundle() {
+  local candidate
+  for candidate in /etc/ssl/cert.pem /private/etc/ssl/cert.pem; do
+    if [[ -f "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+python_runtime_version() {
+  "$1" -V 2>&1 | awk '{print $2}' | tr -d '[:space:]'
+}
+
+ytdlp_version() {
+  "$1" -m yt_dlp --version | head -n 1 | tr -d '[:space:]'
 }
 
 deno_version() {
   "$1" --version | awk 'NR==1 {print $2}' | tr -d '[:space:]'
 }
 
-make_component_archive() {
+download_file() {
+  local url="$1"
+  local destination="$2"
+  curl -L --fail --silent --show-error -o "$destination" "$url"
+}
+
+prepare_python_runtime() {
+  local archive_path="$1"
+  local destination_root="$2"
+
+  rm -rf "$destination_root"
+  mkdir -p "$destination_root"
+  tar -xzf "$archive_path" -C "$destination_root"
+
+  local python_bin="$destination_root/python/bin/python3"
+  [[ -x "$python_bin" ]] || {
+    echo "Error: portable Python runtime did not contain python/bin/python3" >&2
+    exit 1
+  }
+
+  portable_binary_audit "$python_bin"
+
+  local cert_bundle=""
+  cert_bundle="$(system_cert_bundle || true)"
+  if [[ -n "$cert_bundle" ]]; then
+    export SSL_CERT_FILE="$cert_bundle"
+    export REQUESTS_CA_BUNDLE="$cert_bundle"
+    export CURL_CA_BUNDLE="$cert_bundle"
+  fi
+
+  "$python_bin" -m pip install \
+    --disable-pip-version-check \
+    --no-python-version-warning \
+    --no-cache-dir \
+    --upgrade \
+    "${YTDLP_PACKAGE_SPEC:-$DEFAULT_YTDLP_PACKAGE_SPEC}" \
+    ${YTDLP_EXTRA_PACKAGES:-$DEFAULT_YTDLP_EXTRA_PACKAGES}
+
+  "$python_bin" -m yt_dlp --version >/dev/null
+}
+
+make_component_archive_from_directory() {
   local component_id="$1"
-  local binary_path="$2"
-  local version="$3"
-  local output_name="$4"
-  local stage_root="$5"
+  local source_dir="$2"
+  local output_name="$3"
+  local stage_root="$4"
 
   local component_dir="$stage_root/$component_id"
+  rm -rf "$component_dir"
+  mkdir -p "$component_dir"
+  ditto "$source_dir" "$component_dir/$(basename "$source_dir")"
+
+  local zip_path="$OUTPUT_DIR/$output_name"
+  rm -f "$zip_path"
+  ditto -c -k --keepParent --norsrc "$component_dir" "$zip_path"
+  echo "$zip_path"
+}
+
+make_component_archive_from_binary() {
+  local component_id="$1"
+  local binary_path="$2"
+  local output_name="$3"
+  local stage_root="$4"
+
+  local component_dir="$stage_root/$component_id"
+  rm -rf "$component_dir"
   mkdir -p "$component_dir"
   cp "$binary_path" "$component_dir/$component_id"
   chmod +x "$component_dir/$component_id"
@@ -128,29 +208,18 @@ make_component_archive() {
   echo "$zip_path"
 }
 
-[[ -x "$YTDLP_BINARY" ]] || { echo "Error: YTDLP_BINARY is not executable: $YTDLP_BINARY" >&2; exit 1; }
+require_var DENO_BINARY
+
 [[ -x "$DENO_BINARY" ]] || { echo "Error: DENO_BINARY is not executable: $DENO_BINARY" >&2; exit 1; }
-
-if is_python_wrapper "$YTDLP_BINARY"; then
-  echo "Error: YTDLP_BINARY points to a Python wrapper script. Use the standalone Mach-O binary." >&2
-  exit 1
-fi
-
-if ! is_macho_binary "$YTDLP_BINARY"; then
-  echo "Error: YTDLP_BINARY is not a standalone Mach-O binary." >&2
-  exit 1
-fi
-
 if ! is_macho_binary "$DENO_BINARY"; then
   echo "Error: DENO_BINARY is not a standalone Mach-O binary." >&2
   exit 1
 fi
-
-portable_binary_audit "$YTDLP_BINARY"
 portable_binary_audit "$DENO_BINARY"
 
-YTDLP_VERSION="$(yt_dlp_version "$YTDLP_BINARY")"
-DENO_VERSION="$(deno_version "$DENO_BINARY")"
+PYTHON_ARCHIVE_URL="${PYTHON_STANDALONE_URL:-$DEFAULT_PYTHON_STANDALONE_URL}"
+PYTHON_ARCHIVE_PATH="${PYTHON_STANDALONE_ARCHIVE:-}"
+YTDLP_PACKAGE_SPEC="${YTDLP_PACKAGE_SPEC:-$DEFAULT_YTDLP_PACKAGE_SPEC}"
 APP_VERSION="${APP_SHORT_VERSION:-0.0.0}"
 
 rm -rf "$OUTPUT_DIR"
@@ -159,11 +228,31 @@ mkdir -p "$OUTPUT_DIR"
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/backchannel-managed-support.XXXXXX")"
 trap 'rm -rf "$STAGE_DIR"' EXIT
 
-YTDLP_ASSET_NAME="backchannel-managed-ytdlp-macos-arm64-v${YTDLP_VERSION}.zip"
+if [[ -n "$PYTHON_ARCHIVE_PATH" ]]; then
+  [[ -f "$PYTHON_ARCHIVE_PATH" ]] || { echo "Error: PYTHON_STANDALONE_ARCHIVE not found: $PYTHON_ARCHIVE_PATH" >&2; exit 1; }
+  PYTHON_ARCHIVE="$PYTHON_ARCHIVE_PATH"
+else
+  PYTHON_ARCHIVE="$STAGE_DIR/python-build-standalone.tar.gz"
+  echo "Fetching portable Python runtime..."
+  download_file "$PYTHON_ARCHIVE_URL" "$PYTHON_ARCHIVE"
+fi
+
+PYTHON_RUNTIME_DIR="$STAGE_DIR/python-runtime"
+echo "Preparing managed Python runtime..."
+prepare_python_runtime "$PYTHON_ARCHIVE" "$PYTHON_RUNTIME_DIR"
+
+PYTHON_BIN="$PYTHON_RUNTIME_DIR/python/bin/python3"
+PYTHON_VERSION="$(python_runtime_version "$PYTHON_BIN")"
+PYTHON_VERSION_LABEL="Python ${PYTHON_VERSION}"
+YTDLP_VERSION="$(ytdlp_version "$PYTHON_BIN")"
+DENO_VERSION="$(deno_version "$DENO_BINARY")"
+
+YTDLP_COMPONENT_VERSION="py${PYTHON_VERSION}+yt${YTDLP_VERSION}"
+YTDLP_ASSET_NAME="backchannel-managed-ytdlp-runtime-macos-arm64-py${PYTHON_VERSION}-yt${YTDLP_VERSION}.zip"
 DENO_ASSET_NAME="backchannel-managed-deno-macos-arm64-v${DENO_VERSION}.zip"
 
-YTDLP_ZIP="$(make_component_archive "yt-dlp" "$YTDLP_BINARY" "$YTDLP_VERSION" "$YTDLP_ASSET_NAME" "$STAGE_DIR")"
-DENO_ZIP="$(make_component_archive "deno" "$DENO_BINARY" "$DENO_VERSION" "$DENO_ASSET_NAME" "$STAGE_DIR")"
+YTDLP_ZIP="$(make_component_archive_from_directory "yt-dlp" "$PYTHON_RUNTIME_DIR/python" "$YTDLP_ASSET_NAME" "$STAGE_DIR")"
+DENO_ZIP="$(make_component_archive_from_binary "deno" "$DENO_BINARY" "$DENO_ASSET_NAME" "$STAGE_DIR")"
 
 YTDLP_SHA="$(sha256_file "$YTDLP_ZIP")"
 DENO_SHA="$(sha256_file "$DENO_ZIP")"
@@ -174,16 +263,19 @@ echo "$DENO_SHA  $DENO_ZIP" > "${DENO_ZIP}.sha256"
 MANIFEST_PATH="$OUTPUT_DIR/backchannel-managed-support.json"
 cat > "$MANIFEST_PATH" <<MANIFEST
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "generatedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "appVersion": "${APP_VERSION}",
   "components": [
     {
       "id": "yt-dlp",
-      "version": "${YTDLP_VERSION}",
+      "version": "${YTDLP_COMPONENT_VERSION}",
       "assetName": "${YTDLP_ASSET_NAME}",
       "sha256": "${YTDLP_SHA}",
-      "executableRelativePath": "yt-dlp/yt-dlp",
+      "executableRelativePath": "yt-dlp/python/bin/python3",
+      "argumentsPrefix": ["-m", "yt_dlp"],
+      "toolVersion": "${YTDLP_VERSION}",
+      "runtimeVersion": "${PYTHON_VERSION_LABEL}",
       "minimumAppVersion": "${APP_VERSION}"
     },
     {
@@ -192,6 +284,9 @@ cat > "$MANIFEST_PATH" <<MANIFEST
       "assetName": "${DENO_ASSET_NAME}",
       "sha256": "${DENO_SHA}",
       "executableRelativePath": "deno/deno",
+      "argumentsPrefix": [],
+      "toolVersion": "${DENO_VERSION}",
+      "runtimeVersion": null,
       "minimumAppVersion": "${APP_VERSION}"
     }
   ]

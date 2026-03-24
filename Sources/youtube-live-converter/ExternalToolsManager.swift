@@ -19,6 +19,7 @@ struct ManagedComponentStatus: Identifiable {
     let kind: ManagedComponentKind
     let installedVersion: String?
     let availableVersion: String?
+    let runtimeVersion: String?
     let executableURL: URL?
     let health: ManagedComponentHealth
     let message: String
@@ -248,19 +249,35 @@ final class ExternalToolsManager: ObservableObject {
         let record = store.record(for: kind)
         let currentExecutable = ExternalSupportPaths.managedCurrentExecutable(kind)
         let payloadExists = ExternalToolResolver.hasExecutablePayload(currentExecutable)
+        let installedComponent = ExternalToolResolver.loadManagedInstalledComponent(kind)
+        let inferredRelativePath = currentExecutable.standardizedFileURL.path
+            .replacingOccurrences(of: ExternalSupportPaths.managedCurrentLink(kind).standardizedFileURL.path + "/", with: "")
+        let managedTool = ResolvedExternalTool(
+            kind: kind.toolKind,
+            executableURL: currentExecutable,
+            argumentsPrefix: installedComponent?.argumentsPrefix ?? kind.defaultInvocationPrefix(for: installedComponent?.executableRelativePath ?? inferredRelativePath),
+            source: .managed,
+            version: installedComponent?.toolVersion,
+            runtimeVersion: installedComponent?.runtimeVersion
+        )
         let executableExists = payloadExists && ExternalToolResolver.verifyExecutable(
-            currentExecutable,
-            versionArguments: kind.toolKind.versionArguments,
+            managedTool,
             timeout: kind.toolKind.validationTimeout
         )
         let bundledFallback = bundledFallbackStatus?.path ?? ExternalSupportPaths.bundledExecutable(for: kind.toolKind, resourceURL: resourceURL)
-        let bundledFallbackExists = bundledFallbackStatus?.payloadExists ?? bundledFallback.map {
-            ExternalToolResolver.hasExecutablePayload($0)
-        } ?? false
-        let availableVersion = manifest?.components.first(where: { $0.componentKind == kind })?.version
+        let bundledFallbackExists = kind == .ytDlp
+            ? false
+            : bundledFallbackStatus?.payloadExists ?? bundledFallback.map {
+                ExternalToolResolver.hasExecutablePayload($0)
+            } ?? false
+        let availableComponent = manifest?.components.first(where: { $0.componentKind == kind })
+        let availableVersion = availableComponent?.toolVersion ?? availableComponent?.version
+        let runtimeVersion = installedComponent?.runtimeVersion ?? availableComponent?.runtimeVersion
 
         if executableExists {
-            let version = ExternalToolResolver.detectedVersion(for: kind.toolKind, url: currentExecutable) ?? record.currentVersion
+            let version = installedComponent?.toolVersion
+                ?? ExternalToolResolver.detectedVersion(for: managedTool)
+                ?? record.currentVersion
             let canRollback = record.previousVersion.flatMap { previous in
                 let path = ExternalSupportPaths.managedVersionDirectory(kind, version: previous).path
                 return FileManager.default.fileExists(atPath: path) ? previous : nil
@@ -270,6 +287,7 @@ final class ExternalToolsManager: ObservableObject {
                 kind: kind,
                 installedVersion: version,
                 availableVersion: availableVersion,
+                runtimeVersion: runtimeVersion,
                 executableURL: currentExecutable,
                 health: .ready,
                 message: "Installed and ready",
@@ -283,13 +301,14 @@ final class ExternalToolsManager: ObservableObject {
                 let path = ExternalSupportPaths.managedVersionDirectory(kind, version: previous).path
                 return FileManager.default.fileExists(atPath: path) ? previous : nil
             } != nil
-            let installedVersion = record.currentVersion ?? availableVersion
+            let installedVersion = installedComponent?.toolVersion ?? record.currentVersion ?? availableVersion
 
             if bundledFallbackExists {
                 return ManagedComponentStatus(
                     kind: kind,
                     installedVersion: installedVersion,
                     availableVersion: availableVersion,
+                    runtimeVersion: runtimeVersion,
                     executableURL: currentExecutable,
                     health: .bundledFallback,
                     message: "Installed, using bundled fallback",
@@ -302,6 +321,7 @@ final class ExternalToolsManager: ObservableObject {
                 kind: kind,
                 installedVersion: installedVersion,
                 availableVersion: availableVersion,
+                runtimeVersion: runtimeVersion,
                 executableURL: currentExecutable,
                 health: .error,
                 message: "Installed but could not be validated",
@@ -315,6 +335,7 @@ final class ExternalToolsManager: ObservableObject {
                 kind: kind,
                 installedVersion: nil,
                 availableVersion: availableVersion,
+                runtimeVersion: runtimeVersion,
                 executableURL: bundledFallback,
                 health: .bundledFallback,
                 message: "Using bundled fallback",
@@ -328,6 +349,7 @@ final class ExternalToolsManager: ObservableObject {
                 kind: kind,
                 installedVersion: nil,
                 availableVersion: availableVersion,
+                runtimeVersion: runtimeVersion,
                 executableURL: nil,
                 health: .error,
                 message: "Needs repair",
@@ -340,6 +362,7 @@ final class ExternalToolsManager: ObservableObject {
             kind: kind,
             installedVersion: nil,
             availableVersion: availableVersion,
+            runtimeVersion: runtimeVersion,
             executableURL: nil,
             health: .missing,
             message: "Not installed",
@@ -349,7 +372,7 @@ final class ExternalToolsManager: ObservableObject {
     }
 
     nonisolated private static func fetchManifestAndAssets() async throws -> (manifest: ManagedSupportManifest, assetsByName: [String: GitHubReleaseAsset]) {
-        let release = try await fetchLatestRelease()
+        let release = try await fetchManagedSupportRelease()
         let assetsByName = Dictionary(uniqueKeysWithValues: release.assets.map { ($0.name, $0) })
 
         guard let manifestAsset = assetsByName[ExternalSupportConfiguration.managedSupportManifestAssetName],
@@ -364,8 +387,20 @@ final class ExternalToolsManager: ObservableObject {
         return (manifest, assetsByName)
     }
 
+    nonisolated private static func fetchManagedSupportRelease() async throws -> GitHubReleaseResponse {
+        do {
+            return try await fetchRelease(from: ExternalSupportConfiguration.managedSupportReleaseAPIURL)
+        } catch {
+            return try await fetchLatestRelease()
+        }
+    }
+
     nonisolated private static func fetchLatestRelease() async throws -> GitHubReleaseResponse {
-        var request = URLRequest(url: ExternalSupportConfiguration.latestReleaseAPIURL)
+        try await fetchRelease(from: ExternalSupportConfiguration.latestReleaseAPIURL)
+    }
+
+    nonisolated private static func fetchRelease(from url: URL) async throws -> GitHubReleaseResponse {
+        var request = URLRequest(url: url)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("BackChannel/1.0", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 8
@@ -414,8 +449,23 @@ final class ExternalToolsManager: ObservableObject {
             arguments: ["-x", "-k", archiveURL.path, extractedDirectory.path]
         )
 
-        let executableURL = extractedDirectory.appendingPathComponent(component.executableRelativePath)
+        let executableURL = try locateExtractedExecutable(
+            in: extractedDirectory,
+            relativePath: component.executableRelativePath,
+            fallbackRelativePaths: kind.legacyExecutableRelativePaths
+        )
         guard ExternalToolResolver.hasExecutablePayload(executableURL) else {
+            throw ExternalToolsManagerError.invalidPayload(kind.displayName)
+        }
+        let installedTool = ResolvedExternalTool(
+            kind: kind.toolKind,
+            executableURL: executableURL,
+            argumentsPrefix: component.argumentsPrefix ?? kind.defaultInvocationPrefix(for: component.executableRelativePath),
+            source: .managed,
+            version: component.toolVersion,
+            runtimeVersion: component.runtimeVersion
+        )
+        guard ExternalToolResolver.verifyExecutable(installedTool, timeout: kind.toolKind.validationTimeout) else {
             throw ExternalToolsManagerError.invalidPayload(kind.displayName)
         }
 
@@ -425,6 +475,9 @@ final class ExternalToolsManager: ObservableObject {
             try? FileManager.default.removeItem(at: targetVersionDirectory)
         }
         try FileManager.default.moveItem(at: extractedDirectory, to: targetVersionDirectory)
+        let metadataURL = ExternalSupportPaths.managedVersionMetadataURL(kind, version: component.version)
+        let metadataData = try JSONEncoder().encode(component)
+        try metadataData.write(to: metadataURL, options: .atomic)
 
         var store = ExternalToolResolver.loadManagedStateStore()
         var record = store.record(for: kind)
@@ -436,6 +489,34 @@ final class ExternalToolsManager: ObservableObject {
         record.lastError = nil
         updateStore(&store, with: record)
         try ExternalToolResolver.saveManagedStateStore(store)
+    }
+
+    nonisolated private static func locateExtractedExecutable(
+        in extractedDirectory: URL,
+        relativePath: String,
+        fallbackRelativePaths: [String]
+    ) throws -> URL {
+        let candidatePaths = [relativePath] + fallbackRelativePaths
+        let directCandidates = candidatePaths.map { extractedDirectory.appendingPathComponent($0) }
+        if let match = directCandidates.first(where: { ExternalToolResolver.hasExecutablePayload($0) }) {
+            return match
+        }
+
+        let fileManager = FileManager.default
+        let topLevelEntries = (try? fileManager.contentsOfDirectory(
+            at: extractedDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+
+        if topLevelEntries.count == 1, let topLevel = topLevelEntries.first {
+            let nestedCandidates = candidatePaths.map { topLevel.appendingPathComponent($0) }
+            if let match = nestedCandidates.first(where: { ExternalToolResolver.hasExecutablePayload($0) }) {
+                return match
+            }
+        }
+
+        return extractedDirectory.appendingPathComponent(relativePath)
     }
 
     nonisolated private static func rollbackComponent(_ kind: ManagedComponentKind) throws {
@@ -548,7 +629,7 @@ enum ExternalToolsManagerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .manifestMissing:
-            return "Could not find managed support manifest in the latest release."
+            return "Could not find managed support manifest in the published support channel."
         case .componentMissing(let name):
             return "No managed support package was published for \(name)."
         case .assetMissing(let name):

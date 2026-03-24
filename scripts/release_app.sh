@@ -28,8 +28,6 @@ require_var() {
 require_var SIGNING_IDENTITY
 require_var TEAM_ID
 require_var NOTARY_KEYCHAIN_PROFILE
-require_var YTDLP_BINARY
-
 cleanup() {
   if [[ -n "${NOTARY_RESULT_FILE:-}" ]] && [[ -f "$NOTARY_RESULT_FILE" ]]; then
     rm -f "$NOTARY_RESULT_FILE"
@@ -46,7 +44,6 @@ fi
 
 echo "==> Building package"
 env \
-  YTDLP_BINARY="$YTDLP_BINARY" \
   FFMPEG_BINARY="${FFMPEG_BINARY:-}" \
   FFPROBE_BINARY="${FFPROBE_BINARY:-}" \
   DENO_BINARY="${DENO_BINARY:-}" \
@@ -65,7 +62,7 @@ find "$APP_PATH" -type f | while read -r f; do
   if file "$f" | grep -q "Mach-O"; then
     if [[ "$f" == */Contents/Resources/bin/deno ]]; then
       codesign --force --options runtime --timestamp --entitlements "$DENO_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$f"
-    elif [[ "$f" == */Contents/Resources/bin/yt-dlp ]] || [[ "$f" == */Contents/Resources/bin/ffmpeg ]] || [[ "$f" == */Contents/Resources/bin/ffprobe ]]; then
+    elif [[ "$f" == */Contents/Resources/bin/ffmpeg ]] || [[ "$f" == */Contents/Resources/bin/ffprobe ]]; then
       codesign --force --options runtime --timestamp --entitlements "$YTDLP_ENTITLEMENTS" --sign "$SIGNING_IDENTITY" "$f"
     else
       codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$f"

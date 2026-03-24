@@ -734,18 +734,7 @@ else
   echo "Or set APP_ICON_FILE=/absolute/path/icon.icon (or .png/.icns)."
 fi
 
-echo "Bundling yt-dlp, ffmpeg, and ffprobe..."
-YTDLP_PATH="${YTDLP_BINARY:-}"
-if [[ -z "$YTDLP_PATH" ]]; then
-  if [[ -x "$HOME/.local/bin/yt-dlp" ]]; then
-    YTDLP_PATH="$HOME/.local/bin/yt-dlp"
-  else
-    YTDLP_PATH="$(find_tool yt-dlp)" || {
-      echo "Error: yt-dlp not found. Set YTDLP_BINARY to a standalone yt-dlp macOS binary." >&2
-      exit 1
-    }
-  fi
-fi
+echo "Bundling ffmpeg and ffprobe..."
 
 FFMPEG_PATH="${FFMPEG_BINARY:-}"
 if [[ -z "$FFMPEG_PATH" ]]; then
@@ -768,10 +757,6 @@ if [[ -z "$FFPROBE_PATH" ]]; then
   }
 fi
 
-if [[ ! -x "$YTDLP_PATH" ]]; then
-  echo "Error: YTDLP_BINARY is not executable: $YTDLP_PATH" >&2
-  exit 1
-fi
 if [[ ! -x "$FFMPEG_PATH" ]]; then
   echo "Error: FFMPEG_BINARY is not executable: $FFMPEG_PATH" >&2
   exit 1
@@ -780,34 +765,12 @@ if [[ ! -x "$FFPROBE_PATH" ]]; then
   echo "Error: FFPROBE_BINARY is not executable: $FFPROBE_PATH" >&2
   exit 1
 fi
-if is_python_wrapper "$YTDLP_PATH"; then
-  if [[ -x "$HOME/.local/bin/yt-dlp" ]] && is_macho_binary "$HOME/.local/bin/yt-dlp"; then
-    echo "Detected Homebrew yt-dlp wrapper at: $YTDLP_PATH" >&2
-    echo "Using standalone yt-dlp binary at: $HOME/.local/bin/yt-dlp" >&2
-    YTDLP_PATH="$HOME/.local/bin/yt-dlp"
-  else
-    echo "Error: yt-dlp appears to be a Python wrapper script: $YTDLP_PATH" >&2
-    echo "Use a standalone yt-dlp binary (Mach-O) for portable distribution." >&2
-    echo "Install one with:" >&2
-    echo "  mkdir -p \"$HOME/.local/bin\" && curl -L \"https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos\" -o \"$HOME/.local/bin/yt-dlp\" && chmod +x \"$HOME/.local/bin/yt-dlp\"" >&2
-    echo "Or set YTDLP_BINARY=/absolute/path/to/yt-dlp and rerun package_app.sh." >&2
-    exit 1
-  fi
-fi
-
-if ! is_macho_binary "$YTDLP_PATH"; then
-  echo "Error: yt-dlp is not a standalone macOS binary (Mach-O): $YTDLP_PATH" >&2
-  echo "Use a standalone yt-dlp binary and set YTDLP_BINARY to its path." >&2
-  exit 1
-fi
-
 rm -f "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe" "$RES_BIN_DIR/deno"
 rm -rf "$RES_LIB_DIR"
-cp "$YTDLP_PATH" "$RES_BIN_DIR/yt-dlp"
 cp "$FFMPEG_PATH" "$RES_BIN_DIR/ffmpeg"
 cp "$FFPROBE_PATH" "$RES_BIN_DIR/ffprobe"
 bundle_roots=("$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe")
-chmod +x "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
+chmod +x "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 
 echo "Bundling ffmpeg/ffprobe shared libraries into app..."
 bundle_macho_dependencies "${bundle_roots[@]}"
@@ -823,7 +786,7 @@ fi
 normalize_bundled_library_install_names
 
 echo "Bundled:"
-echo "  yt-dlp: $YTDLP_PATH"
+echo "  yt-dlp: managed outside the app bundle"
 echo "  ffmpeg: $FFMPEG_PATH"
 echo "  ffprobe: $FFPROBE_PATH"
 echo "  deno: managed outside the app bundle"
@@ -832,7 +795,6 @@ echo "Signing app bundle..."
 sign_macho_tree_ad_hoc "$APP_DIR"
 codesign --verify --verbose=2 "$APP_DIR"
 codesign --verify --verbose=2 "$APP_BIN"
-codesign --verify --verbose=2 "$RES_BIN_DIR/yt-dlp"
 codesign --verify --verbose=2 "$RES_BIN_DIR/ffmpeg"
 codesign --verify --verbose=2 "$RES_BIN_DIR/ffprobe"
 
