@@ -24,7 +24,7 @@ struct UpdateAvailableSheet: View {
                     .foregroundStyle(.red)
             }
 
-            if updater.state == .downloading || updater.state == .installing || updater.state == .checking {
+            if updater.isBusy {
                 HStack(spacing: 10) {
                     ProgressView()
                     Text(updater.statusSummary)
@@ -44,16 +44,19 @@ struct UpdateAvailableSheet: View {
             }
 
             HStack {
-                Button("Not Now") {
-                    updater.shouldPresentUpdateSheet = false
+                if updater.state != .installing {
+                    Button(updater.isBusy ? "Close" : "Not Now") {
+                        updater.shouldPresentUpdateSheet = false
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(updater.state == .downloading)
                 }
-                .keyboardShortcut(.cancelAction)
 
                 if updater.state == .updateAvailable || updater.state == .readyToInstall {
                     Button("Skip This Version") {
                         updater.skipAvailableUpdate()
                     }
-                    .disabled(updater.state == .downloading || updater.state == .installing)
+                    .disabled(updater.isBusy)
                 }
 
                 Spacer()
@@ -70,7 +73,7 @@ struct UpdateAvailableSheet: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                } else {
+                } else if updater.state == .updateAvailable || (updater.state == .failed && updater.latestRelease != nil && updater.preparedUpdate == nil) {
                     Button("Download Update") {
                         Task {
                             await updater.downloadAndPrepareUpdate()
@@ -79,6 +82,10 @@ struct UpdateAvailableSheet: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(!updater.canDownloadUpdate)
                     .keyboardShortcut(.defaultAction)
+                } else if updater.state == .installing {
+                    Text("Back Channel will relaunch automatically.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -88,10 +95,18 @@ struct UpdateAvailableSheet: View {
 
     private var sheetTitle: String {
         switch updater.state {
+        case .checking:
+            return "Checking for Updates"
+        case .downloading:
+            return "Downloading Update"
+        case .installing:
+            return "Installing Update"
         case .readyToInstall:
             return "Update Ready to Install"
         case .upToDate:
             return "Back Channel is Up to Date"
+        case .failed:
+            return "Update Failed"
         default:
             return "Update Available"
         }
@@ -99,6 +114,12 @@ struct UpdateAvailableSheet: View {
 
     private var sheetSubtitle: String {
         switch updater.state {
+        case .installing:
+            return "The update has already been downloaded and verified. Back Channel will quit and reopen automatically."
+        case .downloading:
+            return "Back Channel is downloading and verifying the latest release from GitHub."
+        case .checking:
+            return "Back Channel is checking GitHub Releases for a newer version."
         case .readyToInstall:
             return updater.statusSummary
         case .upToDate:

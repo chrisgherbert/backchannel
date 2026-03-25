@@ -160,6 +160,15 @@ final class AppUpdater: ObservableObject {
         preparedUpdate != nil && state == .readyToInstall
     }
 
+    var isBusy: Bool {
+        switch state {
+        case .checking, .downloading, .installing:
+            return true
+        default:
+            return false
+        }
+    }
+
     var statusSummary: String {
         switch state {
         case .idle:
@@ -181,7 +190,7 @@ final class AppUpdater: ObservableObject {
             }
             return "Update is ready to install."
         case .installing:
-            return activityMessage.isEmpty ? "Installing update..." : activityMessage
+            return activityMessage.isEmpty ? "Back Channel is preparing to quit and relaunch." : activityMessage
         case .failed:
             return lastError.isEmpty ? "Update failed." : lastError
         }
@@ -277,7 +286,7 @@ final class AppUpdater: ObservableObject {
         do {
             try Self.launchInstaller(for: preparedUpdate.extractedAppURL, replacing: bundle.bundleURL)
             state = .installing
-            activityMessage = "Installing version \(preparedUpdate.release.version)..."
+            activityMessage = "Back Channel will quit and relaunch to finish installing version \(preparedUpdate.release.version)."
             NSApplication.shared.terminate(nil)
         } catch {
             lastError = error.localizedDescription

@@ -69,17 +69,19 @@ struct UpdatesSettingsPane: View {
                         }
                         .disabled(!updater.canCheckForUpdates)
 
-                        Button("Download Update") {
-                            Task {
-                                await updater.downloadAndPrepareUpdate()
+                        if updater.canInstallPreparedUpdate {
+                            Button("Install and Relaunch") {
+                                updater.installPreparedUpdate()
                             }
+                            .buttonStyle(.borderedProminent)
+                        } else if updater.state == .updateAvailable || (updater.state == .failed && updater.latestRelease != nil && updater.preparedUpdate == nil) {
+                            Button("Download Update") {
+                                Task {
+                                    await updater.downloadAndPrepareUpdate()
+                                }
+                            }
+                            .disabled(!updater.canDownloadUpdate)
                         }
-                        .disabled(!updater.canDownloadUpdate)
-
-                        Button("Install and Relaunch") {
-                            updater.installPreparedUpdate()
-                        }
-                        .disabled(!updater.canInstallPreparedUpdate)
 
                         Button("Open Release Page") {
                             updater.openReleasePage()
