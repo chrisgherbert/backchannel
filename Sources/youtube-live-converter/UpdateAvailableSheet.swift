@@ -32,6 +32,10 @@ struct UpdateAvailableSheet: View {
                 }
             }
 
+            Text(updater.manualInstallMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             if let release = updater.latestRelease, !release.notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 GroupBox("What’s New") {
                     ScrollView {
@@ -44,15 +48,13 @@ struct UpdateAvailableSheet: View {
             }
 
             HStack {
-                if updater.state != .installing {
-                    Button(updater.isBusy ? "Close" : "Not Now") {
-                        updater.shouldPresentUpdateSheet = false
-                    }
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(updater.state == .downloading)
+                Button(updater.isBusy ? "Close" : "Not Now") {
+                    updater.shouldPresentUpdateSheet = false
                 }
+                .keyboardShortcut(.cancelAction)
+                .disabled(updater.isBusy)
 
-                if updater.state == .updateAvailable || updater.state == .readyToInstall {
+                if updater.state == .updateAvailable {
                     Button("Skip This Version") {
                         updater.skipAvailableUpdate()
                     }
@@ -67,25 +69,13 @@ struct UpdateAvailableSheet: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                } else if updater.canInstallPreparedUpdate {
-                    Button("Install and Relaunch") {
-                        updater.installPreparedUpdate()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                } else if updater.state == .updateAvailable || (updater.state == .failed && updater.latestRelease != nil && updater.preparedUpdate == nil) {
-                    Button("Download Update") {
-                        Task {
-                            await updater.downloadAndPrepareUpdate()
-                        }
+                } else if updater.latestRelease != nil {
+                    Button("Download in Browser") {
+                        updater.openLatestDownloadInBrowser()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!updater.canDownloadUpdate)
                     .keyboardShortcut(.defaultAction)
-                } else if updater.state == .installing {
-                    Text("Back Channel will relaunch automatically.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -97,12 +87,6 @@ struct UpdateAvailableSheet: View {
         switch updater.state {
         case .checking:
             return "Checking for Updates"
-        case .downloading:
-            return "Downloading Update"
-        case .installing:
-            return "Installing Update"
-        case .readyToInstall:
-            return "Update Ready to Install"
         case .upToDate:
             return "Back Channel is Up to Date"
         case .failed:
@@ -114,14 +98,8 @@ struct UpdateAvailableSheet: View {
 
     private var sheetSubtitle: String {
         switch updater.state {
-        case .installing:
-            return "The update has already been downloaded and verified. Back Channel will quit and reopen automatically."
-        case .downloading:
-            return "Back Channel is downloading and verifying the latest release from GitHub."
         case .checking:
             return "Back Channel is checking GitHub Releases for a newer version."
-        case .readyToInstall:
-            return updater.statusSummary
         case .upToDate:
             return updater.statusSummary
         default:

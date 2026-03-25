@@ -42,8 +42,8 @@ struct HelpView: View {
                 HelpSection(title: "Updates") {
                     Bullet("Back Channel can check GitHub Releases for newer stable versions.")
                     Bullet("Use Back Channel > Check for Updates to run a manual check at any time.")
-                    Bullet("When an update is available, Back Channel downloads the release zip, verifies its checksum, and stages it before install.")
-                    Bullet("Use Install and Relaunch to replace the current app in place after Back Channel quits.")
+                    Bullet("When an update is available, Back Channel can open the release download in your browser.")
+                    Bullet("Install updates manually by downloading the zip, opening it, and replacing the app in /Applications.")
                 }
 
                 HelpSection(title: "CLI Guide") {

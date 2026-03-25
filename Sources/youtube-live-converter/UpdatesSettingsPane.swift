@@ -43,6 +43,22 @@ struct UpdatesSettingsPane: View {
                         Spacer(minLength: 0)
                     }
 
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Install Method")
+                            .frame(width: 170, alignment: .leading)
+                        Text("Manual")
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                    }
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("How It Works")
+                            .frame(width: 170, alignment: .leading)
+                        Text(updater.manualInstallMessage)
+                            .foregroundStyle(.secondary)
+                        Spacer(minLength: 0)
+                    }
+
                     if let release = updater.latestRelease {
                         HStack {
                             Text("Latest Version")
@@ -69,16 +85,9 @@ struct UpdatesSettingsPane: View {
                         }
                         .disabled(!updater.canCheckForUpdates)
 
-                        if updater.canInstallPreparedUpdate {
-                            Button("Install and Relaunch") {
-                                updater.installPreparedUpdate()
-                            }
-                            .buttonStyle(.borderedProminent)
-                        } else if updater.state == .updateAvailable || (updater.state == .failed && updater.latestRelease != nil && updater.preparedUpdate == nil) {
-                            Button("Download Update") {
-                                Task {
-                                    await updater.downloadAndPrepareUpdate()
-                                }
+                        if updater.latestRelease != nil {
+                            Button("Download in Browser") {
+                                updater.openLatestDownloadInBrowser()
                             }
                             .disabled(!updater.canDownloadUpdate)
                         }
