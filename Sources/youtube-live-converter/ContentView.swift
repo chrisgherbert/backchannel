@@ -272,7 +272,7 @@ struct ContentView: View {
                         Text("Stream Copy").tag(OutputModeSelection.streamCopy)
                     }
                     .pickerStyle(.segmented)
-                    .frame(width: 210)
+                    .frame(width: 240)
                     .labelsHidden()
                     .disabled(pipeline.isRunning)
                 }
@@ -492,10 +492,10 @@ struct ContentView: View {
                     }
                 }
                 labeled("Server URL") {
-                    TextField("rtmp://server/app/", text: $config.rtmpServerURL)
+                    TextField("rtmp://server/app", text: $config.rtmpServerURL)
                         .textFieldStyle(.roundedBorder)
                 }
-                labeled("Stream Key") {
+                labeled("Path / Key (Optional)") {
                     TextField("streamName?key=abc123", text: $config.rtmpStreamKey)
                         .textFieldStyle(.roundedBorder)
                 }
@@ -518,7 +518,15 @@ struct ContentView: View {
 
     private var videoModeSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
-            if config.encodeMode == .transcode {
+            if usesSupervisedRTMPRemux {
+                Text("RTMP rebroadcast now uses a supervised Streamlink -> FFmpeg remux path. Buffer delay, disk staging, A/V sync offset, and audio processing settings are not used on this route.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if usesSupervisedRTMPTranscode {
+                Text("RTMP compatibility now uses Streamlink plus a single FFmpeg resync/transcode stage. Buffer delay and DVR staging are not used on this route, but the A/V sync and audio controls below still apply.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if config.encodeMode.usesCompatibilityPipeline {
                 labeledInline("Buffer Delay") {
                     Picker("", selection: $config.bufferSeconds) {
                         ForEach(bufferOptions, id: \.self) { seconds in
@@ -532,23 +540,24 @@ struct ContentView: View {
                 }
             }
 
-            if config.encodeMode == .transcode {
-                labeledInline("Buffer Storage") {
-                    HStack(spacing: 8) {
-                        Toggle("DVR disk staging", isOn: $config.useDiskBackedBuffer)
-                            .toggleStyle(.switch)
-                            .labelsHidden()
-                            .controlSize(.mini)
-                            .disabled(config.bufferSeconds <= 0)
-                        Text("DVR disk staging")
-                            .font(.caption2)
-                        Spacer()
+            if config.encodeMode.usesCompatibilityPipeline {
+                if !usesSupervisedRTMPTranscode {
+                    labeledInline("Buffer Storage") {
+                        HStack(spacing: 8) {
+                            Toggle("DVR disk staging", isOn: $config.useDiskBackedBuffer)
+                                .toggleStyle(.switch)
+                                .labelsHidden()
+                                .controlSize(.mini)
+                                .disabled(config.bufferSeconds <= 0)
+                            Text("DVR disk staging")
+                                .font(.caption2)
+                            Spacer()
+                        }
                     }
+                    Text("Stages normalized media into a local DVR playlist before publish.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                Text("Stages normalized media into a local DVR playlist before publish.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
 
                 labeledInline("A/V Sync Offset") {
                     Stepper(value: $config.avSyncOffsetMs, in: -2000...2000, step: 50) {
@@ -648,7 +657,7 @@ struct ContentView: View {
             statusRow("A/V Offset", pipeline.parsedStatus.avSyncState)
             statusRow("App Event", pipeline.parsedStatus.lastAppEvent, truncateTail: true)
             statusRow("FFmpeg Event", pipeline.parsedStatus.lastFFmpegEvent, truncateTail: true)
-            statusRow("yt-dlp Event", pipeline.parsedStatus.lastYtDlpEvent, truncateTail: true)
+            statusRow("Source Event", pipeline.parsedStatus.lastYtDlpEvent, truncateTail: true)
             statusRow("Last Error", pipeline.parsedStatus.lastError.isEmpty ? "None" : pipeline.parsedStatus.lastError, truncateTail: true)
         }
     }
@@ -848,7 +857,7 @@ struct ContentView: View {
 
     private var bufferStatusRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("Startup Buffer:")
+            Text(usesBufferedStartupDelay ? "Startup Buffer:" : "Startup Buffer Mode:")
                 .bold()
                 .frame(width: 112, alignment: .leading)
             Circle()
@@ -912,6 +921,12 @@ struct ContentView: View {
     private var transportContextText: String {
         switch config.outputType {
         case .rtmp:
+            if usesSupervisedRTMPRemux {
+                return "Editing RTMP endpoint settings for supervised Streamlink -> FFmpeg remux."
+            }
+            if usesSupervisedRTMPTranscode {
+                return "Editing RTMP endpoint settings for supervised Streamlink -> FFmpeg resync/transcode."
+            }
             return "Editing RTMP endpoint settings."
         case .hls:
             return "Editing HLS playlist destination settings."
@@ -919,11 +934,19 @@ struct ContentView: View {
     }
 
     private var videoModeContextText: String {
+        if usesSupervisedRTMPRemux {
+            return "Editing supervised RTMP remux settings."
+        }
+        if usesSupervisedRTMPTranscode {
+            return "Editing supervised RTMP resync/transcode settings."
+        }
         switch config.encodeMode {
         case .transcode:
             return "Editing compatible DVR-to-live output settings."
         case .copy:
             return "Editing stream copy settings."
+        case .experimentalDirectRTMP:
+            return "Editing compatible DVR-to-live output settings."
         }
     }
 
@@ -955,11 +978,28 @@ struct ContentView: View {
         config.resolvedOutputTarget()
     }
 
+    private var usesSupervisedRTMPRemux: Bool {
+        config.outputType == .rtmp && config.encodeMode == .copy
+    }
+
+    private var usesSupervisedRTMPTranscode: Bool {
+        config.outputType == .rtmp && config.encodeMode == .transcode
+    }
+
     private var outputValidationMessage: String? {
+        if config.encodeMode.requiresRTMPOutput && config.outputType != .rtmp {
+            return "Experimental Direct RTMP currently supports RTMP output only."
+        }
         if config.outputType == .hls {
             return resolvedTarget.isEmpty ? "HLS output path is required." : nil
         }
-        return resolvedTarget.isEmpty ? "RTMP destination requires server + key (or full URL)." : nil
+        if resolvedTarget.isEmpty {
+            return "RTMP destination requires a server/app target or full URL."
+        }
+        if config.encodeMode == .experimentalDirectRTMP {
+            return DirectTSRTMPPublisher.outputTargetValidationMessage(for: resolvedTarget)
+        }
+        return nil
     }
 
     private var liveSourceValidationMessage: String? {
@@ -1030,16 +1070,17 @@ struct ContentView: View {
 
     private var shouldShowBufferProgress: Bool {
         guard pipeline.isRunning else { return false }
+        guard usesBufferedStartupDelay else { return false }
         let state = pipeline.parsedStatus.bufferState
-        if state.hasPrefix("Off") || state == "Stopped" {
+        if state.hasPrefix("Off") || state.hasPrefix("Not used") || state == "Stopped" {
             return false
         }
-        return config.encodeMode == .transcode
+        return config.encodeMode.usesCompatibilityPipeline
     }
 
     private var bufferStatusColor: Color {
         let state = pipeline.parsedStatus.bufferState.lowercased()
-        if state.hasPrefix("off") || state == "stopped" {
+        if state.hasPrefix("off") || state.hasPrefix("not used") || state == "stopped" {
             return .secondary
         }
         if state.contains("exhausted") {
@@ -1121,7 +1162,7 @@ struct ContentView: View {
 
     private var bufferProgressText: String {
         let percent = Int((pipeline.parsedStatus.bufferProgress * 100).rounded())
-        if config.encodeMode == .transcode && config.bufferSeconds > 0 {
+        if usesBufferedStartupDelay {
             return "Buffer \(percent)% · \(formattedStagedBufferSeconds)"
         }
         return "Buffer \(percent)%"
@@ -1129,7 +1170,7 @@ struct ContentView: View {
 
     private var bufferChipText: String? {
         guard pipeline.isRunning else { return nil }
-        guard config.encodeMode == .transcode && config.bufferSeconds > 0 else {
+        guard usesBufferedStartupDelay else {
             return nil
         }
         let state = pipeline.parsedStatus.bufferState.lowercased()
@@ -1140,6 +1181,7 @@ struct ContentView: View {
     }
 
     private var bufferChipTone: StatusTone {
+        guard usesBufferedStartupDelay else { return .neutral }
         let state = pipeline.parsedStatus.bufferState.lowercased()
         if state.contains("exhausted") {
             return .critical
@@ -1164,6 +1206,13 @@ struct ContentView: View {
             return "\(Int(seconds.rounded()))s"
         }
         return String(format: "%.1fs", seconds)
+    }
+
+    private var usesBufferedStartupDelay: Bool {
+        config.encodeMode.usesCompatibilityPipeline &&
+            config.bufferSeconds > 0 &&
+            !usesSupervisedRTMPRemux &&
+            !usesSupervisedRTMPTranscode
     }
 
     private func loadInfo() {
@@ -1240,7 +1289,14 @@ struct ContentView: View {
     }
 
     private var selectedOutputMode: OutputModeSelection {
-        config.encodeMode == .transcode ? .highCompatibility : .streamCopy
+        switch config.encodeMode {
+        case .copy:
+            return .streamCopy
+        case .experimentalDirectRTMP:
+            return .highCompatibility
+        case .transcode:
+            return .highCompatibility
+        }
     }
 
     private func applyRtmpPresetSelection(_ id: String) {
@@ -1412,7 +1468,7 @@ struct ContentView: View {
         if raw == "Stream Copy (Paced)" {
             config.encodeMode = .copy
         } else if let mode = EncodeMode(rawValue: raw) {
-            config.encodeMode = mode
+            config.encodeMode = mode == .experimentalDirectRTMP ? .transcode : mode
         }
 
         if defaults.object(forKey: AppPreferenceKeys.defaultBufferSeconds) != nil {

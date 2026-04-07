@@ -1,6 +1,218 @@
 import Foundation
 import Darwin
 
+private actor DirectRTMPLoopWorker {
+    private weak var pipeline: StreamPipeline?
+    private let playlistURL: URL
+    private let config: StreamConfig
+    private let generation: Int
+
+    init(
+        pipeline: StreamPipeline,
+        playlistURL: URL,
+        config: StreamConfig,
+        generation: Int
+    ) {
+        self.pipeline = pipeline
+        self.playlistURL = playlistURL
+        self.config = config
+        self.generation = generation
+    }
+
+    func run() async {
+        guard let pipeline = self.pipeline else { return }
+        let targetDelay = max(0.0, Double(config.bufferSeconds))
+        var startedPublishing = false
+        var nextSegmentIndex = 0
+        var publishedMediaSeconds = 0.0
+        var pendingTrimAdvanceSeconds = 0.0
+        var publisher: DirectTSRTMPPublisher?
+        var prefetchedSegmentIndex: Int?
+        var prefetchedPreparedTask: Task<DirectTSRTMPPublisher.PreparedSegment, Error>?
+
+        while !Task.isCancelled {
+            let snapshot = await pipeline.directRTMPLoopSnapshot()
+            guard snapshot.shouldKeepRunning, snapshot.generation == generation else { break }
+
+            let segments = await Task.detached(priority: .utility) {
+                SegmentQueueSupport.readQueuedSegments(from: self.playlistURL)
+            }.value
+            if nextSegmentIndex > segments.count {
+                nextSegmentIndex = segments.count
+            }
+
+            if let currentPrefetchedSegmentIndex = prefetchedSegmentIndex,
+               (currentPrefetchedSegmentIndex < nextSegmentIndex || currentPrefetchedSegmentIndex >= segments.count) {
+                prefetchedPreparedTask?.cancel()
+                prefetchedPreparedTask = nil
+                prefetchedSegmentIndex = nil
+            }
+
+            let publishAgeSeconds = snapshot.publishAgeSeconds ?? 0
+            let shouldDeferPostStartTrim = publishAgeSeconds < StreamPipeline.directRTMPTrimWarmupDelaySeconds
+            let isWarmupTrimWindow = publishAgeSeconds < StreamPipeline.directRTMPTrimWarmupDurationSeconds
+            let activeTrimHeadroom = isWarmupTrimWindow
+                ? StreamPipeline.directRTMPWarmupTrimHeadroomSeconds
+                : StreamPipeline.directRTMPQueueTrimHeadroomSeconds
+            let activeTrimResume = isWarmupTrimWindow
+                ? StreamPipeline.directRTMPWarmupTrimResumeSeconds
+                : StreamPipeline.directRTMPQueueTrimResumeSeconds
+
+            if startedPublishing,
+               !shouldDeferPostStartTrim,
+               pendingTrimAdvanceSeconds <= (StreamPipeline.directRTMPTrimAdvanceStepSeconds * 0.5) {
+                let trimResult = await pipeline.directRTMPTrimQueuedBacklog(
+                    segments: segments,
+                    nextSegmentIndex: nextSegmentIndex,
+                    targetDelay: targetDelay,
+                    headroomSeconds: activeTrimHeadroom,
+                    resumeSeconds: activeTrimResume
+                )
+                nextSegmentIndex = trimResult.nextSegmentIndex
+                let advanceDuration = trimResult.droppedDuration * StreamPipeline.directRTMPTrimAdvanceFactor
+                if advanceDuration > 0 {
+                    pendingTrimAdvanceSeconds += advanceDuration
+                    prefetchedPreparedTask?.cancel()
+                    prefetchedPreparedTask = nil
+                    prefetchedSegmentIndex = nil
+                }
+            }
+
+            let queuedSegments = segments.suffix(from: nextSegmentIndex)
+            let queuedDuration = SegmentQueueSupport.queuedDuration(for: queuedSegments)
+            await pipeline.directRTMPUpdateBufferState(
+                config: config,
+                availableSeconds: queuedDuration,
+                targetDelay: targetDelay,
+                publishingStarted: startedPublishing
+            )
+
+            if !startedPublishing {
+                nextSegmentIndex = await pipeline.directRTMPTrimStartupBacklog(
+                    segments: segments,
+                    nextSegmentIndex: nextSegmentIndex,
+                    targetDelay: targetDelay
+                )
+                let startupQueuedSegments = segments.suffix(from: nextSegmentIndex)
+                let startupQueuedDuration = SegmentQueueSupport.queuedDuration(for: startupQueuedSegments)
+                let shouldStart = await pipeline.directRTMPShouldStartPublishing(
+                    queuedDuration: startupQueuedDuration,
+                    targetDelay: targetDelay
+                )
+                if shouldStart, nextSegmentIndex < segments.count {
+                    do {
+                        let newPublisher = try DirectTSRTMPPublisher(outputTarget: config.outputTarget)
+                        try await newPublisher.connectAndPublish()
+                        publisher = newPublisher
+                        await pipeline.directRTMPHandlePublisherStarted(newPublisher)
+                        startedPublishing = true
+                    } catch {
+                        prefetchedPreparedTask?.cancel()
+                        await pipeline.directRTMPHandlePublisherStartFailure(error, generation: generation)
+                        return
+                    }
+                }
+            }
+
+            if startedPublishing, nextSegmentIndex < segments.count, let publisher {
+                let segment = segments[nextSegmentIndex]
+                do {
+                    if pendingTrimAdvanceSeconds > 0 {
+                        let appliedAdvance = min(
+                            pendingTrimAdvanceSeconds,
+                            StreamPipeline.directRTMPTrimAdvanceStepSeconds
+                        )
+                        pendingTrimAdvanceSeconds -= appliedAdvance
+                        await publisher.advancePlayoutSchedule(
+                            by: appliedAdvance * StreamPipeline.directRTMPTrimScheduleAdvanceFactor
+                        )
+                        Task { @MainActor [weak pipeline] in
+                            pipeline?.directRTMPLogTimelineAdvance(seconds: appliedAdvance)
+                        }
+                    }
+
+                    let prepareStartedAt = Date()
+                    let prepared: DirectTSRTMPPublisher.PreparedSegment
+                    if prefetchedSegmentIndex == nextSegmentIndex, let currentPrefetchedPreparedTask = prefetchedPreparedTask {
+                        prepared = try await currentPrefetchedPreparedTask.value
+                        prefetchedPreparedTask = nil
+                        prefetchedSegmentIndex = nil
+                    } else {
+                        prepared = try await DirectTSRTMPPublisher.prepareSegmentOffline(
+                            segment,
+                            scheduledMediaStartSeconds: publishedMediaSeconds
+                        )
+                    }
+                    let prepareElapsed = Date().timeIntervalSince(prepareStartedAt)
+
+                    let nextPrepareIndex = nextSegmentIndex + 1
+                    if nextPrepareIndex < segments.count && pendingTrimAdvanceSeconds <= 0 {
+                        let nextSegment = segments[nextPrepareIndex]
+                        let nextMediaStartSeconds = publishedMediaSeconds + prepared.duration
+                        prefetchedSegmentIndex = nextPrepareIndex
+                        prefetchedPreparedTask = Task {
+                            try await DirectTSRTMPPublisher.prepareSegmentOffline(
+                                nextSegment,
+                                scheduledMediaStartSeconds: nextMediaStartSeconds
+                            )
+                        }
+                    } else {
+                        prefetchedPreparedTask?.cancel()
+                        prefetchedPreparedTask = nil
+                        prefetchedSegmentIndex = nil
+                    }
+
+                    let publishStartedAt = Date()
+                    let publishResult = try await publisher.publishPreparedSegment(prepared)
+                    let publishElapsed = Date().timeIntervalSince(publishStartedAt)
+                    let transportMetrics = await publisher.currentTransportMetrics()
+                    let segmentDuration = publishResult.duration
+                    let sendMetrics = publishResult.sendMetrics
+                    Task { @MainActor [weak pipeline] in
+                        pipeline?.directRTMPLogPublishedSegment(
+                            segment: segment,
+                            prepared: prepared,
+                            prepareElapsed: prepareElapsed,
+                            publishElapsed: publishElapsed,
+                            sendMetrics: sendMetrics,
+                            transportMetrics: transportMetrics
+                        )
+                    }
+                    publishedMediaSeconds += segmentDuration
+                    nextSegmentIndex += 1
+                    continue
+                } catch {
+                    prefetchedPreparedTask?.cancel()
+                    await pipeline.directRTMPHandlePublisherFailure(
+                        publisher,
+                        error: error,
+                        generation: generation
+                    )
+                    return
+                }
+            }
+
+            let acquisitionEnded = !snapshot.ytDlpRunning && !snapshot.normalizerRunning
+            if startedPublishing && acquisitionEnded && nextSegmentIndex >= segments.count {
+                prefetchedPreparedTask?.cancel()
+                await publisher?.close()
+                if let publisher {
+                    await pipeline.directRTMPClearPublisherIfCurrent(publisher)
+                }
+                return
+            }
+
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        prefetchedPreparedTask?.cancel()
+        await publisher?.close()
+        if let publisher {
+            await pipeline.directRTMPClearPublisherIfCurrent(publisher)
+        }
+    }
+}
+
 @MainActor
 final class StreamPipeline: ObservableObject {
     @Published private(set) var isRunning = false
@@ -18,6 +230,7 @@ final class StreamPipeline: ObservableObject {
     private var ytDlpErrorPipe: Pipe?
     private var ffmpegErrorPipe: Pipe?
     private var normalizerErrorPipe: Pipe?
+    private var publisherInputPipe: Pipe?
     private var dvrBufferMonitorTask: Task<Void, Never>?
     private var outputFreezeMonitorTask: Task<Void, Never>?
     private var diagnosticHeartbeatTask: Task<Void, Never>?
@@ -25,7 +238,12 @@ final class StreamPipeline: ObservableObject {
     private var currentConfig: StreamConfig?
     private var dvrSessionDirectory: URL?
     private var dvrPlaylistURL: URL?
+    private var dvrPlayoutPlaylistURL: URL?
     private var dvrSegmentPattern: String?
+    private var segmentStreamBridge: LocalTCPPublisherBridge?
+    private var segmentHTTPServer: LocalHTTPPlayoutServer?
+    private var segmentHaishinPublisher: HaishinRTMPPublisher?
+    private var segmentDirectRTMPPublisher: DirectTSRTMPPublisher?
 
     private var shouldKeepRunning = false
     private var restartScheduled = false
@@ -89,10 +307,51 @@ final class StreamPipeline: ObservableObject {
     private var catchUpExpiresAt = Date.distantPast
     private var shouldResumeAfterSystemWake = false
     private var lastCliStatusLine = ""
+    private enum QueuePublisherMode {
+        case disabled
+        case stdin
+        case playlist
+        case tcpStream
+        case tcpMeasuredStream
+        case tcpMeasuredTranscode
+        case httpPlaylist
+        case haishinRTMP
+        case directRTMP
+
+        var isEnabled: Bool {
+            self != .disabled
+        }
+    }
+
+    private var queuePublisherMode: QueuePublisherMode = .disabled
+    private var queuePublisherPrototypeEnabled: Bool {
+        queuePublisherMode.isEnabled
+    }
+
+    fileprivate struct DirectRTMPLoopSnapshot: Sendable {
+        let shouldKeepRunning: Bool
+        let generation: Int
+        let ytDlpRunning: Bool
+        let normalizerRunning: Bool
+        let publishAgeSeconds: Double?
+    }
+
+    fileprivate struct DirectRTMPTrimResult: Sendable {
+        let nextSegmentIndex: Int
+        let droppedDuration: Double
+    }
 
     func start(config: StreamConfig) {
         guard !config.sourceURL.isEmpty, !config.outputTarget.isEmpty else {
             appendLog("[app] Source URL and output target are required.")
+            return
+        }
+        if config.encodeMode == .experimentalDirectRTMP,
+           let validationMessage = DirectTSRTMPPublisher.outputTargetValidationMessage(for: config.outputTarget) {
+            appendLog("[app] \(validationMessage)")
+            parsedStatus.lastError = validationMessage
+            parsedStatus.outputState = "Invalid Output"
+            status = "Invalid Output"
             return
         }
         let requestID = startRequestID + 1
@@ -191,7 +450,10 @@ final class StreamPipeline: ObservableObject {
         cleanupDvrSessionFiles()
         dvrSessionDirectory = nil
         dvrPlaylistURL = nil
+        dvrPlayoutPlaylistURL = nil
         dvrSegmentPattern = nil
+        queuePublisherMode = .disabled
+        segmentHTTPServer = nil
         if cliLogMirroringEnabled {
             emitCliStatus(force: true)
             fputs("[cli] Session stopped.\n", stdout)
@@ -239,7 +501,9 @@ final class StreamPipeline: ObservableObject {
         cleanupDvrSessionFiles()
         dvrSessionDirectory = nil
         dvrPlaylistURL = nil
+        dvrPlayoutPlaylistURL = nil
         dvrSegmentPattern = nil
+        segmentHTTPServer = nil
         ytDlpErrorPipe?.fileHandleForReading.readabilityHandler = nil
         ffmpegErrorPipe?.fileHandleForReading.readabilityHandler = nil
         normalizerErrorPipe?.fileHandleForReading.readabilityHandler = nil
@@ -472,55 +736,86 @@ final class StreamPipeline: ObservableObject {
         generation += 1
         let currentGeneration = generation
 
-        let ytDlp = Process()
         guard let paths = toolPaths else {
             appendLog("[app] Tool paths are unavailable.")
             status = "Missing Tools"
             return
         }
 
-        ytDlp.executableURL = paths.ytDlp.executableURL
-        let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
-        let ytDlpWorkDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("youtube-live-converter", isDirectory: true)
-        do {
-            try FileManager.default.createDirectory(
-                at: ytDlpWorkDir,
-                withIntermediateDirectories: true
-            )
-            ytDlp.currentDirectoryURL = ytDlpWorkDir
-        } catch {
-            appendLog("[app] Failed to create yt-dlp temp directory: \(error.localizedDescription)")
-        }
+        let usesStreamlinkSupervisor = usesStreamlinkSupervisorPipeline(for: config)
+        let usesStreamlinkRemux = usesStreamlinkSupervisorRemuxPipeline(for: config)
+        let usesStreamlinkTranscode = usesStreamlinkSupervisorTranscodePipeline(for: config)
+        let sourceProcess = Process()
+        let sourceLabel = usesStreamlinkSupervisor ? "streamlink" : "yt-dlp"
+        let sourceToolDescription: String
 
-        var ytDlpArguments = ["--no-part", "--no-progress"]
-        if let deno = paths.deno {
-            ytDlpArguments += ["--js-runtimes", "deno:\(deno.path)"]
+        let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
+        if usesStreamlinkSupervisor {
+            guard let streamlink = paths.streamlink else {
+                appendLog("[app] Streamlink is required for RTMP rebroadcast. Update managed support in Settings > Tools.")
+                parsedStatus.lastError = "Streamlink runtime missing"
+                parsedStatus.sourceState = "Missing Streamlink"
+                parsedStatus.outputState = "Stopped"
+                status = "Missing Tools"
+                return
+            }
+            sourceProcess.executableURL = streamlink.executableURL
+            sourceProcess.arguments = streamlink.arguments(appending: [
+                "--stdout",
+                "--hls-live-restart",
+                "--stream-segment-threads", "3",
+                config.sourceURL,
+                "best"
+            ])
+            sourceProcess.environment = paths.environment
+            sourceToolDescription = streamlink.launchDescription
+        } else {
+            sourceProcess.executableURL = paths.ytDlp.executableURL
+            let ytDlpWorkDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("youtube-live-converter", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(
+                    at: ytDlpWorkDir,
+                    withIntermediateDirectories: true
+                )
+                sourceProcess.currentDirectoryURL = ytDlpWorkDir
+            } catch {
+                appendLog("[app] Failed to create yt-dlp temp directory: \(error.localizedDescription)")
+            }
+
+            var ytDlpArguments = ["--no-part", "--no-progress"]
+            if let deno = paths.deno {
+                ytDlpArguments += ["--js-runtimes", "deno:\(deno.path)"]
+            }
+            ytDlpArguments += DownloadAuthenticationSettings.load().ytDLPArguments
+            ytDlpArguments += [
+                "--paths", "home:\(ytDlpWorkDir.path)",
+                "--paths", "temp:\(ytDlpWorkDir.path)",
+                "--ffmpeg-location",
+                ffmpegToolsDir,
+                "-o",
+                "-",
+                config.sourceURL
+            ]
+            sourceProcess.arguments = paths.ytDlp.arguments(appending: ytDlpArguments)
+            sourceProcess.environment = paths.environment
+            sourceToolDescription = paths.ytDlp.launchDescription
         }
-        ytDlpArguments += DownloadAuthenticationSettings.load().ytDLPArguments
-        ytDlpArguments += [
-            "--paths", "home:\(ytDlpWorkDir.path)",
-            "--paths", "temp:\(ytDlpWorkDir.path)",
-            "--ffmpeg-location",
-            ffmpegToolsDir,
-            "-o",
-            "-",
-            config.sourceURL
-        ]
-        ytDlp.arguments = paths.ytDlp.arguments(appending: ytDlpArguments)
-        ytDlp.environment = paths.environment
 
         let mediaPipe = Pipe()
         // Always capture stderr to keep process IO drained and telemetry behavior consistent.
         let ytError = Pipe()
         let ffError = Pipe()
-        let normalizerError = config.encodeMode == .transcode ? Pipe() : nil
-        let useDvrPipeline = config.encodeMode == .transcode
+        let useDvrPipeline = config.encodeMode.usesCompatibilityPipeline && !usesStreamlinkSupervisor
+        let normalizerError = useDvrPipeline ? Pipe() : nil
+        let queuePublisherMode = useDvrPipeline ? resolvedQueuePublisherMode(for: config) : .disabled
+        let useQueuePublisherPrototype = queuePublisherMode.isEnabled
         startupReprimeActive = false
         pendingReprimeAfterRestart = false
+        self.queuePublisherMode = queuePublisherMode
 
-        ytDlp.standardOutput = mediaPipe
-        ytDlp.standardError = ytError
+        sourceProcess.standardOutput = mediaPipe
+        sourceProcess.standardError = ytError
 
         ytDlpErrorPipe = ytError
         ffmpegErrorPipe = ffError
@@ -528,65 +823,141 @@ final class StreamPipeline: ObservableObject {
 
         resetPerLaunchState(config: config)
 
-        observe(pipe: ytError, source: "yt-dlp", generation: currentGeneration)
+        observe(pipe: ytError, source: sourceLabel, generation: currentGeneration)
         observe(pipe: ffError, source: "ffmpeg", generation: currentGeneration)
         if let normalizerError {
             observe(pipe: normalizerError, source: "ffmpeg-normalizer", generation: currentGeneration)
         }
 
-        ytDlp.terminationHandler = { [weak self] proc in
+        sourceProcess.terminationHandler = { [weak self] proc in
             Task { @MainActor in
                 self?.handleTermination(
                     generation: currentGeneration,
-                    source: "yt-dlp",
+                    source: sourceLabel,
                     status: proc.terminationStatus
                 )
             }
         }
 
         do {
-            let ffmpeg: Process
+            let ffmpeg: Process?
             var normalizer: Process?
-            let ffmpegInput: Pipe
+            var queuePublisherInput: Pipe?
             if useDvrPipeline {
                 let dvr = try makeDvrSessionDirectory()
                 dvrSessionDirectory = dvr.directory
                 dvrPlaylistURL = dvr.playlistURL
+                dvrPlayoutPlaylistURL = dvr.playoutPlaylistURL
                 dvrSegmentPattern = dvr.segmentPattern
-                ffmpegInput = Pipe()
                 let norm = makeDvrNormalizerProcess(
                     paths: paths,
                     config: config,
                     generation: currentGeneration,
                     normalizerError: normalizerError,
                     input: mediaPipe,
+                    useSegmentQueuePrototype: useQueuePublisherPrototype,
                     playlistURL: dvr.playlistURL,
                     segmentPattern: dvr.segmentPattern,
                     ffmpegToolsDir: ffmpegToolsDir
                 )
                 normalizer = norm
-                ffmpeg = makeDvrPublisherProcess(
-                    paths: paths,
-                    config: config,
-                    generation: currentGeneration,
-                    ffError: ffError,
-                    playlistURL: dvr.playlistURL,
-                    ffmpegToolsDir: ffmpegToolsDir
-                )
+                if useQueuePublisherPrototype {
+                    switch queuePublisherMode {
+                    case .stdin:
+                        let inputPipe = Pipe()
+                        publisherInputPipe = inputPipe
+                        queuePublisherInput = inputPipe
+                        ffmpeg = makeSegmentQueuePublisherProcess(
+                            paths: paths,
+                            config: config,
+                            generation: currentGeneration,
+                            ffError: ffError,
+                            input: inputPipe,
+                            ffmpegToolsDir: ffmpegToolsDir
+                        )
+                    case .playlist:
+                        ffmpeg = makeDvrPublisherProcess(
+                            paths: paths,
+                            config: config,
+                            generation: currentGeneration,
+                            ffError: ffError,
+                            playlistURL: dvr.playoutPlaylistURL,
+                            ffmpegToolsDir: ffmpegToolsDir,
+                            useRealtimePacingOverride: false,
+                            usePreciseReadRate: false
+                        )
+                    case .tcpStream, .tcpMeasuredStream, .tcpMeasuredTranscode:
+                        let streamBridge = try LocalTCPPublisherBridge()
+                        segmentStreamBridge = streamBridge
+                        ffmpeg = makeSegmentTCPPublisherProcess(
+                            paths: paths,
+                            config: config,
+                            generation: currentGeneration,
+                            ffError: ffError,
+                            inputURL: streamBridge.inputURL,
+                            ffmpegToolsDir: ffmpegToolsDir,
+                            transcodeOnPublish: queuePublisherMode == .tcpMeasuredTranscode
+                        )
+                    case .httpPlaylist:
+                        let httpServer = try LocalHTTPPlayoutServer(
+                            baseDirectory: dvr.directory,
+                            playlistURL: dvr.playoutPlaylistURL
+                        )
+                        segmentHTTPServer = httpServer
+                        appendLog("[app] Experimental queue HTTP server listening at \(httpServer.playlistLocation).")
+                        ffmpeg = makeRemotePlaylistPublisherProcess(
+                            paths: paths,
+                            config: config,
+                            generation: currentGeneration,
+                            ffError: ffError,
+                            playlistLocation: httpServer.playlistLocation,
+                            ffmpegToolsDir: ffmpegToolsDir,
+                            useRealtimePacingOverride: false,
+                            usePreciseReadRate: false
+                        )
+                    case .haishinRTMP, .directRTMP:
+                        ffmpeg = nil
+                    case .disabled:
+                        ffmpeg = makeDvrPublisherProcess(
+                            paths: paths,
+                            config: config,
+                            generation: currentGeneration,
+                            ffError: ffError,
+                            playlistURL: dvr.playlistURL,
+                            ffmpegToolsDir: ffmpegToolsDir
+                        )
+                    }
+                } else {
+                    ffmpeg = makeDvrPublisherProcess(
+                        paths: paths,
+                        config: config,
+                        generation: currentGeneration,
+                        ffError: ffError,
+                        playlistURL: dvr.playlistURL,
+                        ffmpegToolsDir: ffmpegToolsDir
+                    )
+                }
             } else {
-                ffmpegInput = mediaPipe
                 ffmpeg = makeFFmpegProcess(
                     paths: paths,
                     config: config,
                     generation: currentGeneration,
                     ffError: ffError,
-                    input: ffmpegInput,
+                    input: mediaPipe,
                     ffmpegToolsDir: ffmpegToolsDir
                 )
             }
 
-            try ytDlp.run()
-            ytDlpProcess = ytDlp
+            if let normalizer {
+                try normalizer.run()
+                normalizerProcess = normalizer
+            }
+            if !useDvrPipeline, let ffmpeg {
+                try ffmpeg.run()
+                ffmpegProcess = ffmpeg
+            }
+            try sourceProcess.run()
+            ytDlpProcess = sourceProcess
 
             if useDvrPipeline {
                 isRunning = true
@@ -599,45 +970,157 @@ final class StreamPipeline: ObservableObject {
                 } else {
                     appendLog("[app] Output publish will begin as soon as staged playlist is ready.")
                 }
-                if let normalizer {
-                    try normalizer.run()
-                    normalizerProcess = normalizer
-                    appendLog("[app] Normalizer started. Writing staged DVR playlist.")
+                appendLog("[app] Normalizer started. Writing staged DVR playlist.")
+                if useQueuePublisherPrototype {
+                    switch queuePublisherMode {
+                    case .stdin:
+                        if let queuePublisherInput, let ffmpeg {
+                            appendLog("[app] Experimental queue publisher enabled (completed segments -> publisher stdin).")
+                            startSegmentQueueMonitorAndPublisher(
+                                publisher: ffmpeg,
+                                inputPipe: queuePublisherInput,
+                                config: config,
+                                generation: currentGeneration
+                            )
+                        }
+                    case .playlist:
+                        appendLog("[app] Experimental queue publisher enabled (completed segments -> app-managed playout playlist -> publisher).")
+                        if let ffmpeg {
+                            startSegmentPlaylistMonitorAndPublisher(
+                                publisher: ffmpeg,
+                                config: config,
+                                generation: currentGeneration
+                            )
+                        }
+                    case .httpPlaylist:
+                        appendLog("[app] Experimental queue publisher enabled (completed segments -> localhost HTTP playout -> publisher).")
+                        if let ffmpeg {
+                            startSegmentPlaylistMonitorAndPublisher(
+                                publisher: ffmpeg,
+                                config: config,
+                                generation: currentGeneration
+                            )
+                        }
+                    case .haishinRTMP:
+                        appendLog("[app] Experimental queue publisher enabled (completed segments -> app-owned RTMP publisher).")
+                        startSegmentHaishinMonitorAndPublisher(
+                            config: config,
+                            generation: currentGeneration
+                        )
+                    case .directRTMP:
+                        appendLog("[app] Experimental queue publisher enabled (completed TS segments -> direct RTMP remux publisher).")
+                        startSegmentDirectRTMPMonitorAndPublisher(
+                            config: config,
+                            generation: currentGeneration
+                        )
+                    case .tcpStream:
+                        if let streamBridge = segmentStreamBridge {
+                            appendLog("[app] Experimental queue publisher enabled (completed segments -> local TCP stream -> publisher).")
+                            if let ffmpeg {
+                                startSegmentTCPMonitorAndPublisher(
+                                    publisher: ffmpeg,
+                                    streamBridge: streamBridge,
+                                    config: config,
+                                    generation: currentGeneration
+                                )
+                            }
+                        }
+                    case .tcpMeasuredStream:
+                        if let streamBridge = segmentStreamBridge {
+                            appendLog("[app] Experimental queue publisher enabled (completed segments -> measured local TCP stream -> publisher).")
+                            if let ffmpeg {
+                                startSegmentTCPMonitorAndPublisher(
+                                    publisher: ffmpeg,
+                                    streamBridge: streamBridge,
+                                    config: config,
+                                    generation: currentGeneration
+                                )
+                            }
+                        }
+                    case .tcpMeasuredTranscode:
+                        if let streamBridge = segmentStreamBridge {
+                            appendLog("[app] Experimental queue publisher enabled (completed segments -> measured local TCP stream -> transcoding publisher).")
+                            if let ffmpeg {
+                                startSegmentTCPMonitorAndPublisher(
+                                    publisher: ffmpeg,
+                                    streamBridge: streamBridge,
+                                    config: config,
+                                    generation: currentGeneration
+                                )
+                            }
+                        }
+                    case .disabled:
+                        break
+                    }
+                } else {
+                    if let ffmpeg {
+                        startDvrBufferMonitorAndPublisher(
+                            publisher: ffmpeg,
+                            config: config,
+                            generation: currentGeneration
+                        )
+                    }
                 }
-                startDvrBufferMonitorAndPublisher(
-                    publisher: ffmpeg,
-                    config: config,
-                    generation: currentGeneration
-                )
             } else {
-                if let normalizer {
-                    try normalizer.run()
-                    normalizerProcess = normalizer
-                }
-                try ffmpeg.run()
-                ffmpegProcess = ffmpeg
                 lastPublishStartedAt = Date()
                 highSpeedSince = Date.distantPast
 
                 isRunning = true
                 status = "Running"
-                parsedStatus.sourceState = "Running"
-                parsedStatus.outputState = "Running"
-                appendLog("[app] Pipeline started.")
+                parsedStatus.sourceState = "Streaming Source"
+                parsedStatus.outputState = usesStreamlinkSupervisor ? "Publishing" : "Running"
+                if usesStreamlinkRemux {
+                    appendLog("[app] Pipeline started (Streamlink supervisor remux active).")
+                } else if usesStreamlinkTranscode {
+                    appendLog("[app] Pipeline started (Streamlink supervisor transcode active).")
+                } else {
+                    appendLog("[app] Pipeline started.")
+                }
             }
 
-            appendLog("[app] Using yt-dlp: \(paths.ytDlp.launchDescription)")
+            appendLog("[app] Using \(usesStreamlinkSupervisor ? "streamlink" : "yt-dlp"): \(sourceToolDescription)")
             appendLog("[app] Using ffmpeg: \(paths.ffmpeg.path)")
             appendLog("[app] Using ffprobe: \(paths.ffprobe.path)")
             appendSessionConfigurationLog(config)
+            if usesStreamlinkRemux {
+                appendLog("[app] RTMP rebroadcast uses Streamlink supervision and FFmpeg remuxing (-c copy). Buffering and A/V processing options are ignored on this path.")
+            } else if usesStreamlinkTranscode {
+                appendLog("[app] RTMP rebroadcast uses Streamlink supervision and a single FFmpeg resync/transcode stage. Buffering and disk staging are ignored on this path.")
+            }
             if isCatchUpActive() {
                 let remaining = max(1, Int(catchUpExpiresAt.timeIntervalSinceNow.rounded()))
                 appendLog("[app] Catch-up mode active (\(remaining)s remaining): realtime pacing (-re) disabled.")
             }
-            if config.encodeMode == .transcode {
+            if config.encodeMode.usesCompatibilityPipeline && !usesStreamlinkRemux {
                 let encoder = paths.supportsVideoToolboxH264 ? "h264_videotoolbox (hardware)" : "libx264 (software)"
-                appendLog("[app] High compatibility video encoder: \(encoder)")
-                appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged DVR -> publish).")
+                let modeLabel = config.encodeMode == .experimentalDirectRTMP ? "Experimental direct RTMP" : "High compatibility"
+                appendLog("[app] \(modeLabel) video encoder: \(encoder)")
+                if usesStreamlinkTranscode {
+                    appendLog("[app] High compatibility publish path: Streamlink -> FFmpeg decode/resync/transcode -> publish.")
+                } else if useQueuePublisherPrototype {
+                    let queueDescription: String
+                    switch queuePublisherMode {
+                    case .playlist:
+                        queueDescription = "normalize -> completed segments -> app-managed playout playlist -> publisher"
+                    case .tcpStream:
+                        queueDescription = "normalize -> completed segments -> local TCP stream -> publisher"
+                    case .tcpMeasuredStream:
+                        queueDescription = "normalize -> completed segments -> measured local TCP stream -> publisher"
+                    case .tcpMeasuredTranscode:
+                        queueDescription = "normalize -> completed segments -> measured local TCP stream -> transcoding publisher"
+                    case .httpPlaylist:
+                        queueDescription = "normalize -> completed segments -> localhost HTTP playout -> publisher"
+                    case .haishinRTMP:
+                        queueDescription = "normalize -> completed segments -> app-owned RTMP publisher"
+                    case .directRTMP:
+                        queueDescription = "normalize -> completed TS segments -> direct RTMP remux publisher"
+                    default:
+                        queueDescription = "normalize -> completed segments -> publisher"
+                    }
+                    appendLog("[app] \(modeLabel) normalizer stage: enabled (\(queueDescription)).")
+                } else {
+                    appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged DVR -> publish).")
+                }
             }
             if let deno = paths.deno {
                 appendLog("[app] Using deno: \(deno.path)")
@@ -689,6 +1172,7 @@ final class StreamPipeline: ObservableObject {
     private struct DvrSession {
         let directory: URL
         let playlistURL: URL
+        let playoutPlaylistURL: URL
         let segmentPattern: String
     }
 
@@ -699,8 +1183,14 @@ final class StreamPipeline: ObservableObject {
         let sessionDir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
         let playlistURL = sessionDir.appendingPathComponent("staged.m3u8")
+        let playoutPlaylistURL = sessionDir.appendingPathComponent("playout.m3u8")
         let segmentPattern = sessionDir.appendingPathComponent("seg-%09d.ts").path
-        return DvrSession(directory: sessionDir, playlistURL: playlistURL, segmentPattern: segmentPattern)
+        return DvrSession(
+            directory: sessionDir,
+            playlistURL: playlistURL,
+            playoutPlaylistURL: playoutPlaylistURL,
+            segmentPattern: segmentPattern
+        )
     }
 
     private func makeDvrNormalizerProcess(
@@ -709,17 +1199,26 @@ final class StreamPipeline: ObservableObject {
         generation: Int,
         normalizerError: Pipe?,
         input: Pipe,
+        useSegmentQueuePrototype: Bool,
         playlistURL: URL,
         segmentPattern: String,
         ffmpegToolsDir: String
     ) -> Process {
         let normalizer = Process()
         normalizer.executableURL = paths.ffmpeg
-        normalizer.arguments = normalizerToDvrArguments(
-            for: config,
-            playlistURL: playlistURL,
-            segmentPattern: segmentPattern
-        )
+        if useSegmentQueuePrototype {
+            normalizer.arguments = normalizerToSegmentQueueArguments(
+                for: config,
+                playlistURL: playlistURL,
+                segmentPattern: segmentPattern
+            )
+        } else {
+            normalizer.arguments = normalizerToDvrArguments(
+                for: config,
+                playlistURL: playlistURL,
+                segmentPattern: segmentPattern
+            )
+        }
         normalizer.environment = paths.environment
         normalizer.standardInput = input
         normalizer.standardOutput = FileHandle.nullDevice
@@ -740,20 +1239,112 @@ final class StreamPipeline: ObservableObject {
         return normalizer
     }
 
+    private func makeSegmentQueuePublisherProcess(
+        paths: ToolPaths,
+        config: StreamConfig,
+        generation: Int,
+        ffError: Pipe?,
+        input: Pipe,
+        ffmpegToolsDir: String
+    ) -> Process {
+        let ffmpeg = Process()
+        ffmpeg.executableURL = paths.ffmpeg
+        ffmpeg.arguments = segmentQueuePublisherArguments(for: config)
+        ffmpeg.environment = paths.environment
+        ffmpeg.standardInput = input
+        ffmpeg.standardOutput = FileHandle.nullDevice
+        if let ffError {
+            ffmpeg.standardError = ffError
+        } else {
+            ffmpeg.standardError = FileHandle.nullDevice
+        }
+        ffmpeg.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                self?.handleTermination(
+                    generation: generation,
+                    source: "ffmpeg",
+                    status: proc.terminationStatus
+                )
+            }
+        }
+        return ffmpeg
+    }
+
+    private func makeSegmentTCPPublisherProcess(
+        paths: ToolPaths,
+        config: StreamConfig,
+        generation: Int,
+        ffError: Pipe?,
+        inputURL: String,
+        ffmpegToolsDir: String,
+        transcodeOnPublish: Bool = false
+    ) -> Process {
+        let ffmpeg = Process()
+        ffmpeg.executableURL = paths.ffmpeg
+        ffmpeg.arguments = segmentTCPPublisherArguments(
+            for: config,
+            inputURL: inputURL,
+            transcodeOnPublish: transcodeOnPublish
+        )
+        ffmpeg.environment = paths.environment
+        ffmpeg.standardInput = FileHandle.nullDevice
+        ffmpeg.standardOutput = FileHandle.nullDevice
+        if let ffError {
+            ffmpeg.standardError = ffError
+        } else {
+            ffmpeg.standardError = FileHandle.nullDevice
+        }
+        ffmpeg.terminationHandler = { [weak self] proc in
+            Task { @MainActor in
+                self?.handleTermination(
+                    generation: generation,
+                    source: "ffmpeg",
+                    status: proc.terminationStatus
+                )
+            }
+        }
+        return ffmpeg
+    }
+
     private func makeDvrPublisherProcess(
         paths: ToolPaths,
         config: StreamConfig,
         generation: Int,
         ffError: Pipe?,
         playlistURL: URL,
-        ffmpegToolsDir: String
+        ffmpegToolsDir: String,
+        useRealtimePacingOverride: Bool? = nil,
+        usePreciseReadRate: Bool = false
+    ) -> Process {
+        makeRemotePlaylistPublisherProcess(
+            paths: paths,
+            config: config,
+            generation: generation,
+            ffError: ffError,
+            playlistLocation: playlistURL.path,
+            ffmpegToolsDir: ffmpegToolsDir,
+            useRealtimePacingOverride: useRealtimePacingOverride,
+            usePreciseReadRate: usePreciseReadRate
+        )
+    }
+
+    private func makeRemotePlaylistPublisherProcess(
+        paths: ToolPaths,
+        config: StreamConfig,
+        generation: Int,
+        ffError: Pipe?,
+        playlistLocation: String,
+        ffmpegToolsDir: String,
+        useRealtimePacingOverride: Bool? = nil,
+        usePreciseReadRate: Bool = false
     ) -> Process {
         let ffmpeg = Process()
         ffmpeg.executableURL = paths.ffmpeg
         ffmpeg.arguments = dvrPublisherArguments(
             for: config,
-            playlistURL: playlistURL,
-            useRealtimePacing: !isCatchUpActive()
+            playlistLocation: playlistLocation,
+            useRealtimePacing: useRealtimePacingOverride ?? !isCatchUpActive(),
+            usePreciseReadRate: usePreciseReadRate
         )
         ffmpeg.environment = paths.environment
         ffmpeg.standardInput = FileHandle.nullDevice
@@ -827,8 +1418,724 @@ final class StreamPipeline: ObservableObject {
                     }
                 }
 
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+    }
+
+    private func startSegmentQueueMonitorAndPublisher(
+        publisher: Process,
+        inputPipe: Pipe,
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let playlistURL = self.dvrPlaylistURL else { return }
+            let targetDelay = max(0.0, Double(config.bufferSeconds))
+            var startedPublishing = false
+            var nextSegmentIndex = 0
+            var writerClosed = false
+            let writerFD = inputPipe.fileHandleForWriting.fileDescriptor
+
+            while !Task.isCancelled {
+                guard self.shouldKeepRunning, generation == self.generation else { break }
+
+                let segments = await Self.readQueuedSegmentsOffMain(from: playlistURL)
+                if nextSegmentIndex > segments.count {
+                    nextSegmentIndex = segments.count
+                }
+                if startedPublishing {
+                    _ = self.trimQueuedBacklogIfNeeded(
+                        segments: segments,
+                        nextSegmentIndex: &nextSegmentIndex,
+                        targetDelay: targetDelay
+                    )
+                }
+                let queuedSegments = segments.suffix(from: nextSegmentIndex)
+                let queuedDuration = SegmentQueueSupport.queuedDuration(for: queuedSegments)
+
+                self.updateDvrBufferState(
+                    config: config,
+                    availableSeconds: queuedDuration,
+                    targetDelay: targetDelay,
+                    publishingStarted: startedPublishing
+                )
+
+                if !startedPublishing {
+                    let reachedTarget = targetDelay <= 0 || queuedDuration >= targetDelay
+                    let canStartEarlyOnEnd = self.ytDlpProcess?.isRunning != true && queuedDuration > 0.5
+                    if reachedTarget || canStartEarlyOnEnd {
+                        do {
+                            try publisher.run()
+                            self.ffmpegProcess = publisher
+                            self.lastPublishStartedAt = Date()
+                            self.highSpeedSince = Date.distantPast
+                            self.publisherRestartScheduled = false
+                            self.parsedStatus.outputState = "Publishing"
+                            self.startupReprimeActive = false
+                            self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            self.refreshStreamHealth(now: Date())
+                            startedPublishing = true
+                        } catch {
+                            let nsError = error as NSError
+                            self.appendLog(
+                                "[app] Failed to start publisher after buffer fill: \(error.localizedDescription) [domain=\(nsError.domain) code=\(nsError.code)]"
+                            )
+                            self.terminatePipeline()
+                            self.scheduleRestart(generation: generation)
+                            return
+                        }
+                    }
+                }
+
+                if startedPublishing && nextSegmentIndex < segments.count {
+                    let segment = segments[nextSegmentIndex]
+                    do {
+                        let data = try await Self.readSegmentDataOffMain(from: segment.fileURL)
+                        try await Self.streamSegmentDataOffMain(
+                            data,
+                            to: writerFD,
+                            over: max(segment.duration, 0.1)
+                        )
+                        nextSegmentIndex += 1
+                        continue
+                    } catch {
+                        if !writerClosed {
+                            _ = Darwin.close(writerFD)
+                            writerClosed = true
+                        }
+                        self.appendLog("[app] Queue publisher write failed: \(error.localizedDescription)")
+                        self.terminatePipeline()
+                        self.scheduleRestart(generation: generation, reason: .processExit)
+                        return
+                    }
+                }
+
+                let acquisitionEnded = self.ytDlpProcess?.isRunning != true && self.normalizerProcess?.isRunning != true
+                if startedPublishing && acquisitionEnded && nextSegmentIndex >= segments.count && !writerClosed {
+                    _ = Darwin.close(writerFD)
+                    writerClosed = true
+                }
+
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
+
+            if !writerClosed {
+                _ = Darwin.close(writerFD)
+            }
+        }
+    }
+
+    private func startSegmentPlaylistMonitorAndPublisher(
+        publisher: Process,
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let playlistURL = self.dvrPlaylistURL,
+                  let playoutPlaylistURL = self.dvrPlayoutPlaylistURL else { return }
+            let targetDelay = max(0.0, Double(config.bufferSeconds))
+            let playoutDirectory = playoutPlaylistURL.deletingLastPathComponent()
+            var startedPublishing = false
+            var playlistBaseIndex = 0
+            var forcedTrimIndex = 0
+            var lastPlaylistSignature = ""
+            var pendingDiscontinuity = false
+            var playlistStartedAt = Date.distantPast
+
+            while !Task.isCancelled {
+                guard self.shouldKeepRunning, generation == self.generation else { break }
+
+                let segments = await Self.readQueuedSegmentsOffMain(from: playlistURL)
+                let startupQueuedDuration = SegmentQueueSupport.queuedDuration(for: segments.suffix(from: 0))
+
+                if !startedPublishing {
+                    self.updateDvrBufferState(
+                        config: config,
+                        availableSeconds: startupQueuedDuration,
+                        targetDelay: targetDelay,
+                        publishingStarted: false
+                    )
+
+                    let reachedTarget = targetDelay <= 0 || startupQueuedDuration >= targetDelay
+                    let canStartEarlyOnEnd = self.ytDlpProcess?.isRunning != true && startupQueuedDuration > 0.5
+                    if (reachedTarget || canStartEarlyOnEnd) && !segments.isEmpty {
+                        playlistBaseIndex = 0
+                        forcedTrimIndex = 0
+                        let initialLeadSeconds = self.playoutLeadSeconds()
+                        let initialReleaseIndex = min(
+                            segments.count,
+                            max(
+                                1,
+                                SegmentQueueSupport.segmentIndex(
+                                    forElapsed: initialLeadSeconds,
+                                    in: segments,
+                                    startingAt: playlistBaseIndex
+                                ) + 1
+                            )
+                        )
+                        let initialSegments = segments[0..<initialReleaseIndex]
+                        do {
+                            try await Self.writePlayoutPlaylistOffMain(
+                                to: playoutPlaylistURL,
+                                segments: initialSegments,
+                                baseDirectory: playoutDirectory,
+                                mediaSequence: initialSegments.first?.index ?? 0,
+                                includeDiscontinuityAtStart: false,
+                                includeEndList: false
+                            )
+                            lastPlaylistSignature = "0:\(initialReleaseIndex):0:0"
+                            try publisher.run()
+                            self.ffmpegProcess = publisher
+                            self.lastPublishStartedAt = Date()
+                            self.highSpeedSince = Date.distantPast
+                            self.publisherRestartScheduled = false
+                            self.parsedStatus.outputState = "Publishing"
+                            self.startupReprimeActive = false
+                            playlistStartedAt = Date()
+                            self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            self.refreshStreamHealth(now: Date())
+                            startedPublishing = true
+                        } catch {
+                            let nsError = error as NSError
+                            self.appendLog(
+                                "[app] Failed to start playlist-backed publisher after buffer fill: \(error.localizedDescription) [domain=\(nsError.domain) code=\(nsError.code)]"
+                            )
+                            self.terminatePipeline()
+                            self.scheduleRestart(generation: generation)
+                            return
+                        }
+                    }
+
+                    try? await Task.sleep(nanoseconds: Self.playoutPlaylistUpdateIntervalNanoseconds)
+                    continue
+                }
+
+                let outputSeconds = self.parseClockToSeconds(self.parsedStatus.ffmpegTime) ?? 0
+                let scheduledElapsed = playlistStartedAt == Date.distantPast
+                    ? outputSeconds
+                    : max(0, Date().timeIntervalSince(playlistStartedAt))
+                let leadSeconds = self.playoutLeadSeconds()
+                let naturalPlaybackIndex = SegmentQueueSupport.segmentIndex(
+                    forElapsed: outputSeconds,
+                    in: segments,
+                    startingAt: playlistBaseIndex
+                )
+                let retainedStartIndex = SegmentQueueSupport.rewindIndex(
+                    from: naturalPlaybackIndex,
+                    retainSeconds: Self.playoutPlaylistRetainPastSeconds,
+                    in: segments,
+                    lowerBound: playlistBaseIndex
+                )
+                let naturalReadIndex = max(naturalPlaybackIndex, forcedTrimIndex)
+                var queueAheadDuration = SegmentQueueSupport.queuedDuration(for: segments, startingAt: naturalReadIndex)
+
+                if targetDelay > 0 && naturalReadIndex < segments.count {
+                    let maxQueuedDelay = targetDelay + Self.queueTrimHeadroomSeconds
+                    let resumeQueuedDelay = targetDelay + Self.queueTrimResumeSeconds
+                    if queueAheadDuration > maxQueuedDelay {
+                        let trimStartIndex = naturalReadIndex
+                        var droppedDuration = 0.0
+                        var droppedSegments = 0
+                        while trimStartIndex + droppedSegments < segments.count &&
+                                (queueAheadDuration - droppedDuration) > resumeQueuedDelay {
+                            droppedDuration += max(0, segments[trimStartIndex + droppedSegments].duration)
+                            droppedSegments += 1
+                        }
+
+                        if droppedSegments > 0 {
+                            forcedTrimIndex = trimStartIndex + droppedSegments
+                            queueAheadDuration = max(0, queueAheadDuration - droppedDuration)
+                            pendingDiscontinuity = true
+                            ffmpegDiagnosticCounters["queue_trim", default: 0] += 1
+                            appendLog(
+                                "[app] Queued delay grew to \(Int((queueAheadDuration + droppedDuration).rounded()))s. Dropping \(droppedSegments) queued segment(s) (~\(Int(droppedDuration.rounded()))s) to hold latency near \(Int(targetDelay.rounded()))s."
+                            )
+                        }
+                    }
+                }
+
+                let playlistStartIndex = min(max(retainedStartIndex, forcedTrimIndex), segments.count)
+                let releaseEndIndex = min(
+                    segments.count,
+                    max(
+                        playlistStartIndex,
+                        SegmentQueueSupport.segmentIndex(
+                            forElapsed: scheduledElapsed + leadSeconds,
+                            in: segments,
+                            startingAt: playlistBaseIndex
+                        ) + 1
+                    )
+                )
+                let playlistSegments = segments[playlistStartIndex..<releaseEndIndex]
+                let mediaSequence = playlistSegments.first?.index ?? playlistStartIndex
+                let acquisitionEnded = self.ytDlpProcess?.isRunning != true && self.normalizerProcess?.isRunning != true
+                let includeEndList = acquisitionEnded && releaseEndIndex >= segments.count
+                let playlistSignature = "\(playlistStartIndex):\(releaseEndIndex):\(pendingDiscontinuity ? 1 : 0):\(includeEndList ? 1 : 0)"
+
+                self.updateDvrBufferState(
+                    config: config,
+                    availableSeconds: queueAheadDuration,
+                    targetDelay: targetDelay,
+                    publishingStarted: true
+                )
+
+                if playlistSignature != lastPlaylistSignature {
+                    do {
+                        try await Self.writePlayoutPlaylistOffMain(
+                            to: playoutPlaylistURL,
+                            segments: playlistSegments,
+                            baseDirectory: playoutDirectory,
+                            mediaSequence: mediaSequence,
+                            includeDiscontinuityAtStart: pendingDiscontinuity,
+                            includeEndList: includeEndList
+                        )
+                        lastPlaylistSignature = playlistSignature
+                        pendingDiscontinuity = false
+                    } catch {
+                        self.appendLog("[app] Failed to update playout playlist: \(error.localizedDescription)")
+                        self.terminatePipeline()
+                        self.scheduleRestart(generation: generation, reason: .processExit)
+                        return
+                    }
+                }
+
+                try? await Task.sleep(nanoseconds: Self.playoutPlaylistUpdateIntervalNanoseconds)
+            }
+        }
+    }
+
+    private func startSegmentTCPMonitorAndPublisher(
+        publisher: Process,
+        streamBridge: LocalTCPPublisherBridge,
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let playlistURL = self.dvrPlaylistURL else { return }
+            let targetDelay = max(0.0, Double(config.bufferSeconds))
+            let usesMeasuredPacing = (self.queuePublisherMode == .tcpMeasuredStream || self.queuePublisherMode == .tcpMeasuredTranscode)
+            let allowsTrim = (self.queuePublisherMode == .tcpStream)
+            var startedPublishing = false
+            var nextSegmentIndex = 0
+            var writerDescriptor: Int32?
+            var pacingScale = 1.0
+            var calibrationLogged = false
+
+            while !Task.isCancelled {
+                guard self.shouldKeepRunning, generation == self.generation else { break }
+
+                let segments = await Self.readQueuedSegmentsOffMain(from: playlistURL)
+                if nextSegmentIndex > segments.count {
+                    nextSegmentIndex = segments.count
+                }
+                if usesMeasuredPacing,
+                   pacingScale == 1.0,
+                   segments.count >= Self.streamPacingCalibrationMinimumSegmentCount,
+                   let ffprobeURL = self.toolPaths?.ffprobe,
+                   let measuredScale = await Self.measureQueuedSegmentDurationScaleOffMain(
+                    ffprobeURL: ffprobeURL,
+                    segments: segments
+                   ) {
+                    pacingScale = min(
+                        max(measuredScale, Self.streamPacingCalibrationMinimumScale),
+                        Self.streamPacingCalibrationMaximumScale
+                    )
+                    if !calibrationLogged && abs(pacingScale - 1) >= 0.002 {
+                        calibrationLogged = true
+                        let scaleText = String(format: "%.3f", pacingScale)
+                        self.appendLog("[app] Experimental TCP queue pacing calibration: using \(scaleText)x measured segment timing.")
+                    }
+                }
+                if startedPublishing && allowsTrim {
+                    _ = self.trimQueuedBacklogIfNeeded(
+                        segments: segments,
+                        nextSegmentIndex: &nextSegmentIndex,
+                        targetDelay: targetDelay
+                    )
+                }
+                let queuedSegments = segments.suffix(from: nextSegmentIndex)
+                let queuedDuration = SegmentQueueSupport.queuedDuration(for: queuedSegments)
+
+                self.updateDvrBufferState(
+                    config: config,
+                    availableSeconds: queuedDuration,
+                    targetDelay: targetDelay,
+                    publishingStarted: startedPublishing
+                )
+
+                if !startedPublishing {
+                    let reachedTarget = targetDelay <= 0 || queuedDuration >= targetDelay
+                    let canStartEarlyOnEnd = self.ytDlpProcess?.isRunning != true && queuedDuration > 0.5
+                    if reachedTarget || canStartEarlyOnEnd {
+                        do {
+                            try publisher.run()
+                            self.ffmpegProcess = publisher
+                            self.lastPublishStartedAt = Date()
+                            self.highSpeedSince = Date.distantPast
+                            self.publisherRestartScheduled = false
+                            self.parsedStatus.outputState = "Publishing"
+                            self.startupReprimeActive = false
+                            self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            self.refreshStreamHealth(now: Date())
+                            startedPublishing = true
+                        } catch {
+                            let nsError = error as NSError
+                            self.appendLog(
+                                "[app] Failed to start TCP-backed publisher after buffer fill: \(error.localizedDescription) [domain=\(nsError.domain) code=\(nsError.code)]"
+                            )
+                            self.terminatePipeline()
+                            self.scheduleRestart(generation: generation)
+                            return
+                        }
+                    }
+                }
+
+                if startedPublishing && nextSegmentIndex < segments.count {
+                    do {
+                        if writerDescriptor == nil {
+                            writerDescriptor = try await streamBridge.connectedDescriptor()
+                        }
+                        let segment = segments[nextSegmentIndex]
+                        let data = try await Self.readSegmentDataOffMain(from: segment.fileURL)
+                        let pacedDuration = max(segment.duration * pacingScale, 0.1)
+                        try await Self.streamSegmentDataOffMain(
+                            data,
+                            to: writerDescriptor ?? -1,
+                            over: pacedDuration
+                        )
+                        nextSegmentIndex += 1
+                        continue
+                    } catch {
+                        self.appendLog("[app] TCP queue publisher write failed: \(error.localizedDescription)")
+                        await streamBridge.close()
+                        self.terminatePipeline()
+                        self.scheduleRestart(generation: generation, reason: .processExit)
+                        return
+                    }
+                }
+
+                let acquisitionEnded = self.ytDlpProcess?.isRunning != true && self.normalizerProcess?.isRunning != true
+                if startedPublishing && acquisitionEnded && nextSegmentIndex >= segments.count {
+                    await streamBridge.close()
+                    writerDescriptor = nil
+                }
+
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+
+            await streamBridge.close()
+        }
+    }
+
+    private func startSegmentHaishinMonitorAndPublisher(
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        dvrBufferMonitorTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let playlistURL = self.dvrPlaylistURL else { return }
+            guard config.outputType == .rtmp else {
+                self.appendLog("[app] Experimental RTMP publisher requires an RTMP output target.")
+                self.terminatePipeline()
+                self.scheduleRestart(generation: generation, reason: .processExit)
+                return
+            }
+
+            let targetDelay = max(0.0, Double(config.bufferSeconds))
+            var startedPublishing = false
+            var nextSegmentIndex = 0
+            var publishedMediaSeconds = 0.0
+            var publisher: HaishinRTMPPublisher?
+
+            while !Task.isCancelled {
+                guard self.shouldKeepRunning, generation == self.generation else { break }
+
+                let segments = await Self.readQueuedSegmentsOffMain(from: playlistURL)
+                if nextSegmentIndex > segments.count {
+                    nextSegmentIndex = segments.count
+                }
+                if startedPublishing {
+                    let droppedDuration = self.trimQueuedBacklogIfNeeded(
+                        segments: segments,
+                        nextSegmentIndex: &nextSegmentIndex,
+                        targetDelay: targetDelay
+                    )
+                    if droppedDuration > 0 {
+                        publishedMediaSeconds += droppedDuration
+                        self.appendLog(
+                            "[app] Direct RTMP playout advanced by ~\(Int(droppedDuration.rounded()))s after queue trim to stay aligned with live delay."
+                        )
+                    }
+                }
+                let queuedSegments = segments.suffix(from: nextSegmentIndex)
+                let queuedDuration = SegmentQueueSupport.queuedDuration(for: queuedSegments)
+
+                self.updateDvrBufferState(
+                    config: config,
+                    availableSeconds: queuedDuration,
+                    targetDelay: targetDelay,
+                    publishingStarted: startedPublishing
+                )
+
+                if !startedPublishing {
+                    let reachedTarget = targetDelay <= 0 || queuedDuration >= targetDelay
+                    let canStartEarlyOnEnd = self.ytDlpProcess?.isRunning != true && queuedDuration > 0.5
+                    if (reachedTarget || canStartEarlyOnEnd), !segments.isEmpty {
+                        do {
+                            let newPublisher = try HaishinRTMPPublisher(outputTarget: config.outputTarget)
+                            try await newPublisher.connectAndPublish()
+                            publisher = newPublisher
+                            self.segmentHaishinPublisher = newPublisher
+                            self.lastPublishStartedAt = Date()
+                            self.highSpeedSince = Date.distantPast
+                            self.publisherRestartScheduled = false
+                            self.parsedStatus.outputState = "Publishing"
+                            self.parsedStatus.lastFFmpegEvent = "Publishing via app-owned RTMP publisher"
+                            self.startupReprimeActive = false
+                            self.appendLog("[app] Startup buffer filled. Publishing to destination.")
+                            self.refreshStreamHealth(now: Date())
+                            startedPublishing = true
+                        } catch {
+                            self.appendLog("[app] Failed to start app-owned RTMP publisher: \(error.localizedDescription)")
+                            self.terminatePipeline()
+                            self.scheduleRestart(generation: generation)
+                            return
+                        }
+                    }
+                }
+
+                if startedPublishing, nextSegmentIndex < segments.count, let publisher {
+                    let segment = segments[nextSegmentIndex]
+                    do {
+                        let segmentDuration = try await publisher.publishSegment(
+                            segment,
+                            scheduledMediaStartSeconds: publishedMediaSeconds
+                        ) { progress in
+                            self.recordSyntheticPublisherProgress(progress)
+                        }
+                        publishedMediaSeconds += segmentDuration
+                        nextSegmentIndex += 1
+                        continue
+                    } catch {
+                        self.appendLog("[app] App-owned RTMP publisher failed: \(error.localizedDescription)")
+                        await publisher.close()
+                        if self.segmentHaishinPublisher === publisher {
+                            self.segmentHaishinPublisher = nil
+                        }
+                        self.terminatePipeline()
+                        self.scheduleRestart(generation: generation, reason: .processExit)
+                        return
+                    }
+                }
+
+                let acquisitionEnded = self.ytDlpProcess?.isRunning != true && self.normalizerProcess?.isRunning != true
+                if startedPublishing && acquisitionEnded && nextSegmentIndex >= segments.count {
+                    await publisher?.close()
+                    if let publisher, self.segmentHaishinPublisher === publisher {
+                        self.segmentHaishinPublisher = nil
+                    }
+                    return
+                }
+
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+
+            await publisher?.close()
+            if let publisher, self.segmentHaishinPublisher === publisher {
+                self.segmentHaishinPublisher = nil
+            }
+        }
+    }
+
+    private func startSegmentDirectRTMPMonitorAndPublisher(
+        config: StreamConfig,
+        generation: Int
+    ) {
+        dvrBufferMonitorTask?.cancel()
+        guard let playlistURL = dvrPlaylistURL else { return }
+        guard config.outputType == .rtmp else {
+            appendLog("[app] Direct RTMP remux publisher requires an RTMP output target.")
+            terminatePipeline()
+            scheduleRestart(generation: generation, reason: .processExit)
+            return
+        }
+
+        let worker = DirectRTMPLoopWorker(
+            pipeline: self,
+            playlistURL: playlistURL,
+            config: config,
+            generation: generation
+        )
+        dvrBufferMonitorTask = Task {
+            await worker.run()
+        }
+    }
+
+    fileprivate func directRTMPLoopSnapshot() -> DirectRTMPLoopSnapshot {
+        let publishAgeSeconds: Double?
+        if lastPublishStartedAt == Date.distantPast {
+            publishAgeSeconds = nil
+        } else {
+            publishAgeSeconds = max(0, Date().timeIntervalSince(lastPublishStartedAt))
+        }
+        return DirectRTMPLoopSnapshot(
+            shouldKeepRunning: shouldKeepRunning,
+            generation: generation,
+            ytDlpRunning: ytDlpProcess?.isRunning == true,
+            normalizerRunning: normalizerProcess?.isRunning == true,
+            publishAgeSeconds: publishAgeSeconds
+        )
+    }
+
+    fileprivate func directRTMPTrimQueuedBacklog(
+        segments: [QueuedSegment],
+        nextSegmentIndex: Int,
+        targetDelay: Double,
+        headroomSeconds: Double? = nil,
+        resumeSeconds: Double? = nil
+    ) -> DirectRTMPTrimResult {
+        var updatedIndex = nextSegmentIndex
+        let droppedDuration = trimQueuedBacklogIfNeeded(
+            segments: segments,
+            nextSegmentIndex: &updatedIndex,
+            targetDelay: targetDelay,
+            headroomSeconds: headroomSeconds ?? Self.directRTMPQueueTrimHeadroomSeconds,
+            resumeSeconds: resumeSeconds ?? Self.directRTMPQueueTrimResumeSeconds
+        )
+        return DirectRTMPTrimResult(nextSegmentIndex: updatedIndex, droppedDuration: droppedDuration)
+    }
+
+    fileprivate func directRTMPTrimStartupBacklog(
+        segments: [QueuedSegment],
+        nextSegmentIndex: Int,
+        targetDelay: Double
+    ) -> Int {
+        var updatedIndex = nextSegmentIndex
+        _ = trimQueuedBacklogForStartupIfNeeded(
+            segments: segments,
+            nextSegmentIndex: &updatedIndex,
+            targetDelay: targetDelay,
+            headroomSeconds: Self.directRTMPQueueStartupTrimHeadroomSeconds
+        )
+        return updatedIndex
+    }
+
+    fileprivate func directRTMPUpdateBufferState(
+        config: StreamConfig,
+        availableSeconds: Double,
+        targetDelay: Double,
+        publishingStarted: Bool
+    ) {
+        updateDvrBufferState(
+            config: config,
+            availableSeconds: availableSeconds,
+            targetDelay: targetDelay,
+            publishingStarted: publishingStarted
+        )
+    }
+
+    fileprivate func directRTMPShouldStartPublishing(
+        queuedDuration: Double,
+        targetDelay: Double
+    ) -> Bool {
+        let reachedTarget = targetDelay <= 0 || queuedDuration >= targetDelay
+        let canStartEarlyOnEnd = ytDlpProcess?.isRunning != true && queuedDuration > 0.5
+        return reachedTarget || canStartEarlyOnEnd
+    }
+
+    fileprivate func directRTMPHandlePublisherStarted(_ publisher: DirectTSRTMPPublisher) {
+        segmentDirectRTMPPublisher = publisher
+        lastPublishStartedAt = Date()
+        highSpeedSince = Date.distantPast
+        publisherRestartScheduled = false
+        parsedStatus.outputState = "Publishing"
+        parsedStatus.lastFFmpegEvent = "Publishing via direct TS RTMP remux publisher"
+        startupReprimeActive = false
+        appendLog("[app] Startup buffer filled. Publishing to destination.")
+        refreshStreamHealth(now: Date())
+    }
+
+    fileprivate func directRTMPHandlePublisherStartFailure(_ error: Error, generation: Int) {
+        appendLog("[app] Failed to start direct RTMP remux publisher: \(error.localizedDescription)")
+        if let publisherError = error as? DirectTSRTMPPublisher.PublisherError,
+           case .invalidTarget = publisherError {
+            parsedStatus.lastError = error.localizedDescription
+            parsedStatus.outputState = "Invalid Output"
+            status = "Invalid Output"
+            shouldKeepRunning = false
+            terminatePipeline()
+            isRunning = false
+            return
+        }
+        terminatePipeline()
+        scheduleRestart(generation: generation)
+    }
+
+    fileprivate func directRTMPLogTimelineAdvance(seconds: Double) {
+        appendLog(
+            "[app] Direct RTMP playout schedule advanced by ~\(Int(seconds.rounded()))s after queue trim to stay aligned with live delay."
+        )
+    }
+
+    fileprivate func directRTMPLogPublishedSegment(
+        segment: QueuedSegment,
+        prepared: DirectTSRTMPPublisher.PreparedSegment,
+        prepareElapsed: Double,
+        publishElapsed: Double,
+        sendMetrics: DirectTSRTMPPublisher.SendMetrics,
+        transportMetrics: DirectTSRTMPPublisher.TransportMetrics?
+    ) {
+        appendLog(
+            String(
+                format: "[app] direct-rtmp segment %@: media=%.3fs span=%.3fs gap=%.3fs packets=%d prep=%.3fs publish=%.3fs send=%.3fs bucketSleep=%.3fs endSleep=%.3fs build=%.4fs enqueue=%.4fs chunks=%d vDelta=%.3fs aDelta=%.3fs vPackets=%d aPackets=%d queueOut=%dB totalOut=%dB",
+                segment.fileURL.lastPathComponent,
+                prepared.duration,
+                prepared.scheduleSpanSeconds,
+                prepared.maxInterPacketGapSeconds,
+                prepared.packetCount,
+                prepareElapsed,
+                publishElapsed,
+                sendMetrics.sendCallSeconds,
+                sendMetrics.bucketSleepSeconds,
+                sendMetrics.endSleepSeconds,
+                sendMetrics.buildSeconds,
+                sendMetrics.enqueueSeconds,
+                sendMetrics.chunkCount,
+                Double(sendMetrics.videoTimestampDeltaMilliseconds) / 1000.0,
+                Double(sendMetrics.audioTimestampDeltaMilliseconds) / 1000.0,
+                sendMetrics.videoPacketCount,
+                sendMetrics.audioPacketCount,
+                transportMetrics?.queueBytesOut ?? -1,
+                transportMetrics?.totalBytesOut ?? -1
+            )
+        )
+    }
+
+    fileprivate func directRTMPHandlePublisherFailure(
+        _ publisher: DirectTSRTMPPublisher,
+        error: Error,
+        generation: Int
+    ) async {
+        appendLog("[app] Direct RTMP remux publisher failed: \(error.localizedDescription)")
+        await publisher.close()
+        if segmentDirectRTMPPublisher === publisher {
+            segmentDirectRTMPPublisher = nil
+        }
+        terminatePipeline()
+        scheduleRestart(generation: generation, reason: .processExit)
+    }
+
+    fileprivate func directRTMPClearPublisherIfCurrent(_ publisher: DirectTSRTMPPublisher) {
+        if segmentDirectRTMPPublisher === publisher {
+            segmentDirectRTMPPublisher = nil
         }
     }
 
@@ -851,10 +2158,40 @@ final class StreamPipeline: ObservableObject {
         cliStatusTask = nil
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
+        publisherInputPipe?.fileHandleForWriting.closeFile()
+        publisherInputPipe = nil
+        let streamBridge = segmentStreamBridge
+        segmentStreamBridge = nil
+        let httpServer = segmentHTTPServer
+        segmentHTTPServer = nil
+        let haishinPublisher = segmentHaishinPublisher
+        segmentHaishinPublisher = nil
+        let directPublisher = segmentDirectRTMPPublisher
+        segmentDirectRTMPPublisher = nil
 
         terminateProcessIfRunning(ytProcess, label: "yt-dlp")
         terminateProcessIfRunning(outProcess, label: "ffmpeg")
         terminateProcessIfRunning(normProcess, label: "normalizer")
+        if let streamBridge {
+            Task {
+                await streamBridge.close()
+            }
+        }
+        if let httpServer {
+            Task {
+                await httpServer.close()
+            }
+        }
+        if let haishinPublisher {
+            Task { @MainActor in
+                await haishinPublisher.close()
+            }
+        }
+        if let directPublisher {
+            Task { @MainActor in
+                await directPublisher.close()
+            }
+        }
 
         ytDlpProcess = nil
         ffmpegProcess = nil
@@ -862,7 +2199,9 @@ final class StreamPipeline: ObservableObject {
         cleanupDvrSessionFiles()
         dvrSessionDirectory = nil
         dvrPlaylistURL = nil
+        dvrPlayoutPlaylistURL = nil
         dvrSegmentPattern = nil
+        queuePublisherMode = .disabled
         ytDlpErrorPipe?.fileHandleForReading.readabilityHandler = nil
         ffmpegErrorPipe?.fileHandleForReading.readabilityHandler = nil
         normalizerErrorPipe?.fileHandleForReading.readabilityHandler = nil
@@ -903,7 +2242,7 @@ final class StreamPipeline: ObservableObject {
         Task { @MainActor in
             self.appendLog("[\(source)] exited with status \(status)")
         }
-        if source == "yt-dlp" {
+        if source == "yt-dlp" || source == "streamlink" {
             parsedStatus.sourceState = "Stopped (\(status))"
             ytDlpProcess = nil
             ytDlpErrorPipe?.fileHandleForReading.readabilityHandler = nil
@@ -1006,6 +2345,13 @@ final class StreamPipeline: ObservableObject {
             return
         }
 
+        guard !queuePublisherPrototypeEnabled else {
+            appendLog("[app] Publisher-only restart unavailable in queue-publisher mode; doing full restart.")
+            terminatePipeline()
+            scheduleRestart(generation: generation, reason: .general)
+            return
+        }
+
         publisherRestartScheduled = true
         parsedStatus.outputState = "Reconnecting Output"
         refreshStreamHealth(now: Date())
@@ -1063,6 +2409,39 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func ffmpegArguments(for config: StreamConfig) -> [String] {
+        if usesStreamlinkSupervisorRemuxPipeline(for: config) {
+            var args = [
+                "-hide_banner",
+                "-loglevel", "info",
+                "-stats_period", "1",
+                "-progress", "pipe:2",
+                "-re",
+                "-fflags", "+genpts",
+                "-i", "pipe:0",
+                "-map", "0:v:0",
+                "-map", "0:a:0?",
+                "-c", "copy"
+            ]
+
+            switch config.outputType {
+            case .rtmp:
+                args += [
+                    "-flvflags", "no_duration_filesize",
+                    "-f", "flv",
+                    config.outputTarget
+                ]
+            case .hls:
+                args += [
+                    "-f", "hls",
+                    "-hls_time", "2",
+                    "-hls_list_size", "6",
+                    "-hls_flags", "delete_segments+append_list+independent_segments",
+                    config.outputTarget
+                ]
+            }
+            return args
+        }
+
         let syncOffsetMs = config.avSyncOffsetMs
         let extraAudioDelayMs = max(0, syncOffsetMs)
         let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
@@ -1075,7 +2454,7 @@ final class StreamPipeline: ObservableObject {
             // Be more tolerant of HLS discontinuities and timestamp issues in copy-based modes.
             inputArgs += ["-fflags", "+genpts+discardcorrupt+igndts+sortdts", "-err_detect", "ignore_err"]
         }
-        if config.encodeMode == .transcode {
+        if config.encodeMode.usesCompatibilityPipeline {
             // High compatibility path: aggressively tolerate timestamp disorder and damaged packets.
             inputArgs += [
                 "-thread_queue_size", "8192",
@@ -1105,7 +2484,7 @@ final class StreamPipeline: ObservableObject {
         switch config.encodeMode {
         case .copy:
             args += ["-c:v", "copy", "-c:a", "copy"]
-        case .transcode:
+        case .transcode, .experimentalDirectRTMP:
             // Rebuild a stable monotonic A/V timeline in compatibility mode.
             // Keep correction gentle to avoid audible pitch warble on long sessions.
             let asyncDepth = config.audioContinuityEnabled ? "1000" : "1"
@@ -1217,7 +2596,10 @@ final class StreamPipeline: ObservableObject {
         return args
     }
 
-    private func normalizerArguments(for config: StreamConfig) -> [String] {
+    private func normalizerArguments(
+        for config: StreamConfig,
+        keyframeIntervalSeconds: Double = 1
+    ) -> [String] {
         let syncOffsetMs = config.avSyncOffsetMs
         let extraAudioDelayMs = max(0, syncOffsetMs)
         let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
@@ -1252,6 +2634,9 @@ final class StreamPipeline: ObservableObject {
         audioFilters.append("aresample=48000:async=\(asyncDepth):min_hard_comp=0.100:comp_duration=1.5:max_soft_comp=0.050:first_pts=0")
         audioFilters.append("asetpts=N/SR/TB")
         let targetFps = resolvedTargetFPS()
+        let keyframeInterval = max(0.25, keyframeIntervalSeconds)
+        let gopFrames = max(1, Int((Double(targetFps) * keyframeInterval).rounded()))
+        let keyframeIntervalLabel = String(format: "%.3f", keyframeInterval)
         var videoSetptsExpr = "N/\(targetFps)/TB"
         if totalVideoDelaySeconds > 0 {
             let delay = String(format: "%.3f", totalVideoDelaySeconds)
@@ -1268,14 +2653,14 @@ final class StreamPipeline: ObservableObject {
                 "-allow_sw", "1",
                 "-realtime", "1",
                 "-pix_fmt", "yuv420p",
-                "-g", "30",
-                "-keyint_min", "30",
+                "-g", "\(gopFrames)",
+                "-keyint_min", "\(gopFrames)",
                 "-bf", "0",
                 "-b:v", "3500k",
                 "-maxrate", "4500k",
                 "-bufsize", "9000k",
                 "-profile:v", "baseline",
-                "-force_key_frames", "expr:gte(t,n_forced*1)",
+                "-force_key_frames", "expr:gte(t,n_forced*\(keyframeIntervalLabel))",
                 "-vf", videoFilter,
                 "-c:a", "aac",
                 "-ar", "48000",
@@ -1291,13 +2676,13 @@ final class StreamPipeline: ObservableObject {
                 "-preset", "ultrafast",
                 "-tune", "zerolatency",
                 "-crf", "27",
-                "-x264-params", "force-cfr=1:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1",
+                "-x264-params", "force-cfr=1:keyint=\(gopFrames):min-keyint=\(gopFrames):scenecut=0:repeat-headers=1",
                 "-pix_fmt", "yuv420p",
-                "-g", "30",
-                "-keyint_min", "30",
+                "-g", "\(gopFrames)",
+                "-keyint_min", "\(gopFrames)",
                 "-sc_threshold", "0",
                 "-profile:v", "baseline",
-                "-force_key_frames", "expr:gte(t,n_forced*1)",
+                "-force_key_frames", "expr:gte(t,n_forced*\(keyframeIntervalLabel))",
                 "-vf", videoFilter,
                 "-c:a", "aac",
                 "-ar", "48000",
@@ -1353,10 +2738,39 @@ final class StreamPipeline: ObservableObject {
         return args
     }
 
-    private func dvrPublisherArguments(
+    private func normalizerToSegmentQueueArguments(
         for config: StreamConfig,
         playlistURL: URL,
-        useRealtimePacing: Bool
+        segmentPattern: String
+    ) -> [String] {
+        let segmentDuration = queuePrototypeSegmentDurationSeconds(for: resolvedTargetFPS())
+        var args = normalizerArguments(
+            for: config,
+            keyframeIntervalSeconds: segmentDuration
+        )
+        if let last = args.last, last == "pipe:1" {
+            _ = args.popLast()
+        }
+        if args.suffix(2) == ["-f", "mpegts"] {
+            _ = args.popLast()
+            _ = args.popLast()
+        }
+        args += [
+            "-f", "hls",
+            "-hls_time", String(format: "%.6f", segmentDuration),
+            "-hls_list_size", "0",
+            "-hls_flags", "append_list+omit_endlist+independent_segments+temp_file",
+            "-hls_segment_filename", segmentPattern,
+            playlistURL.path
+        ]
+        return args
+    }
+
+    private func dvrPublisherArguments(
+        for config: StreamConfig,
+        playlistLocation: String,
+        useRealtimePacing: Bool,
+        usePreciseReadRate: Bool = false
     ) -> [String] {
         var args = [
             "-hide_banner",
@@ -1366,14 +2780,21 @@ final class StreamPipeline: ObservableObject {
         ]
 
         if useRealtimePacing {
-            args += ["-re"]
+            if usePreciseReadRate {
+                args += [
+                    "-readrate", "1",
+                    "-readrate_initial_burst", "0"
+                ]
+            } else {
+                args += ["-re"]
+            }
         }
 
         args += [
             "-thread_queue_size", "8192",
             "-fflags", "+genpts+discardcorrupt+igndts+sortdts",
             "-err_detect", "ignore_err",
-            "-i", playlistURL.path,
+            "-i", playlistLocation,
             "-map", "0:v:0",
             "-map", "0:a:0?",
             "-c:v", "copy",
@@ -1383,6 +2804,184 @@ final class StreamPipeline: ObservableObject {
         if config.outputType == .rtmp {
             args += [
                 "-bsf:v", "extract_extradata",
+                "-flvflags", "no_duration_filesize",
+                "-fflags", "+flush_packets",
+                "-flush_packets", "1",
+                "-max_muxing_queue_size", "4096",
+                "-muxdelay", "0",
+                "-muxpreload", "0",
+                "-max_interleave_delta", "0",
+                "-rtmp_live", "live"
+            ]
+        }
+
+        switch config.outputType {
+        case .rtmp:
+            args += ["-f", "flv", config.outputTarget]
+        case .hls:
+            args += [
+                "-f", "hls",
+                "-hls_time", "2",
+                "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+append_list+independent_segments",
+                config.outputTarget
+            ]
+        }
+        return args
+    }
+
+    private func segmentQueuePublisherArguments(for config: StreamConfig) -> [String] {
+        var args = [
+            "-hide_banner",
+            "-loglevel", "info",
+            "-stats_period", "1",
+            "-progress", "pipe:2",
+            "-thread_queue_size", "8192",
+            "-fflags", "+genpts+discardcorrupt+igndts+sortdts",
+            "-err_detect", "ignore_err",
+            "-f", "mpegts",
+            "-i", "pipe:0",
+            "-map", "0:v:0",
+            "-map", "0:a:0?",
+            "-c:v", "copy",
+            "-c:a", "copy"
+        ]
+
+        if config.outputType == .rtmp {
+            args += [
+                "-bsf:v", "extract_extradata",
+                "-flvflags", "no_duration_filesize",
+                "-fflags", "+flush_packets",
+                "-flush_packets", "1",
+                "-max_muxing_queue_size", "4096",
+                "-muxdelay", "0",
+                "-muxpreload", "0",
+                "-max_interleave_delta", "0",
+                "-rtmp_live", "live"
+            ]
+        }
+
+        switch config.outputType {
+        case .rtmp:
+            args += ["-f", "flv", config.outputTarget]
+        case .hls:
+            args += [
+                "-f", "hls",
+                "-hls_time", "2",
+                "-hls_list_size", "6",
+                "-hls_flags", "delete_segments+append_list+independent_segments",
+                config.outputTarget
+            ]
+        }
+        return args
+    }
+
+    private func segmentTCPPublisherArguments(
+        for config: StreamConfig,
+        inputURL: String,
+        transcodeOnPublish: Bool = false
+    ) -> [String] {
+        var args = [
+            "-hide_banner",
+            "-loglevel", "info",
+            "-stats_period", "1",
+            "-progress", "pipe:2",
+            "-thread_queue_size", "8192",
+            "-fflags", "+genpts+discardcorrupt+igndts+sortdts",
+            "-err_detect", "ignore_err",
+            "-f", "mpegts",
+            "-i", inputURL,
+            "-map", "0:v:0",
+            "-map", "0:a:0?"
+        ]
+
+        if transcodeOnPublish {
+            let syncOffsetMs = config.avSyncOffsetMs
+            let extraAudioDelayMs = max(0, syncOffsetMs)
+            let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
+            var audioFilters: [String] = []
+            let asyncDepth = config.audioContinuityEnabled ? "1000" : "1"
+            audioFilters.append("aresample=48000:async=\(asyncDepth):min_hard_comp=0.100:comp_duration=1.5:max_soft_comp=0.050:first_pts=0")
+            audioFilters.append("asetpts=N/SR/TB")
+
+            let targetFps = resolvedTargetFPS()
+            var videoSetptsExpr = "N/\(targetFps)/TB"
+            if extraVideoDelaySeconds > 0 {
+                let delay = String(format: "%.3f", extraVideoDelaySeconds)
+                videoSetptsExpr += "+\(delay)/TB"
+            }
+            let videoFilter = "fps=\(targetFps),settb=AVTB,setpts=\(videoSetptsExpr)"
+            let useVideoToolbox = (toolPaths?.supportsVideoToolboxH264 == true) && !forceSoftwareEncoderForSession
+
+            if useVideoToolbox {
+                args += [
+                    "-fps_mode", "cfr",
+                    "-vsync", "cfr",
+                    "-r", "\(targetFps)",
+                    "-c:v", "h264_videotoolbox",
+                    "-allow_sw", "1",
+                    "-realtime", "1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", "30",
+                    "-keyint_min", "30",
+                    "-bf", "0",
+                    "-b:v", "3500k",
+                    "-maxrate", "4500k",
+                    "-bufsize", "9000k",
+                    "-profile:v", "baseline",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)",
+                    "-vf", videoFilter,
+                    "-c:a", "aac",
+                    "-ar", "48000",
+                    "-ac", "2",
+                    "-b:a", "128k"
+                ]
+            } else {
+                args += [
+                    "-fps_mode", "cfr",
+                    "-vsync", "cfr",
+                    "-r", "\(targetFps)",
+                    "-c:v", "libx264",
+                    "-preset", "ultrafast",
+                    "-tune", "zerolatency",
+                    "-crf", "27",
+                    "-x264-params", "force-cfr=1:keyint=30:min-keyint=30:scenecut=0:repeat-headers=1",
+                    "-pix_fmt", "yuv420p",
+                    "-g", "30",
+                    "-keyint_min", "30",
+                    "-sc_threshold", "0",
+                    "-profile:v", "baseline",
+                    "-force_key_frames", "expr:gte(t,n_forced*1)",
+                    "-vf", videoFilter,
+                    "-c:a", "aac",
+                    "-ar", "48000",
+                    "-ac", "2",
+                    "-b:a", "128k"
+                ]
+            }
+
+            if extraAudioDelayMs > 0 {
+                audioFilters.append("adelay=\(extraAudioDelayMs)|\(extraAudioDelayMs)")
+            }
+            if config.audioBoostEnabled {
+                let boostDb = config.audioBoostDb
+                if boostDb > 0 {
+                    audioFilters.append("volume=\(boostDb)dB")
+                }
+                audioFilters.append("alimiter=limit=0.891251")
+            }
+            if !audioFilters.isEmpty {
+                args += ["-af", audioFilters.joined(separator: ",")]
+            }
+        } else {
+            args += ["-c:v", "copy", "-c:a", "copy"]
+        }
+
+        if config.outputType == .rtmp {
+            if !transcodeOnPublish {
+                args += ["-bsf:v", "extract_extradata"]
+            }
+            args += [
                 "-flvflags", "no_duration_filesize",
                 "-fflags", "+flush_packets",
                 "-flush_packets", "1",
@@ -1431,8 +3030,37 @@ final class StreamPipeline: ObservableObject {
         return fallback
     }
 
+    private func queuePrototypeSegmentDurationSeconds(for targetFPS: Int) -> Double {
+        _ = targetFPS
+        return Self.queuePrototypeBaseSegmentDurationSeconds
+    }
+
+    private func usesStreamlinkSupervisorPipeline(for config: StreamConfig) -> Bool {
+        config.outputType == .rtmp && config.encodeMode != .experimentalDirectRTMP
+    }
+
+    private func usesStreamlinkSupervisorRemuxPipeline(for config: StreamConfig) -> Bool {
+        usesStreamlinkSupervisorPipeline(for: config) && config.encodeMode == .copy
+    }
+
+    private func usesStreamlinkSupervisorTranscodePipeline(for config: StreamConfig) -> Bool {
+        usesStreamlinkSupervisorPipeline(for: config) && config.encodeMode == .transcode
+    }
+
+    private func usesBufferedStartupDelay(for config: StreamConfig) -> Bool {
+        config.encodeMode.usesCompatibilityPipeline &&
+            config.bufferSeconds > 0 &&
+            !usesStreamlinkSupervisorPipeline(for: config)
+    }
+
     private func bufferStateText(for config: StreamConfig) -> String {
-        guard config.encodeMode == .transcode else {
+        if usesStreamlinkSupervisorRemuxPipeline(for: config) {
+            return "Not used (Supervised Remux)"
+        }
+        if usesStreamlinkSupervisorTranscodePipeline(for: config) {
+            return "Not used (Single-stage Transcode)"
+        }
+        guard config.encodeMode.usesCompatibilityPipeline else {
             return "Off (Stream Copy)"
         }
         if config.bufferSeconds <= 0 {
@@ -1442,14 +3070,20 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func initialBufferProgress(for config: StreamConfig) -> Double {
-        if config.encodeMode != .transcode {
+        if usesStreamlinkSupervisorPipeline(for: config) {
+            return 1.0
+        }
+        if !config.encodeMode.usesCompatibilityPipeline {
             return 1.0
         }
         return config.bufferSeconds > 0 ? 0.0 : 1.0
     }
 
     private func avSyncStateText(for config: StreamConfig) -> String {
-        if config.encodeMode != .transcode {
+        if usesStreamlinkSupervisorRemuxPipeline(for: config) {
+            return "Off (Remux)"
+        }
+        if !config.encodeMode.usesCompatibilityPipeline {
             return "Off (Stream Copy)"
         }
         if config.avSyncOffsetMs == 0 {
@@ -1474,7 +3108,9 @@ final class StreamPipeline: ObservableObject {
         let continuityLabel = config.audioContinuityEnabled ? "on" : "off"
         let storageLabel = config.useDiskBackedBuffer ? "disk" : "memory"
         let monitoringLabel = logMonitoringEnabled ? "on" : "off"
-        let fpsLabel = config.encodeMode == .transcode ? "\(resolvedTargetFPS())fps" : "source"
+        let fpsLabel = (config.encodeMode.usesCompatibilityPipeline && !usesStreamlinkSupervisorRemuxPipeline(for: config))
+            ? "\(resolvedTargetFPS())fps"
+            : "source"
         appendLog(
             "[app] Session config: mode=\(config.encodeMode.rawValue), format=\(config.outputType.rawValue), buffer=\(config.bufferSeconds)s, storage=\(storageLabel), avOffset=\(config.avSyncOffsetMs)ms, targetFps=\(fpsLabel), audioBoost=\(boostLabel), audioContinuity=\(continuityLabel), logMonitoring=\(monitoringLabel), output=\(outputTarget)"
         )
@@ -1617,6 +3253,7 @@ final class StreamPipeline: ObservableObject {
 
     private func appendLog(_ message: String) {
         let isToolMessage = message.hasPrefix("[yt-dlp] ") ||
+            message.hasPrefix("[streamlink] ") ||
             message.hasPrefix("[ffmpeg] ") ||
             message.hasPrefix("[ffmpeg-normalizer] ")
 
@@ -1865,87 +3502,93 @@ final class StreamPipeline: ObservableObject {
                     appendDiagnosticSnapshot(reason: "speed-drift")
                 }
 
-                let publishAge = now.timeIntervalSince(lastPublishStartedAt)
-                let outputState = parsedStatus.outputState.lowercased()
-                let canEnforceHighSpeed = shouldKeepRunning &&
-                    isRunning &&
-                    outputState.contains("publish") &&
-                    publishAge >= Self.highSpeedRestartGracePeriod
-                if canEnforceHighSpeed && speed > Self.highSpeedRestartThreshold {
-                    if highSpeedSince == Date.distantPast {
-                        highSpeedSince = now
-                    }
-                    let highSpeedDuration = now.timeIntervalSince(highSpeedSince)
-                    if highSpeedDuration >= Self.highSpeedRestartDuration {
-                        let speedText = String(format: "%.2f", speed)
-                        ffmpegDiagnosticCounters["speed_high_restart", default: 0] += 1
-                        appendLog(
-                            "[app] Output speed stayed high (\(speedText)x for \(Int(highSpeedDuration.rounded()))s). Restarting publisher stage with strict pacing."
-                        )
-                        appendDiagnosticSnapshot(reason: "high-speed-publisher-restart")
-                        highSpeedSince = Date.distantPast
-                        schedulePublisherOnlyRestart(
-                            generation: generation,
-                            reason: "sustained speed \(speedText)x"
-                        )
-                        return
-                    }
-                } else {
-                    highSpeedSince = Date.distantPast
-                }
-
-                if speed < Self.lowSpeedThreshold {
-                    if lowSpeedSince == Date.distantPast {
-                        lowSpeedSince = now
-                    }
-                    let lowSpeedDuration = now.timeIntervalSince(lowSpeedSince)
-                    let bufferedSeconds = estimatedBufferedSeconds()
-                    let bufferStarved = bufferedSeconds <= Self.lowSpeedRestartBufferCeiling
-                    if bufferStarved &&
-                        lowSpeedDuration >= Self.lowSpeedRestartThreshold &&
-                        !freezeRecoveryTriggered &&
-                        shouldKeepRunning &&
-                        isRunning {
-                        freezeRecoveryTriggered = true
-                        ffmpegDiagnosticCounters["speed_low_restart", default: 0] += 1
-                        let lowSpeedText = String(format: "%.2f", speed)
-                        let bufferText = String(format: "%.1f", bufferedSeconds)
-                        appendLog(
-                            "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with low staged buffer (\(bufferText)s). Restarting pipeline."
-                        )
-                        appendDiagnosticSnapshot(reason: "low-speed-restart")
-                        terminatePipeline()
-                        scheduleRestart(generation: generation, reason: .lowSpeed)
-                        return
-                    }
-
-                    let bufferHealthy = bufferedSeconds >= Self.catchUpBufferFloor
-                    let catchUpEligibleSpeed = speed < Self.catchUpLowSpeedThreshold
-                    if bufferHealthy && catchUpEligibleSpeed {
-                        if lowSpeedHealthySince == Date.distantPast {
-                            lowSpeedHealthySince = now
+                if !queuePublisherPrototypeEnabled {
+                    let publishAge = now.timeIntervalSince(lastPublishStartedAt)
+                    let outputState = parsedStatus.outputState.lowercased()
+                    let canEnforceHighSpeed = shouldKeepRunning &&
+                        isRunning &&
+                        outputState.contains("publish") &&
+                        publishAge >= Self.highSpeedRestartGracePeriod
+                    if canEnforceHighSpeed && speed > Self.highSpeedRestartThreshold {
+                        if highSpeedSince == Date.distantPast {
+                            highSpeedSince = now
                         }
-                        let healthyLowSpeedDuration = now.timeIntervalSince(lowSpeedHealthySince)
-                        if healthyLowSpeedDuration >= Self.catchUpTriggerThreshold &&
-                            !isCatchUpActive(now: now) &&
-                            shouldKeepRunning &&
-                            isRunning {
+                        let highSpeedDuration = now.timeIntervalSince(highSpeedSince)
+                        if highSpeedDuration >= Self.highSpeedRestartDuration {
                             let speedText = String(format: "%.2f", speed)
-                            let bufferText = String(format: "%.1f", bufferedSeconds)
-                            catchUpExpiresAt = now.addingTimeInterval(Self.catchUpDuration)
-                            ffmpegDiagnosticCounters["speed_low_catchup", default: 0] += 1
+                            ffmpegDiagnosticCounters["speed_high_restart", default: 0] += 1
                             appendLog(
-                                "[app] Output speed stayed below realtime (\(speedText)x for \(Int(healthyLowSpeedDuration.rounded()))s) with healthy staged buffer (\(bufferText)s). Enabling temporary catch-up mode (no -re) for \(Int(Self.catchUpDuration))s."
+                                "[app] Output speed stayed high (\(speedText)x for \(Int(highSpeedDuration.rounded()))s). Restarting publisher stage with strict pacing."
                             )
-                            appendDiagnosticSnapshot(reason: "catch-up-enable")
-                            terminatePipeline()
-                            scheduleRestart(generation: generation, reason: .catchUp)
+                            appendDiagnosticSnapshot(reason: "high-speed-publisher-restart")
+                            highSpeedSince = Date.distantPast
+                            schedulePublisherOnlyRestart(
+                                generation: generation,
+                                reason: "sustained speed \(speedText)x"
+                            )
                             return
                         }
                     } else {
+                        highSpeedSince = Date.distantPast
+                    }
+
+                    if speed < Self.lowSpeedThreshold {
+                        if lowSpeedSince == Date.distantPast {
+                            lowSpeedSince = now
+                        }
+                        let lowSpeedDuration = now.timeIntervalSince(lowSpeedSince)
+                        let bufferedSeconds = estimatedBufferedSeconds()
+                        let bufferStarved = bufferedSeconds <= Self.lowSpeedRestartBufferCeiling
+                        if bufferStarved &&
+                            lowSpeedDuration >= Self.lowSpeedRestartThreshold &&
+                            !freezeRecoveryTriggered &&
+                            shouldKeepRunning &&
+                            isRunning {
+                            freezeRecoveryTriggered = true
+                            ffmpegDiagnosticCounters["speed_low_restart", default: 0] += 1
+                            let lowSpeedText = String(format: "%.2f", speed)
+                            let bufferText = String(format: "%.1f", bufferedSeconds)
+                            appendLog(
+                                "[app] Output speed remained low (\(lowSpeedText)x for \(Int(lowSpeedDuration.rounded()))s) with low staged buffer (\(bufferText)s). Restarting pipeline."
+                            )
+                            appendDiagnosticSnapshot(reason: "low-speed-restart")
+                            terminatePipeline()
+                            scheduleRestart(generation: generation, reason: .lowSpeed)
+                            return
+                        }
+
+                        let bufferHealthy = bufferedSeconds >= Self.catchUpBufferFloor
+                        let catchUpEligibleSpeed = speed < Self.catchUpLowSpeedThreshold
+                        if bufferHealthy && catchUpEligibleSpeed {
+                            if lowSpeedHealthySince == Date.distantPast {
+                                lowSpeedHealthySince = now
+                            }
+                            let healthyLowSpeedDuration = now.timeIntervalSince(lowSpeedHealthySince)
+                            if healthyLowSpeedDuration >= Self.catchUpTriggerThreshold &&
+                                !isCatchUpActive(now: now) &&
+                                shouldKeepRunning &&
+                                isRunning {
+                                let speedText = String(format: "%.2f", speed)
+                                let bufferText = String(format: "%.1f", bufferedSeconds)
+                                catchUpExpiresAt = now.addingTimeInterval(Self.catchUpDuration)
+                                ffmpegDiagnosticCounters["speed_low_catchup", default: 0] += 1
+                                appendLog(
+                                    "[app] Output speed stayed below realtime (\(speedText)x for \(Int(healthyLowSpeedDuration.rounded()))s) with healthy staged buffer (\(bufferText)s). Enabling temporary catch-up mode (no -re) for \(Int(Self.catchUpDuration))s."
+                                )
+                                appendDiagnosticSnapshot(reason: "catch-up-enable")
+                                terminatePipeline()
+                                scheduleRestart(generation: generation, reason: .catchUp)
+                                return
+                            }
+                        } else {
+                            lowSpeedHealthySince = Date.distantPast
+                        }
+                    } else {
+                        lowSpeedSince = Date.distantPast
                         lowSpeedHealthySince = Date.distantPast
                     }
                 } else {
+                    highSpeedSince = Date.distantPast
                     lowSpeedSince = Date.distantPast
                     lowSpeedHealthySince = Date.distantPast
                 }
@@ -2179,7 +3822,14 @@ final class StreamPipeline: ObservableObject {
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
 
-        guard config.encodeMode == .transcode, config.bufferSeconds > 0 else {
+        if usesStreamlinkSupervisorPipeline(for: config) {
+            parsedStatus.bufferState = bufferStateText(for: config)
+            parsedStatus.bufferProgress = initialBufferProgress(for: config)
+            parsedStatus.stagedBufferSeconds = 0
+            return
+        }
+
+        guard config.encodeMode.usesCompatibilityPipeline, config.bufferSeconds > 0 else {
             parsedStatus.bufferState = bufferStateText(for: config)
             parsedStatus.bufferProgress = initialBufferProgress(for: config)
             return
@@ -2204,6 +3854,177 @@ final class StreamPipeline: ObservableObject {
         }.value
     }
 
+    nonisolated private static func readQueuedSegmentsOffMain(from playlistURL: URL) async -> [QueuedSegment] {
+        await Task.detached(priority: .utility) {
+            SegmentQueueSupport.readQueuedSegments(from: playlistURL)
+        }.value
+    }
+
+    nonisolated private static func measureQueuedSegmentDurationScaleOffMain(
+        ffprobeURL: URL,
+        segments: [QueuedSegment]
+    ) async -> Double? {
+        await Task.detached(priority: .utility) {
+            measureQueuedSegmentDurationScaleBlocking(ffprobeURL: ffprobeURL, segments: segments)
+        }.value
+    }
+
+    nonisolated private static func readSegmentDataOffMain(from fileURL: URL) async throws -> Data {
+        try await Task.detached(priority: .utility) {
+            try Data(contentsOf: fileURL)
+        }.value
+    }
+
+    nonisolated private static func writeTextOffMain(_ text: String, to fileURL: URL) async throws {
+        try await Task.detached(priority: .utility) {
+            try text.write(to: fileURL, atomically: true, encoding: .utf8)
+        }.value
+    }
+
+    nonisolated private static func writePlayoutPlaylistOffMain(
+        to playlistURL: URL,
+        segments: ArraySlice<QueuedSegment>,
+        baseDirectory: URL,
+        mediaSequence: Int,
+        includeDiscontinuityAtStart: Bool,
+        includeEndList: Bool
+    ) async throws {
+        let contents = SegmentQueueSupport.playlistContents(
+            for: segments,
+            baseDirectory: baseDirectory,
+            mediaSequence: mediaSequence,
+            includeDiscontinuityAtStart: includeDiscontinuityAtStart,
+            includeEndList: includeEndList
+        )
+        try await writeTextOffMain(contents, to: playlistURL)
+    }
+
+    nonisolated private static func writeDataOffMain(_ data: Data, to descriptor: Int32) async throws {
+        try await Task.detached(priority: .utility) {
+            try writeDataBlocking(data, to: descriptor)
+        }.value
+    }
+
+    nonisolated private static func streamSegmentDataOffMain(
+        _ data: Data,
+        to descriptor: Int32,
+        over duration: TimeInterval
+    ) async throws {
+        let packetSize = max(1, mpegTsPacketSize)
+        let packetCount = max(1, data.count / packetSize)
+        let tick = max(0.01, queuePacingTick)
+        let ticks = max(1, Int(ceil(duration / tick)))
+
+        var offset = 0
+        for tickIndex in 0..<ticks {
+            try Task.checkCancellation()
+            let packetsAlreadySent = offset / packetSize
+            let packetsRemaining = max(0, packetCount - packetsAlreadySent)
+            let ticksRemaining = max(1, ticks - tickIndex)
+            let packetsThisTick = max(1, Int(ceil(Double(packetsRemaining) / Double(ticksRemaining))))
+            let bytesThisTick = min(data.count - offset, packetsThisTick * packetSize)
+            if bytesThisTick > 0 {
+                let chunk = data.subdata(in: offset..<(offset + bytesThisTick))
+                try await writeDataOffMain(chunk, to: descriptor)
+                offset += bytesThisTick
+            }
+            if tickIndex < ticks - 1 {
+                let nanos = UInt64((tick * 1_000_000_000).rounded())
+                try await Task.sleep(nanoseconds: nanos)
+            }
+        }
+
+        if offset < data.count {
+            try await writeDataOffMain(data.subdata(in: offset..<data.count), to: descriptor)
+        }
+    }
+
+    nonisolated private static func writeDataBlocking(_ data: Data, to descriptor: Int32) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return
+            }
+            var totalWritten = 0
+            while totalWritten < rawBuffer.count {
+                let bytesRemaining = rawBuffer.count - totalWritten
+                let result = Darwin.write(descriptor, baseAddress.advanced(by: totalWritten), bytesRemaining)
+                if result < 0 {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                totalWritten += result
+            }
+        }
+    }
+
+    nonisolated private static func measureQueuedSegmentDurationScaleBlocking(
+        ffprobeURL: URL,
+        segments: [QueuedSegment]
+    ) -> Double? {
+        let startIndex = min(Self.streamPacingCalibrationSkipCount, segments.count)
+        let sampleSegments = Array(
+            segments
+                .dropFirst(startIndex)
+                .prefix(Self.streamPacingCalibrationSampleCount)
+        )
+        guard sampleSegments.count >= Self.streamPacingCalibrationSampleCount else { return nil }
+
+        var declaredDurations: [Double] = []
+        var measuredDurations: [Double] = []
+
+        for segment in sampleSegments {
+            let declaredDuration = max(0, segment.duration)
+            guard declaredDuration > 0 else { continue }
+            guard let measuredDuration = probeSegmentDuration(ffprobeURL: ffprobeURL, fileURL: segment.fileURL),
+                  measuredDuration > 0 else {
+                continue
+            }
+            declaredDurations.append(declaredDuration)
+            measuredDurations.append(measuredDuration)
+        }
+
+        guard declaredDurations.count >= max(4, Self.streamPacingCalibrationSampleCount / 2) else {
+            return nil
+        }
+
+        let averageDeclared = declaredDurations.reduce(0, +) / Double(declaredDurations.count)
+        let averageMeasured = measuredDurations.reduce(0, +) / Double(measuredDurations.count)
+        guard averageDeclared > 0, averageMeasured > 0 else { return nil }
+        return averageMeasured / averageDeclared
+    }
+
+    nonisolated private static func probeSegmentDuration(ffprobeURL: URL, fileURL: URL) -> Double? {
+        let process = Process()
+        process.executableURL = ffprobeURL
+        process.arguments = [
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nw=1:nk=1",
+            fileURL.path
+        ]
+
+        let outputPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+
+        let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: outputData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else {
+            return nil
+        }
+        return Double(text)
+    }
+
+
     nonisolated private static func readPlaylistDurationSecondsBlocking(from playlistURL: URL) -> Double {
         guard let text = try? String(contentsOf: playlistURL, encoding: .utf8) else {
             return 0
@@ -2226,7 +4047,7 @@ final class StreamPipeline: ObservableObject {
         targetDelay: Double,
         publishingStarted: Bool
     ) {
-        guard config.encodeMode == .transcode else { return }
+        guard config.encodeMode.usesCompatibilityPipeline else { return }
         let now = Date()
         parsedStatus.stagedBufferSeconds = max(0, availableSeconds)
         guard now.timeIntervalSince(lastBufferUiUpdate) >= 0.25 else { return }
@@ -2303,10 +4124,13 @@ final class StreamPipeline: ObservableObject {
             ? 0
             : max(0, now.timeIntervalSince(lastVideoFrameAdvanceAt))
         let speed = parseSpeedFactor(parsedStatus.ffmpegSpeed)
+        let usesStartupBuffer = usesBufferedStartupDelay(for: config)
 
         let bufferMetric: StreamHealthMetric
-        if config.encodeMode != .transcode || config.bufferSeconds <= 0 {
-            bufferMetric = healthMetric("Buffer", detail: "Bypassed", level: .neutral)
+        if !config.encodeMode.usesCompatibilityPipeline || !usesStartupBuffer {
+            let detail = config.encodeMode.usesCompatibilityPipeline ? "Not used on this path" : "Bypassed"
+            let level: StreamHealthLevel = isRunning ? .good : .neutral
+            bufferMetric = healthMetric("Buffer", detail: detail, level: level)
         } else if bufferExhausted {
             bufferMetric = healthMetric("Buffer", detail: "Exhausted", level: .critical)
         } else {
@@ -2441,6 +4265,71 @@ final class StreamPipeline: ObservableObject {
     private static let statsEventInterval: TimeInterval = 0.5
     private static let outputStallThreshold: TimeInterval = 12.0
     private static let transientStallLogThreshold: TimeInterval = 2.5
+    nonisolated private static let queuePacingTick: TimeInterval = 0.05
+    nonisolated private static let mpegTsPacketSize = 188
+    private static let queueTrimHeadroomSeconds: Double = 8
+    private static let queueTrimResumeSeconds: Double = 2
+    private static let queueStartupTrimHeadroomSeconds: Double = 1
+    nonisolated fileprivate static let directRTMPQueueTrimHeadroomSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_HEADROOM_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 0.75
+        return max(parsed, 0)
+    }()
+    nonisolated fileprivate static let directRTMPQueueTrimResumeSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_RESUME_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 0.25
+        return max(parsed, 0)
+    }()
+    nonisolated fileprivate static let directRTMPTrimWarmupDelaySeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_WARMUP_DELAY_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 2.0
+        return max(parsed, 0)
+    }()
+    nonisolated fileprivate static let directRTMPTrimWarmupDurationSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_WARMUP_DURATION_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 8.0
+        return max(parsed, 0)
+    }()
+    nonisolated fileprivate static let directRTMPWarmupTrimHeadroomSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_WARMUP_TRIM_HEADROOM_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 3.0
+        return max(parsed, 0)
+    }()
+    nonisolated fileprivate static let directRTMPWarmupTrimResumeSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_WARMUP_TRIM_RESUME_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 1.5
+        return max(parsed, 0)
+    }()
+    nonisolated private static let directRTMPQueueStartupTrimHeadroomSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_STARTUP_TRIM_HEADROOM_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 0.25
+        return max(parsed, 0)
+    }()
+    private static let queuePrototypeBaseSegmentDurationSeconds: Double = 0.5
+    private static let playoutPlaylistLeadSeconds: Double = 1
+    private static let httpPlayoutPlaylistLeadSeconds: Double = 0.75
+    private static let playoutPlaylistRetainPastSeconds: Double = 2
+    private static let playoutPlaylistUpdateIntervalNanoseconds: UInt64 = 250_000_000
+    nonisolated fileprivate static let directRTMPTrimAdvanceFactor: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_ADVANCE_FACTOR"] ?? ""
+        let parsed = Double(rawValue) ?? 1.0
+        return min(max(parsed, 0), 1)
+    }()
+    nonisolated fileprivate static let directRTMPTrimAdvanceStepSeconds: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_ADVANCE_STEP_SECONDS"] ?? ""
+        let parsed = Double(rawValue) ?? 0.5
+        return max(parsed, 0.05)
+    }()
+    nonisolated fileprivate static let directRTMPTrimScheduleAdvanceFactor: Double = {
+        let rawValue = ProcessInfo.processInfo.environment["BACKCHANNEL_DIRECT_RTMP_TRIM_SCHEDULE_ADVANCE_FACTOR"] ?? ""
+        let parsed = Double(rawValue) ?? 1.0
+        return min(max(parsed, 0), 1)
+    }()
+    nonisolated private static let streamPacingCalibrationMinimumSegmentCount: Int = 12
+    nonisolated private static let streamPacingCalibrationSkipCount: Int = 2
+    nonisolated private static let streamPacingCalibrationSampleCount: Int = 10
+    nonisolated private static let streamPacingCalibrationMinimumScale: Double = 0.98
+    nonisolated private static let streamPacingCalibrationMaximumScale: Double = 1.06
     private static let outputFreezeLogThreshold: TimeInterval = 6.0
     private static let outputFreezeHeartbeatInterval: TimeInterval = 10.0
     private static let outputFreezeRestartThreshold: TimeInterval = 12.0
@@ -2507,6 +4396,9 @@ final class StreamPipeline: ObservableObject {
         if message.hasPrefix("[yt-dlp] ") {
             return .ytDlp
         }
+        if message.hasPrefix("[streamlink] ") {
+            return .ytDlp
+        }
         return .unknown
     }
 
@@ -2539,15 +4431,184 @@ final class StreamPipeline: ObservableObject {
         now < catchUpExpiresAt
     }
 
+    private func resolvedQueuePublisherMode(for config: StreamConfig) -> QueuePublisherMode {
+        if config.encodeMode == .experimentalDirectRTMP {
+            return .directRTMP
+        }
+        let value = ProcessInfo.processInfo.environment["BACKCHANNEL_INTERNAL_PIPELINE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        switch value {
+        case "segment-queue", "queue":
+            return .stdin
+        case "segment-playlist", "playlist-queue", "queue-playlist":
+            return .playlist
+        case "segment-tcp", "queue-tcp", "tcp-queue", "segment-stream":
+            return .tcpStream
+        case "segment-tcp-measured", "queue-tcp-measured", "tcp-measured":
+            return .tcpMeasuredStream
+        case "segment-tcp-transcode", "queue-tcp-transcode", "tcp-transcode":
+            return .tcpMeasuredTranscode
+        case "segment-http", "queue-http", "http-queue", "http-playlist":
+            return .httpPlaylist
+        case "segment-haishin", "queue-haishin", "haishin-rtmp", "segment-rtmp":
+            return .haishinRTMP
+        case "segment-direct-rtmp", "queue-direct-rtmp", "direct-rtmp", "segment-ts-rtmp":
+            return .directRTMP
+        default:
+            return .disabled
+        }
+    }
+
     private func supportsBufferedDrainOnSourceExit() -> Bool {
         guard let config = currentConfig else { return false }
-        return config.encodeMode == .transcode && config.bufferSeconds > 0
+        if usesStreamlinkSupervisorPipeline(for: config) {
+            return false
+        }
+        return config.encodeMode.usesCompatibilityPipeline && config.bufferSeconds > 0
+    }
+
+    private func playoutLeadSeconds() -> Double {
+        switch queuePublisherMode {
+        case .httpPlaylist:
+            return Self.httpPlayoutPlaylistLeadSeconds
+        default:
+            return Self.playoutPlaylistLeadSeconds
+        }
+    }
+
+    private func trimQueuedBacklogIfNeeded(
+        segments: [QueuedSegment],
+        nextSegmentIndex: inout Int,
+        targetDelay: Double,
+        headroomSeconds: Double? = nil,
+        resumeSeconds: Double? = nil
+    ) -> Double {
+        guard targetDelay > 0 else { return 0 }
+        guard nextSegmentIndex < segments.count else { return 0 }
+
+        let maxQueuedDelay = targetDelay + (headroomSeconds ?? Self.queueTrimHeadroomSeconds)
+        let resumeQueuedDelay = targetDelay + (resumeSeconds ?? Self.queueTrimResumeSeconds)
+        var queuedDuration = SegmentQueueSupport.queuedDuration(for: segments.suffix(from: nextSegmentIndex))
+        guard queuedDuration > maxQueuedDelay else { return 0 }
+
+        var droppedDuration = 0.0
+        var droppedSegments = 0
+        while nextSegmentIndex + droppedSegments < segments.count &&
+                (queuedDuration - droppedDuration) > resumeQueuedDelay {
+            droppedDuration += max(0, segments[nextSegmentIndex + droppedSegments].duration)
+            droppedSegments += 1
+        }
+
+        guard droppedSegments > 0 else { return 0 }
+
+        nextSegmentIndex += droppedSegments
+        queuedDuration = max(0, queuedDuration - droppedDuration)
+        ffmpegDiagnosticCounters["queue_trim", default: 0] += 1
+        appendLog(
+            "[app] Queued delay grew to \(Int((queuedDuration + droppedDuration).rounded()))s. Dropping \(droppedSegments) queued segment(s) (~\(Int(droppedDuration.rounded()))s) to hold latency near \(Int(targetDelay.rounded()))s."
+        )
+        return droppedDuration
+    }
+
+    private func trimQueuedBacklogForStartupIfNeeded(
+        segments: [QueuedSegment],
+        nextSegmentIndex: inout Int,
+        targetDelay: Double,
+        headroomSeconds: Double? = nil
+    ) -> Bool {
+        guard targetDelay > 0 else { return false }
+        guard nextSegmentIndex < segments.count else { return false }
+
+        let allowedQueuedDelay = targetDelay + (headroomSeconds ?? Self.queueStartupTrimHeadroomSeconds)
+        var queuedDuration = SegmentQueueSupport.queuedDuration(for: segments.suffix(from: nextSegmentIndex))
+        guard queuedDuration > allowedQueuedDelay else { return false }
+
+        var droppedDuration = 0.0
+        var droppedSegments = 0
+        while nextSegmentIndex + droppedSegments < segments.count &&
+                (queuedDuration - droppedDuration) > allowedQueuedDelay {
+            droppedDuration += max(0, segments[nextSegmentIndex + droppedSegments].duration)
+            droppedSegments += 1
+        }
+
+        guard droppedSegments > 0 else { return false }
+
+        nextSegmentIndex += droppedSegments
+        queuedDuration = max(0, queuedDuration - droppedDuration)
+        ffmpegDiagnosticCounters["queue_trim", default: 0] += 1
+        appendLog(
+            "[app] Startup queue trimmed by \(droppedSegments) segment(s) (~\(Int(droppedDuration.rounded()))s) to begin near \(Int(targetDelay.rounded()))s delay (\(Int(queuedDuration.rounded()))s queued)."
+        )
+        return true
     }
 
     private func shouldMonitorStallRecovery() -> Bool {
+        if queuePublisherPrototypeEnabled {
+            return true
+        }
         guard let config = currentConfig else { return true }
-        let usesDelayedBuffer = config.encodeMode == .transcode && config.bufferSeconds > 0
+        if usesStreamlinkSupervisorPipeline(for: config) {
+            return true
+        }
+        let usesDelayedBuffer = config.encodeMode.usesCompatibilityPipeline && config.bufferSeconds > 0
         return !usesDelayedBuffer
+    }
+
+    private func recordSyntheticPublisherProgress(_ progress: SegmentPublisherProgress) {
+        let now = Date()
+        parsedStatus.ffmpegTime = formatClock(seconds: progress.mediaSeconds)
+        parsedStatus.ffmpegSpeed = String(format: "%.3fx", progress.speed)
+
+        if progress.containsVideo {
+            lastVideoFrameAdvanceAt = now
+            videoCadenceFreezeActive = false
+        }
+
+        if progress.mediaSeconds > lastFfmpegProgressSeconds + 0.01 {
+            let progressGap = now.timeIntervalSince(lastFfmpegProgressAt)
+            let wasPublishing = parsedStatus.outputState.lowercased().contains("publish")
+            if hasSeenFfmpegProgress &&
+                wasPublishing &&
+                progressGap >= Self.transientStallLogThreshold &&
+                progressGap < Self.outputFreezeLogThreshold {
+                ffmpegDiagnosticCounters["transient_stall", default: 0] += 1
+                appendLog(
+                    "[app] Short output stall recovered after \(Int(progressGap.rounded()))s (no restart needed)."
+                )
+            }
+
+            lastFfmpegProgressSeconds = progress.mediaSeconds
+            lastFfmpegProgressAt = now
+            hasSeenFfmpegProgress = true
+            stallRecoveryTriggered = false
+            freezeRecoveryTriggered = false
+
+            if outputFreezeActive {
+                outputFreezeActive = false
+                let freezeDuration = max(0, now.timeIntervalSince(outputFreezeStartedAt))
+                appendLog("[app] Output freeze recovered after \(Int(freezeDuration.rounded()))s.")
+                appendDiagnosticSnapshot(reason: "freeze-recovered")
+            }
+        }
+
+        if progress.speed > Self.speedDriftThreshold,
+           now.timeIntervalSince(lastSpeedDriftLogAt) >= Self.speedDriftLogInterval {
+            lastSpeedDriftLogAt = now
+            ffmpegDiagnosticCounters["speed_drift", default: 0] += 1
+            let speedText = String(format: "%.2f", progress.speed)
+            appendLog(
+                "[app] Output speed drift detected (\(speedText)x). Receiver-side jitter/freezes are more likely when publishing faster than realtime."
+            )
+            appendDiagnosticSnapshot(reason: "speed-drift")
+        }
+
+        if now.timeIntervalSince(lastFfmpegProgressLogAt) >= Self.ffmpegProgressLogInterval {
+            lastFfmpegProgressLogAt = now
+            appendLogCore("[app] ffmpeg progress: t=\(parsedStatus.ffmpegTime)")
+        }
+
+        refreshStreamHealth(now: now)
     }
 
     private func estimatedBufferedSeconds() -> Double {
@@ -2556,7 +4617,8 @@ final class StreamPipeline: ObservableObject {
             return stagedSeconds
         }
         guard let config = currentConfig,
-              config.encodeMode == .transcode,
+              !usesStreamlinkSupervisorPipeline(for: config),
+              config.encodeMode.usesCompatibilityPipeline,
               config.bufferSeconds > 0 else {
             return 0
         }
@@ -2820,8 +4882,405 @@ final class StreamPipeline: ObservableObject {
     }
 }
 
+private actor LocalTCPPublisherBridge {
+    let port: UInt16
+    nonisolated let inputURL: String
+
+    private let listenerFD: Int32
+    private var clientFD: Int32?
+    private let acceptTask: Task<Int32, Error>
+    private var isClosed = false
+
+    init() throws {
+        let listenerFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard listenerFD >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        var reuseAddr: Int32 = 1
+        if Darwin.setsockopt(listenerFD, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(0).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listenerFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        guard Darwin.listen(listenerFD, 1) == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        var boundAddress = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &boundAddress) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(listenerFD, $0, &length)
+            }
+        }
+        guard nameResult == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        self.listenerFD = listenerFD
+        self.port = UInt16(bigEndian: boundAddress.sin_port)
+        self.inputURL = "tcp://127.0.0.1:\(UInt16(bigEndian: boundAddress.sin_port))"
+        self.acceptTask = Task.detached(priority: .utility) {
+            try Self.acceptClient(on: listenerFD)
+        }
+    }
+
+    func connectedDescriptor() async throws -> Int32 {
+        if let clientFD {
+            return clientFD
+        }
+        let acceptedFD = try await acceptTask.value
+        self.clientFD = acceptedFD
+        return acceptedFD
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        Darwin.shutdown(listenerFD, SHUT_RDWR)
+        Darwin.close(listenerFD)
+        if let clientFD {
+            Darwin.shutdown(clientFD, SHUT_RDWR)
+            Darwin.close(clientFD)
+            self.clientFD = nil
+        }
+    }
+
+    private static func acceptClient(on listenerFD: Int32) throws -> Int32 {
+        var address = sockaddr()
+        var length = socklen_t(MemoryLayout<sockaddr>.size)
+        let clientFD = Darwin.accept(listenerFD, &address, &length)
+        guard clientFD >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        var noSigPipe: Int32 = 1
+        _ = Darwin.setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        return clientFD
+    }
+}
+
+private actor LocalHTTPPlayoutServer {
+    private struct HTTPRequest {
+        let method: String
+        let path: String
+        let rangeStart: Int?
+    }
+
+    let port: UInt16
+    nonisolated let playlistLocation: String
+
+    private let listenerFD: Int32
+    private let acceptTask: Task<Void, Never>
+    private var isClosed = false
+
+    init(baseDirectory: URL, playlistURL: URL) throws {
+        let listenerFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard listenerFD >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        var reuseAddr: Int32 = 1
+        if Darwin.setsockopt(listenerFD, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = in_port_t(0).bigEndian
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+        let bindResult = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(listenerFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        guard Darwin.listen(listenerFD, 8) == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        var boundAddress = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &boundAddress) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(listenerFD, $0, &length)
+            }
+        }
+        guard nameResult == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            Darwin.close(listenerFD)
+            throw error
+        }
+
+        let port = UInt16(bigEndian: boundAddress.sin_port)
+        self.listenerFD = listenerFD
+        self.port = port
+        self.playlistLocation = "http://127.0.0.1:\(port)/playout.m3u8"
+        self.acceptTask = Task.detached(priority: .utility) {
+            await Self.acceptLoop(on: listenerFD, baseDirectory: baseDirectory, playlistURL: playlistURL)
+        }
+    }
+
+    func close() {
+        guard !isClosed else { return }
+        isClosed = true
+        acceptTask.cancel()
+        Darwin.shutdown(listenerFD, SHUT_RDWR)
+        Darwin.close(listenerFD)
+    }
+
+    private static func acceptLoop(on listenerFD: Int32, baseDirectory: URL, playlistURL: URL) async {
+        while !Task.isCancelled {
+            var address = sockaddr()
+            var length = socklen_t(MemoryLayout<sockaddr>.size)
+            let clientFD = Darwin.accept(listenerFD, &address, &length)
+            if clientFD < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                break
+            }
+
+            var noSigPipe: Int32 = 1
+            _ = Darwin.setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+
+            Task.detached(priority: .utility) {
+                Self.serveClient(
+                    clientFD,
+                    baseDirectory: baseDirectory,
+                    playlistURL: playlistURL
+                )
+            }
+        }
+    }
+
+    private static func serveClient(_ clientFD: Int32, baseDirectory: URL, playlistURL: URL) {
+        defer {
+            Darwin.shutdown(clientFD, SHUT_RDWR)
+            Darwin.close(clientFD)
+        }
+
+        guard let request = requestInfo(from: clientFD) else {
+            log("request parse failed")
+            sendResponse(status: "400 Bad Request", contentType: "text/plain; charset=utf-8", body: Data("Bad request".utf8), to: clientFD)
+            return
+        }
+
+        guard let fileURL = resolvedFileURL(for: request.path, baseDirectory: baseDirectory, playlistURL: playlistURL),
+              let data = try? Data(contentsOf: fileURL) else {
+            log("\(request.method) \(request.path) -> 404")
+            sendResponse(status: "404 Not Found", contentType: "text/plain; charset=utf-8", body: Data("Not found".utf8), to: clientFD)
+            return
+        }
+
+        if let rangeStart = request.rangeStart {
+            let safeStart = min(max(0, rangeStart), data.count)
+            let body = safeStart < data.count ? data.subdata(in: safeStart..<data.count) : Data()
+            log("\(request.method) \(request.path) -> 206 (\(body.count) bytes from \(safeStart))")
+            sendResponse(
+                status: "206 Partial Content",
+                contentType: contentType(for: fileURL),
+                body: request.method == "HEAD" ? Data() : body,
+                to: clientFD,
+                contentLength: body.count,
+                contentRange: "bytes \(safeStart)-\(max(safeStart, data.count - 1))/\(data.count)"
+            )
+            return
+        }
+
+        log("\(request.method) \(request.path) -> 200 (\(data.count) bytes)")
+        sendResponse(
+            status: "200 OK",
+            contentType: contentType(for: fileURL),
+            body: request.method == "HEAD" ? Data() : data,
+            to: clientFD,
+            contentLength: data.count
+        )
+    }
+
+    private static func requestInfo(from clientFD: Int32) -> HTTPRequest? {
+        var buffer = Data()
+        var readBuffer = [UInt8](repeating: 0, count: 2048)
+
+        while buffer.count < 8192 {
+            let bytesRead = Darwin.read(clientFD, &readBuffer, readBuffer.count)
+            if bytesRead <= 0 {
+                break
+            }
+            buffer.append(readBuffer, count: bytesRead)
+            if buffer.range(of: Data("\r\n\r\n".utf8)) != nil {
+                break
+            }
+        }
+
+        guard let request = String(data: buffer, encoding: .utf8) else {
+            return nil
+        }
+
+        let lines = request.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else {
+            return nil
+        }
+
+        let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return nil }
+        let method = parts[0].uppercased()
+        guard method == "GET" || method == "HEAD" else { return nil }
+        let rawPath = String(parts[1])
+        let rangeStart = lines
+            .dropFirst()
+            .first { $0.lowercased().hasPrefix("range:") }
+            .flatMap { line -> Int? in
+                guard let rangeValue = line.split(separator: ":", maxSplits: 1).last?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased(),
+                      rangeValue.hasPrefix("bytes=") else {
+                    return nil
+                }
+                let byteSpec = rangeValue.dropFirst("bytes=".count)
+                guard let startText = byteSpec.split(separator: "-", maxSplits: 1).first,
+                      let start = Int(startText) else {
+                    return nil
+                }
+                return start
+            }
+        if rawPath.hasPrefix("http://") || rawPath.hasPrefix("https://"),
+           let url = URL(string: rawPath) {
+            let path = url.path.isEmpty ? "/" : url.path
+            if let query = url.query, !query.isEmpty {
+                return HTTPRequest(method: method, path: path + "?" + query, rangeStart: rangeStart)
+            }
+            return HTTPRequest(method: method, path: path, rangeStart: rangeStart)
+        }
+        return HTTPRequest(method: method, path: rawPath, rangeStart: rangeStart)
+    }
+
+    private static func resolvedFileURL(for requestPath: String, baseDirectory: URL, playlistURL: URL) -> URL? {
+        let cleanPath = requestPath
+            .split(separator: "?", maxSplits: 1)
+            .first
+            .map(String.init) ?? requestPath
+
+        if cleanPath == "/" || cleanPath == "/playout.m3u8" {
+            return playlistURL
+        }
+
+        let relativePath = cleanPath.hasPrefix("/") ? String(cleanPath.dropFirst()) : cleanPath
+        guard !relativePath.isEmpty,
+              !relativePath.contains("..") else {
+            return nil
+        }
+
+        let candidate = baseDirectory.appendingPathComponent(relativePath).standardizedFileURL
+        let allowedPrefix = baseDirectory.standardizedFileURL.path + "/"
+        guard candidate.path.hasPrefix(allowedPrefix) else { return nil }
+        return candidate
+    }
+
+    private static func contentType(for fileURL: URL) -> String {
+        switch fileURL.pathExtension.lowercased() {
+        case "m3u8":
+            return "application/vnd.apple.mpegurl"
+        case "ts":
+            return "video/mp2t"
+        default:
+            return "application/octet-stream"
+        }
+    }
+
+    private static func sendResponse(
+        status: String,
+        contentType: String,
+        body: Data,
+        to clientFD: Int32,
+        contentLength: Int? = nil,
+        contentRange: String? = nil
+    ) {
+        var headerLines = [
+            "HTTP/1.1 \(status)",
+            "Content-Length: \(contentLength ?? body.count)",
+            "Content-Type: \(contentType)",
+            "Cache-Control: no-cache, no-store, must-revalidate",
+            "Accept-Ranges: bytes",
+            "Connection: close"
+        ]
+        if let contentRange {
+            headerLines.append("Content-Range: \(contentRange)")
+        }
+        let header = headerLines.joined(separator: "\r\n") + "\r\n\r\n"
+
+        writeAll(Data(header.utf8), to: clientFD)
+        if !body.isEmpty {
+            writeAll(body, to: clientFD)
+        }
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32) {
+        data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                return
+            }
+            var totalWritten = 0
+            while totalWritten < rawBuffer.count {
+                let bytesRemaining = rawBuffer.count - totalWritten
+                let result = Darwin.write(descriptor, baseAddress.advanced(by: totalWritten), bytesRemaining)
+                if result < 0 {
+                    if errno == EINTR {
+                        continue
+                    }
+                    break
+                }
+                if result == 0 {
+                    break
+                }
+                totalWritten += result
+            }
+        }
+    }
+
+    private static func log(_ message: String) {
+        fputs("[http-server] \(message)\n", stderr)
+        fflush(stderr)
+    }
+}
+
 private struct ToolPaths: Sendable {
     let ytDlp: ResolvedExternalTool
+    let streamlink: ResolvedExternalTool?
     let ffmpeg: URL
     let ffprobe: URL
     let deno: URL?
@@ -3012,6 +5471,7 @@ private extension StreamPipeline {
         }
 
         let ytDlp = toolchain.ytDlp
+        let streamlink = toolchain.streamlink
         let ffmpeg = toolchain.ffmpeg.url
         let ffprobe = toolchain.ffprobe.url
         let denoURL = toolchain.deno?.url
@@ -3057,6 +5517,7 @@ private extension StreamPipeline {
 
         let paths = ToolPaths(
             ytDlp: ytDlp,
+            streamlink: streamlink,
             ffmpeg: ffmpeg,
             ffprobe: ffprobe,
             deno: denoURL,

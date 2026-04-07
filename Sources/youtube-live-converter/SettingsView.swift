@@ -160,7 +160,7 @@ struct SettingsView: View {
                         Text("Default Mode")
                             .frame(width: 170, alignment: .leading)
                         Picker("", selection: defaultModeSelectionBinding) {
-                            Text("Compatible (DVR-to-Live)").tag(DefaultOutputModeSelection.compatible)
+                            Text("Compatible (Resync Transcode)").tag(DefaultOutputModeSelection.compatible)
                             Text("Stream Copy").tag(DefaultOutputModeSelection.streamCopy)
                         }
                         .pickerStyle(.menu)
@@ -178,7 +178,7 @@ struct SettingsView: View {
                         }
                         .pickerStyle(.menu)
                         .labelsHidden()
-                        .disabled(defaultModeSelection != .compatible)
+                        .disabled(defaultModeSelection == .streamCopy)
                         Spacer(minLength: 0)
                     }
 
@@ -189,11 +189,11 @@ struct SettingsView: View {
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
-                            .disabled(defaultModeSelection != .compatible || defaultBufferSeconds <= 0)
+                            .disabled(defaultModeSelection == .streamCopy || defaultBufferSeconds <= 0)
                         Spacer(minLength: 0)
                     }
 
-                    Text("Compatible mode stages normalized media to a local DVR playlist before publish.")
+                    Text("Compatible mode uses single-stage FFmpeg resync/transcode for RTMP. Buffer delay and DVR staging only apply to buffered workflows that still use the DVR path.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -207,7 +207,7 @@ struct SettingsView: View {
                                 .monospacedDigit()
                         }
                         .controlSize(.small)
-                        .disabled(defaultModeSelection != .compatible)
+                        .disabled(defaultModeSelection == .streamCopy)
                         Spacer(minLength: 0)
                     }
 
@@ -218,7 +218,7 @@ struct SettingsView: View {
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
-                            .disabled(defaultModeSelection != .compatible)
+                            .disabled(defaultModeSelection == .streamCopy)
                         if defaultAudioBoostEnabled {
                             Picker("", selection: $defaultAudioBoostDb) {
                                 ForEach(audioBoostOptions, id: \.self) { db in
@@ -227,7 +227,7 @@ struct SettingsView: View {
                             }
                             .pickerStyle(.menu)
                             .labelsHidden()
-                            .disabled(defaultModeSelection != .compatible)
+                            .disabled(defaultModeSelection == .streamCopy)
                         }
                         Spacer(minLength: 0)
                     }
@@ -239,7 +239,7 @@ struct SettingsView: View {
                             .labelsHidden()
                             .toggleStyle(.switch)
                             .controlSize(.small)
-                            .disabled(defaultModeSelection != .compatible)
+                            .disabled(defaultModeSelection == .streamCopy)
                         Spacer(minLength: 0)
                     }
                 }
@@ -370,7 +370,14 @@ struct SettingsView: View {
             return .streamCopy
         }
         let mode = EncodeMode(rawValue: defaultEncodeModeRaw) ?? .transcode
-        return mode == .transcode ? .compatible : .streamCopy
+        switch mode {
+        case .transcode:
+            return .compatible
+        case .copy:
+            return .streamCopy
+        case .experimentalDirectRTMP:
+            return .compatible
+        }
     }
 
     private var defaultModeSelectionBinding: Binding<DefaultOutputModeSelection> {
@@ -390,6 +397,9 @@ struct SettingsView: View {
     private func sanitizeDefaults() {
         if defaultEncodeModeRaw == "Stream Copy (Paced)" {
             defaultEncodeModeRaw = EncodeMode.copy.rawValue
+        }
+        if defaultEncodeModeRaw == EncodeMode.experimentalDirectRTMP.rawValue {
+            defaultEncodeModeRaw = EncodeMode.transcode.rawValue
         }
         if !bufferOptions.contains(defaultBufferSeconds) {
             defaultBufferSeconds = 30

@@ -10,8 +10,21 @@ enum OutputType: String, CaseIterable, Identifiable {
 enum EncodeMode: String, CaseIterable, Identifiable {
     case copy = "Stream Copy"
     case transcode = "High Compatibility"
+    case experimentalDirectRTMP = "Experimental Direct RTMP"
 
     var id: String { rawValue }
+
+    var usesCompatibilityPipeline: Bool {
+        self != .copy
+    }
+
+    var requiresRTMPOutput: Bool {
+        self == .experimentalDirectRTMP
+    }
+
+    var usesDirectRTMPExperimentalPipeline: Bool {
+        self == .experimentalDirectRTMP
+    }
 }
 
 struct StreamConfig {
@@ -43,7 +56,8 @@ struct StreamConfig {
 
             let server = rtmpServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let key = rtmpStreamKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !server.isEmpty, !key.isEmpty else { return "" }
+            guard !server.isEmpty else { return "" }
+            guard !key.isEmpty else { return server }
 
             let normalizedServer = server.hasSuffix("/") ? server : server + "/"
             return normalizedServer + key

@@ -3,6 +3,7 @@ import Foundation
 
 enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
     case ytDlp = "yt-dlp"
+    case streamlink = "streamlink"
     case ffmpeg = "ffmpeg"
     case ffprobe = "ffprobe"
     case deno = "deno"
@@ -13,6 +14,8 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .ytDlp:
             return "yt-dlp"
+        case .streamlink:
+            return "Streamlink"
         case .ffmpeg:
             return "FFmpeg"
         case .ffprobe:
@@ -26,14 +29,14 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .ffmpeg, .ffprobe:
             return true
-        case .ytDlp, .deno:
+        case .ytDlp, .streamlink, .deno:
             return false
         }
     }
 
     var allowsBundledRuntimeFallback: Bool {
         switch self {
-        case .ytDlp:
+        case .ytDlp, .streamlink:
             return false
         case .ffmpeg, .ffprobe, .deno:
             return true
@@ -44,7 +47,7 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .ffmpeg, .ffprobe:
             return ["-version"]
-        case .ytDlp, .deno:
+        case .ytDlp, .streamlink, .deno:
             return ["--version"]
         }
     }
@@ -53,6 +56,8 @@ enum ExternalToolKind: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .ytDlp:
             return 8
+        case .streamlink:
+            return 6
         case .deno:
             return 4
         case .ffmpeg, .ffprobe:
@@ -140,6 +145,7 @@ struct ResolvedExternalTool: Sendable {
 
 struct ResolvedToolchain: Sendable {
     let ytDlp: ResolvedExternalTool
+    let streamlink: ResolvedExternalTool?
     let ffmpeg: ResolvedExternalTool
     let ffprobe: ResolvedExternalTool
     let deno: ResolvedExternalTool?
@@ -385,13 +391,22 @@ enum ExternalToolResolver {
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
 
+        let streamlink = resolveManagedPythonModuleBestEffort(
+            moduleName: "streamlink",
+            kind: .streamlink,
+            pythonRuntime: ytDlp,
+            logLines: &logLines
+        )
         let deno = resolveManagedToolBestEffort(.deno, logLines: &logLines)
             ?? resolveBundledOptionalToolBestEffort(.deno, resourceURL: resourceURL, logLines: &logLines)
-        let environment = runtimeEnvironment(using: [ytDlp, ffmpeg, ffprobe] + (deno.map { [$0] } ?? []))
+        let environment = runtimeEnvironment(
+            using: [ytDlp] + (streamlink.map { [$0] } ?? []) + [ffmpeg, ffprobe] + (deno.map { [$0] } ?? [])
+        )
 
         return ExternalToolResolution(
             toolchain: ResolvedToolchain(
                 ytDlp: ytDlp,
+                streamlink: streamlink,
                 ffmpeg: ffmpeg,
                 ffprobe: ffprobe,
                 deno: deno,
@@ -649,6 +664,36 @@ enum ExternalToolResolver {
 
     private static func resolveBundledOptionalToolBestEffort(_ kind: ExternalToolKind, resourceURL: URL?, logLines: inout [String]) -> ResolvedExternalTool? {
         resolveBundledToolBestEffort(kind, resourceURL: resourceURL, logLines: &logLines)
+    }
+
+    private static func resolveManagedPythonModuleBestEffort(
+        moduleName: String,
+        kind: ExternalToolKind,
+        pythonRuntime: ResolvedExternalTool,
+        logLines: inout [String]
+    ) -> ResolvedExternalTool? {
+        let tool = ResolvedExternalTool(
+            kind: kind,
+            executableURL: pythonRuntime.executableURL,
+            argumentsPrefix: ["-m", moduleName],
+            source: .managed,
+            version: nil,
+            runtimeVersion: pythonRuntime.runtimeVersion
+        )
+
+        guard verifyExecutable(tool, timeout: kind.validationTimeout) else {
+            return nil
+        }
+
+        logLines.append("[app] Using Managed \(kind.displayName): \(tool.launchDescription)")
+        return ResolvedExternalTool(
+            kind: kind,
+            executableURL: tool.executableURL,
+            argumentsPrefix: tool.argumentsPrefix,
+            source: .managed,
+            version: detectedVersion(for: tool),
+            runtimeVersion: tool.runtimeVersion
+        )
     }
 
     private static func makeResolvedManagedTool(

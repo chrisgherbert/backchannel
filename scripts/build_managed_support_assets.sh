@@ -15,7 +15,7 @@ CONFIG_FILE="$DEFAULT_CONFIG_FILE"
 OUTPUT_DIR="$ROOT_DIR/dist/managed-support"
 DEFAULT_PYTHON_STANDALONE_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20260320/cpython-3.13.12+20260320-aarch64-apple-darwin-install_only_stripped.tar.gz"
 DEFAULT_YTDLP_PACKAGE_SPEC="yt-dlp[default]"
-DEFAULT_YTDLP_EXTRA_PACKAGES="yt-dlp-ejs"
+DEFAULT_YTDLP_EXTRA_PACKAGES="yt-dlp-ejs streamlink"
 
 usage() {
   cat <<USAGE

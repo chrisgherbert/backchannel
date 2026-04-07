@@ -85,6 +85,49 @@ otool_dependencies() {
   '
 }
 
+loader_relative_ref() {
+  local from_path="$1"
+  local to_path="$2"
+  python3 - "$from_path" "$to_path" <<'PY'
+import os
+import sys
+
+from_dir = os.path.dirname(os.path.abspath(sys.argv[1]))
+to_path = os.path.abspath(sys.argv[2])
+relative = os.path.relpath(to_path, from_dir)
+print("@loader_path/" + relative)
+PY
+}
+
+bundled_reference_for_macho() {
+  local macho="$1"
+  local dep="$2"
+  local dep_dest="$RES_LIB_DIR$dep"
+
+  if [[ "$macho" == "$APP_BIN" ]]; then
+    echo "@executable_path/../Resources/lib$dep"
+    return 0
+  fi
+
+  if [[ "$macho" == "$RES_BIN_DIR/"* ]]; then
+    echo "@executable_path/../lib$dep"
+    return 0
+  fi
+
+  if [[ "$macho" == "$RES_LIB_DIR/"* ]]; then
+    loader_relative_ref "$macho" "$dep_dest"
+    return 0
+  fi
+
+  echo "@executable_path/../Resources/lib$dep"
+}
+
+bundled_library_id() {
+  local macho="$1"
+  local rel_path="${macho#$RES_LIB_DIR/}"
+  echo "@rpath/$rel_path"
+}
+
 bundle_macho_dependencies() {
   mkdir -p "$RES_LIB_DIR"
 
@@ -131,13 +174,12 @@ bundle_macho_dependencies() {
         echo "$dest" >> "$queue_file"
       fi
 
-      new_ref="@executable_path/../lib$dep"
+      new_ref="$(bundled_reference_for_macho "$macho" "$dep")"
       install_name_tool -change "$dep" "$new_ref" "$macho" >/dev/null 2>&1 || true
     done <<< "$dep_list"
 
     if [[ "$macho" == "$RES_LIB_DIR/"* ]] && [[ "$macho" == *.dylib ]]; then
-      rel_path="${macho#$RES_LIB_DIR/}"
-      install_name_tool -id "@executable_path/../lib/$rel_path" "$macho" >/dev/null 2>&1 || true
+      install_name_tool -id "$(bundled_library_id "$macho")" "$macho" >/dev/null 2>&1 || true
     fi
   done
 
@@ -187,8 +229,7 @@ normalize_bundled_library_install_names() {
     fi
 
     if [[ "$dep_path" == "$RES_LIB_DIR/"* ]] && [[ "$dep_path" == *.dylib ]]; then
-      rel_path="${dep_path#$RES_LIB_DIR/}"
-      install_name_tool -id "@executable_path/../lib/$rel_path" "$dep_path"
+      install_name_tool -id "$(bundled_library_id "$dep_path")" "$dep_path"
     fi
 
     while IFS= read -r dep; do
@@ -197,7 +238,7 @@ normalize_bundled_library_install_names() {
       if is_bundleable_dependency "$dep"; then
         dep_dest="$RES_LIB_DIR$dep"
         if [[ -f "$dep_dest" ]]; then
-          new_ref="@executable_path/../lib$dep"
+          new_ref="$(bundled_reference_for_macho "$dep_path" "$dep")"
           install_name_tool -change "$dep" "$new_ref" "$dep_path"
         fi
         continue
@@ -208,7 +249,13 @@ normalize_bundled_library_install_names() {
         dep_dest="$(find "$RES_LIB_DIR" -name "$dep_name" -type f | head -n 1 || true)"
         if [[ -n "$dep_dest" ]]; then
           rel_path="${dep_dest#$RES_LIB_DIR/}"
-          new_ref="@executable_path/../lib/$rel_path"
+          if [[ "$dep_path" == "$APP_BIN" ]]; then
+            new_ref="@executable_path/../Resources/lib/$rel_path"
+          elif [[ "$dep_path" == "$RES_BIN_DIR/"* ]]; then
+            new_ref="@executable_path/../lib/$rel_path"
+          else
+            new_ref="$(loader_relative_ref "$dep_path" "$dep_dest")"
+          fi
           install_name_tool -change "$dep" "$new_ref" "$dep_path"
         fi
       fi
@@ -769,7 +816,7 @@ rm -f "$RES_BIN_DIR/yt-dlp" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe" "$RES_B
 rm -rf "$RES_LIB_DIR"
 cp "$FFMPEG_PATH" "$RES_BIN_DIR/ffmpeg"
 cp "$FFPROBE_PATH" "$RES_BIN_DIR/ffprobe"
-bundle_roots=("$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe")
+bundle_roots=("$APP_BIN" "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe")
 chmod +x "$RES_BIN_DIR/ffmpeg" "$RES_BIN_DIR/ffprobe"
 
 echo "Bundling ffmpeg/ffprobe shared libraries into app..."

@@ -14,7 +14,7 @@ struct ManagedSupportSetupSheet: View {
                 .foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 8) {
-                Label("Managed Python runtime with fast-start yt-dlp", systemImage: "shippingbox")
+                Label("Managed Python runtime with yt-dlp and Streamlink", systemImage: "shippingbox")
                 Label("Managed JavaScript runtime for source extraction", systemImage: "cpu")
                 Label("Automatic repair and rollback controls in Settings", systemImage: "wrench.and.screwdriver")
             }

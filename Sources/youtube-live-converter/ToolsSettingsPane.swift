@@ -37,7 +37,7 @@ struct ToolsSettingsPane: View {
                 }
 
                 Section("Managed Support") {
-                    Text("Back Channel can install and maintain a fast-start Python runtime for yt-dlp and other support components in Application Support without asking the user to manage runtimes manually.")
+                    Text("Back Channel can install and maintain a fast-start Python runtime for yt-dlp, Streamlink, and other support components in Application Support without asking the user to manage runtimes manually.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
