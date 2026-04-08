@@ -22,19 +22,18 @@ struct HelpView: View {
                     StepRow(number: 2, text: "Wait for source info to load automatically, then verify title/thumbnail.")
                     StepRow(number: 3, text: "Select RTMP or HLS output and set destination fields.")
                     StepRow(number: 4, text: "Choose Compatible mode for most production use.")
-                    StepRow(number: 5, text: "Click Start and verify output playback. RTMP Compatible mode starts directly without DVR buffer fill.")
+                    StepRow(number: 5, text: "Click Start and verify output playback.")
                 }
 
                 HelpSection(title: "Recommended Defaults") {
                     Bullet("Use Compatible mode unless you specifically need pass-through.")
-                    Bullet("For RTMP Compatible mode, leave buffer-focused expectations behind: it uses Streamlink plus single-stage FFmpeg resync/transcode instead of staged DVR delay.")
-                    Bullet("Use buffer delay and disk-backed buffering only on workflows that still use the DVR path.")
+                    Bullet("For RTMP, Compatible uses Streamlink for source supervision and FFmpeg for a single resync/transcode publish stage.")
                     Bullet("Use presets to avoid endpoint typos between sessions.")
                 }
 
                 HelpSection(title: "Troubleshooting") {
                     Bullet("No output: Validate transport fields and destination endpoint.")
-                    Bullet("Frequent freezes: Increase buffer delay and use Compatible mode.")
+                    Bullet("Frequent RTMP instability: Switch to Compatible mode.")
                     Bullet("A/V drift: Use A/V sync offset in small increments.")
                     Bullet("Source issues: Try another live URL to rule out upstream instability.")
                 }

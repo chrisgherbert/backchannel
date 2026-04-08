@@ -11,7 +11,7 @@ Back Channel is a macOS app for turning livestream URLs into RTMP or HLS outputs
 - Converts livestream URLs into RTMP or HLS output
 - Supports both GUI and CLI workflows
 - Bundles its own core native tooling for end-user installs
-- Offers managed support components for broader compatibility and updates
+- Offers a managed Python source runtime for `yt-dlp` + `Streamlink`, plus managed support updates
 - Built for Apple Silicon Macs running macOS 13 or later
 
 ## Website
@@ -25,7 +25,7 @@ The marketing/documentation site deploys automatically through GitHub Actions wh
 ## Release Checklist
 
 1. Ensure standalone `deno` exists for managed support payloads.
-2. Optional: set a portable Python runtime URL/archive for the managed `yt-dlp` runtime build, or let the script use its tested default.
+2. Optional: set a portable Python runtime URL/archive for the managed Python source runtime build, or let the script use its tested default.
 3. Create/update private release config:
 ```bash
 cp -n scripts/release.env.example scripts/release.env
@@ -43,7 +43,7 @@ cp -n scripts/release.env.example scripts/release.env
 - app zip
 - app zip checksum
 - `backchannel-managed-support.json`
-- managed `yt-dlp` runtime archive + checksum
+- managed Python source runtime archive + checksum
 - managed `deno` archive + checksum
 8. Confirm the dedicated `managed-support` release was updated with the same managed assets.
 9. Distribute:
@@ -56,7 +56,7 @@ open dist
 - macOS 13+
 - portable `ffmpeg` / `ffprobe` binaries available for packaging
 - standalone `deno` binary available for managed support packaging
-- optional portable Python runtime archive/URL for managed `yt-dlp` packaging
+- optional portable Python runtime archive/URL for managed Python source runtime packaging
 
 These are release-time/build-time requirements, not end-user runtime requirements. The shipped app bundles or manages its own dependencies.
 
@@ -127,7 +127,7 @@ Then run:
 backchannel --help
 ```
 
-`yt-dlp` and `deno` are both managed separately as app support components rather than being sealed inside the `.app` bundle.
+The managed Python source runtime (`yt-dlp` + `Streamlink`) and `deno` are both managed separately as app support components rather than being sealed inside the `.app` bundle.
 
 ### 2. Packaging For Local Testing
 
@@ -179,10 +179,10 @@ The GitHub release script uploads:
 - notarized app zip
 - app zip checksum
 - managed support manifest
-- managed yt-dlp archive + checksum
+- managed Python source runtime archive + checksum
 - managed deno archive + checksum
 
-It also republishes those managed support assets to the dedicated `managed-support` release channel so the app can pick up newer `yt-dlp` / `deno` payloads without waiting for a new app build.
+It also republishes those managed support assets to the dedicated `managed-support` release channel so the app can pick up newer source-runtime / `deno` payloads without waiting for a new app build.
 
 If you only want to refresh managed support payloads:
 
@@ -213,12 +213,10 @@ xcrun stapler validate "dist/Back Channel.app"
    - fill `Server URL` + `Stream Key`, or
    - paste a full RTMP URL in `Full RTMP URL (optional override)`
 5. Choose mode:
-   - `Stream Copy` for lowest CPU (best-effort passthrough)
-   - `Compatible` for stricter ingest-friendly output (`libx264` + `aac`, fixed GOP/CFR)
-6. Set `Buffer Delay` in Compatible mode (`No buffer`, `5s`, `15s`, `30s`, `60s`, `120s`; default `30s`) to smooth short source stalls.
-   - On start, the app shows an explicit startup buffer countdown in `Status`.
-7. Click `Start`.
-8. Use `Status` tab for parsed health/progress (including buffer state), and `Advanced` tab for raw console logs.
+   - `Stream Copy` for lowest CPU on RTMP (`Streamlink -> FFmpeg remux`, best-effort passthrough)
+   - `Compatible` for RTMP resync/transcode (`Streamlink -> single FFmpeg resync/transcode`, `libx264` + `aac`, fixed GOP/CFR)
+6. Click `Start`.
+7. Use `Status` tab for parsed health/progress, and `Advanced` tab for raw console logs.
 
 ## Repository Layout
 
@@ -229,8 +227,9 @@ xcrun stapler validate "dist/Back Channel.app"
 
 ## Notes
 
-- The app captures `yt-dlp` and `ffmpeg` stderr logs in the UI.
+- The app captures source-tool (`Streamlink` or `yt-dlp`) and `ffmpeg` stderr logs in the UI.
 - On process failure, it retries with exponential backoff (up to 30 seconds).
+- For RTMP, `Compatible` uses `Streamlink` plus a single FFmpeg resync/transcode stage.
 - `Stream Copy` may fail if target/container codec compatibility does not match. Use `Compatible` mode in that case.
 - Runtime tool resolution prefers:
   - app-managed support components in `~/Library/Application Support/Back Channel/`

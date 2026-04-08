@@ -183,7 +183,7 @@ struct SettingsView: View {
                     }
 
                     HStack {
-                        Text("DVR Disk Staging")
+                        Text("Local Staging")
                             .frame(width: 170, alignment: .leading)
                         Toggle("Enable", isOn: $defaultUseDiskBackedBuffer)
                             .labelsHidden()
@@ -193,7 +193,7 @@ struct SettingsView: View {
                         Spacer(minLength: 0)
                     }
 
-                    Text("Compatible mode uses single-stage FFmpeg resync/transcode for RTMP. Buffer delay and DVR staging only apply to buffered workflows that still use the DVR path.")
+                    Text("Compatible mode uses single-stage FFmpeg resync/transcode for RTMP. Additional delivery options vary by output format.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

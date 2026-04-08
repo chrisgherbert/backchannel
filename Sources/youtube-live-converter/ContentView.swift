@@ -519,11 +519,11 @@ struct ContentView: View {
     private var videoModeSectionFields: some View {
         VStack(alignment: .leading, spacing: 10) {
             if usesSupervisedRTMPRemux {
-                Text("RTMP rebroadcast now uses a supervised Streamlink -> FFmpeg remux path. Buffer delay, disk staging, A/V sync offset, and audio processing settings are not used on this route.")
+                Text("RTMP rebroadcast runs through a supervised Streamlink -> FFmpeg remux path. A/V sync offset and audio processing settings are not used on this route.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if usesSupervisedRTMPTranscode {
-                Text("RTMP compatibility now uses Streamlink plus a single FFmpeg resync/transcode stage. Buffer delay and DVR staging are not used on this route, but the A/V sync and audio controls below still apply.")
+                Text("RTMP compatibility uses Streamlink plus a single FFmpeg resync/transcode stage. The A/V sync and audio controls below still apply.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if config.encodeMode.usesCompatibilityPipeline {
@@ -542,19 +542,19 @@ struct ContentView: View {
 
             if config.encodeMode.usesCompatibilityPipeline {
                 if !usesSupervisedRTMPTranscode {
-                    labeledInline("Buffer Storage") {
+                    labeledInline("Local Staging") {
                         HStack(spacing: 8) {
-                            Toggle("DVR disk staging", isOn: $config.useDiskBackedBuffer)
+                            Toggle("Local staging", isOn: $config.useDiskBackedBuffer)
                                 .toggleStyle(.switch)
                                 .labelsHidden()
                                 .controlSize(.mini)
                                 .disabled(config.bufferSeconds <= 0)
-                            Text("DVR disk staging")
+                            Text("Local staging")
                                 .font(.caption2)
                             Spacer()
                         }
                     }
-                    Text("Stages normalized media into a local DVR playlist before publish.")
+                    Text("Writes normalized media to local staged files before publish.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -946,7 +946,7 @@ struct ContentView: View {
         }
         switch config.encodeMode {
         case .transcode:
-            return "Editing compatible DVR-to-live output settings."
+            return "Editing compatible output settings."
         case .copy:
             return "Editing stream copy settings."
         }

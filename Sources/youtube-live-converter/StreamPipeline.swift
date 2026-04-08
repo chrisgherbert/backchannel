@@ -626,13 +626,13 @@ final class StreamPipeline: ObservableObject {
                 status = "Running"
                 parsedStatus.sourceState = "Running"
                 parsedStatus.outputState = "Buffering"
-                appendLog("[app] Pipeline started (dvr-to-live staging active).")
+                appendLog("[app] Pipeline started (staged publish path active).")
                 if config.bufferSeconds > 0 {
                     appendLog("[app] Output publish will begin after \(config.bufferSeconds)s staged media fill.")
                 } else {
                     appendLog("[app] Output publish will begin as soon as staged playlist is ready.")
                 }
-                appendLog("[app] Normalizer started. Writing staged DVR playlist.")
+                appendLog("[app] Normalizer started. Writing staged playlist.")
                 if let ffmpeg {
                     startDvrBufferMonitorAndPublisher(
                         publisher: ffmpeg,
@@ -662,9 +662,9 @@ final class StreamPipeline: ObservableObject {
             appendLog("[app] Using ffprobe: \(paths.ffprobe.path)")
             appendSessionConfigurationLog(config)
             if usesStreamlinkRemux {
-                appendLog("[app] RTMP rebroadcast uses Streamlink supervision and FFmpeg remuxing (-c copy). Buffering and A/V processing options are ignored on this path.")
+                appendLog("[app] RTMP rebroadcast: Streamlink supervision with FFmpeg remuxing (-c copy). A/V processing options are not applied on this path.")
             } else if usesStreamlinkTranscode {
-                appendLog("[app] RTMP rebroadcast uses Streamlink supervision and a single FFmpeg resync/transcode stage. Buffering and disk staging are ignored on this path.")
+                appendLog("[app] RTMP rebroadcast: Streamlink supervision with a single FFmpeg resync/transcode stage.")
             }
             if isCatchUpActive() {
                 let remaining = max(1, Int(catchUpExpiresAt.timeIntervalSinceNow.rounded()))
@@ -677,7 +677,7 @@ final class StreamPipeline: ObservableObject {
                 if usesStreamlinkTranscode {
                     appendLog("[app] High compatibility publish path: Streamlink -> FFmpeg decode/resync/transcode -> publish.")
                 } else {
-                    appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged DVR -> publish).")
+                    appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged playlist -> publish).")
                 }
             }
             if let deno = paths.deno {
@@ -1185,7 +1185,7 @@ final class StreamPipeline: ObservableObject {
                 self.lastPublishStartedAt = Date()
                 self.highSpeedSince = Date.distantPast
                 self.parsedStatus.outputState = "Publishing"
-                self.appendLog("[app] Publisher restarted from staged DVR playlist.")
+                self.appendLog("[app] Publisher restarted from staged playlist.")
                 self.refreshStreamHealth(now: Date())
             } catch {
                 self.appendLog("[app] Publisher restart failed: \(error.localizedDescription)")
@@ -1233,7 +1233,7 @@ final class StreamPipeline: ObservableObject {
         let syncOffsetMs = config.avSyncOffsetMs
         let extraAudioDelayMs = max(0, syncOffsetMs)
         let extraVideoDelaySeconds = syncOffsetMs < 0 ? Double(-syncOffsetMs) / 1_000.0 : 0
-        // Startup buffering is handled by staged DVR playout; filters should only apply A/V sync offsets.
+        // Startup buffering is handled by staged playout; filters should only apply A/V sync offsets.
         let totalVideoDelaySeconds = extraVideoDelaySeconds
         let totalAudioDelayMs = extraAudioDelayMs
         var audioFilters: [String] = []
