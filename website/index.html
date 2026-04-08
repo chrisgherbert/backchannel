@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Back Channel - Bridge Livestreams to RTMP & HLS</title>
+  <title>Back Channel - Convert Livestreams to RTMP & HLS</title>
   <meta name="description" content="Back Channel turns live web streams into RTMP and HLS workflows for production teams and technical creators." />
   <link rel="stylesheet" href="./styles.css" />
 </head>
@@ -28,9 +28,7 @@
       <p class="eyebrow">macOS Livestream Bridge</p>
       <h1>Bridge Livestreams to RTMP &amp; HLS</h1>
       <p class="hero-copy">
-        Back Channel turns live web streams into stable RTMP or HLS outputs on macOS.
-        RTMP output uses Streamlink for source supervision and a single
-        FFmpeg resync/transcode stage for cleaner downstream ingest.
+        Back Channel turns livestreams from YouTube, Tiktok, Twitch and other video platforms into stable RTMP or HLS outputs on macOS. RTMP output uses Streamlink for source supervision and a single FFmpeg resync/transcode stage for cleaner downstream ingest.
       </p>
       <div class="hero-actions">
         <a id="download-btn" class="btn-primary" href="#" target="_blank" rel="noopener noreferrer">Download for macOS</a>
@@ -40,7 +38,7 @@
 
     <section id="screenshot" class="screenshot-section panel">
       <h2>Back Channel</h2>
-      <p class="section-copy">Back Channel is a macOS app for routing livestream URLs into RTMP or HLS workflows.</p>
+      <p class="section-copy">Back Channel is a macOS app for converting livestreams into RTMP or HLS.</p>
       <div class="screenshot-frame">
         <img src="./assets/screenshot.png" alt="Back Channel app screenshot placeholder" />
       </div>
@@ -49,7 +47,7 @@
     <section id="features" class="features panel">
       <h2>Key Features</h2>
       <ul>
-        <li>Converts livestreams (including YouTube Live, Twitch, TikTok, and more) into RTMP or HLS output.</li>
+        <li>Converts livestreams (including YouTube Live, Twitch, TikTok, etc) into RTMP or HLS output.</li>
         <li>Recommended RTMP path uses Streamlink supervision plus single-stage FFmpeg resync/transcode.</li>
         <li>Optional command-line workflow for automation and headless operation.</li>
         <li>Built for rebroadcasting, monitoring, archiving, and transcription.</li>
@@ -65,35 +63,18 @@
           <ul>
             <li>Confirm you are on macOS 13+ with Apple Silicon.</li>
             <li>Get your output destination ready (RTMP URL/key or HLS path).</li>
-            <li>Use a livestream source rather than a prerecorded video.</li>
+            <li>Make sure you're converting stream that is currently live—recorded videos will not work.</li>
           </ul>
         </article>
         <article class="doc-card">
           <h3>Quick Start</h3>
           <ol>
             <li>Input a livestream URL in <strong>Input Source</strong>.</li>
-            <li>Wait for source info to load automatically, then verify title/thumbnail.</li>
+            <li>Wait for source info to load.</li>
             <li>Select RTMP or HLS output and set destination fields.</li>
-            <li>Choose <strong>Compatible</strong> mode for most production use.</li>
-            <li>Click <strong>Start</strong> and verify playback.</li>
+            <li>Choose <strong>Compatible</strong> mode for most production uses.</li>
+            <li>Click <strong>Start</strong> to begin the stream conversion.</li>
           </ol>
-        </article>
-        <article class="doc-card">
-          <h3>Recommended Defaults</h3>
-          <ul>
-            <li>Use <strong>Compatible</strong> mode unless you specifically need pass-through.</li>
-            <li>For RTMP, use <strong>Compatible</strong> for resync/transcode and <strong>Stream Copy</strong> for a lower-CPU best-effort path.</li>
-            <li>Set up presets for sources and outputs in the Settings menu.</li>
-          </ul>
-        </article>
-        <article class="doc-card">
-          <h3>Troubleshooting</h3>
-          <ul>
-            <li><strong>No output:</strong> validate transport fields and destination endpoint.</li>
-            <li><strong>Frequent RTMP instability:</strong> switch to <strong>Compatible</strong>.</li>
-            <li><strong>A/V drift:</strong> use A/V sync offset in small increments.</li>
-            <li><strong>Source issues:</strong> try another live URL to rule out upstream instability.</li>
-          </ul>
         </article>
       </div>
       <article class="docs-subsection">
@@ -132,7 +113,7 @@
         <span class="danger-icon" aria-hidden="true">!</span>
         <div>
           <p class="danger-title">Early Development Warning</p>
-          <p class="danger-copy">Back Channel is very early and has not been extensively tested. Use at your own risk.</p>
+          <p class="danger-copy">Back Channel is in very early development and has not been extensively tested.</p>
         </div>
       </div>
     </section>
