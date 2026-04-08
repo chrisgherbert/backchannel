@@ -128,6 +128,34 @@ bundled_library_id() {
   echo "@rpath/$rel_path"
 }
 
+resolve_rpath_source_for_macho() {
+  local dep_path="$1"
+  local dep_name="$2"
+  local original_source_path original_source_dir candidate
+
+  if [[ "$dep_path" == "$RES_LIB_DIR/"* ]]; then
+    original_source_path="/${dep_path#$RES_LIB_DIR/}"
+    original_source_dir="$(dirname "$original_source_path")"
+    candidate="$original_source_dir/$dep_name"
+    if [[ -f "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+
+  for candidate in \
+    "/opt/homebrew/lib/$dep_name" \
+    "/usr/local/lib/$dep_name" \
+    "/opt/local/lib/$dep_name"; do
+    if [[ -f "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 bundle_macho_dependencies() {
   mkdir -p "$RES_LIB_DIR"
 
@@ -187,37 +215,76 @@ bundle_macho_dependencies() {
 }
 
 resolve_rpath_dependencies_in_bundle() {
-  local dep dep_name dep_path found original_source_path original_source_dir
-  while IFS= read -r dep_path; do
-    if ! is_macho_binary "$dep_path"; then
-      continue
-    fi
+  local pass_changed dep dep_name dep_path found dest new_copy_roots_file
 
-    while IFS= read -r dep; do
-      [[ -n "$dep" ]] || continue
-      [[ "$dep" == @rpath/* ]] || continue
-      dep_name="${dep#@rpath/}"
+  while :; do
+    pass_changed=0
+    new_copy_roots_file="$(mktemp "${TMPDIR:-/tmp}/backchannel-rpath-roots.XXXXXX")"
 
-      if [[ -f "$(dirname "$dep_path")/$dep_name" ]]; then
-        install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
+    while IFS= read -r dep_path; do
+      if ! is_macho_binary "$dep_path"; then
         continue
       fi
 
-      found="$(find "$RES_LIB_DIR" -name "$dep_name" -type f | head -n 1 || true)"
-      if [[ -z "$found" ]] && [[ "$dep_path" == "$RES_LIB_DIR/"* ]]; then
-        original_source_path="/${dep_path#$RES_LIB_DIR/}"
-        original_source_dir="$(dirname "$original_source_path")"
-        if [[ -f "$original_source_dir/$dep_name" ]]; then
-          found="$original_source_dir/$dep_name"
+      while IFS= read -r dep; do
+        [[ -n "$dep" ]] || continue
+        [[ "$dep" == @rpath/* ]] || continue
+        dep_name="${dep#@rpath/}"
+        dest="$(dirname "$dep_path")/$dep_name"
+
+        if [[ ! -f "$dest" ]]; then
+          found="$(resolve_rpath_source_for_macho "$dep_path" "$dep_name" || true)"
+          if [[ -n "$found" ]]; then
+            cp -fL "$found" "$dest"
+            chmod u+w "$dest" >/dev/null 2>&1 || true
+            echo "$dest" >> "$new_copy_roots_file"
+            pass_changed=1
+          fi
         fi
-      fi
-      if [[ -n "$found" ]]; then
-        cp -fL "$found" "$(dirname "$dep_path")/$dep_name"
-        chmod u+w "$(dirname "$dep_path")/$dep_name" >/dev/null 2>&1 || true
-        install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
-      fi
-    done < <(otool_dependencies "$dep_path")
-  done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
+
+        if [[ -f "$dest" ]]; then
+          install_name_tool -change "$dep" "@loader_path/$dep_name" "$dep_path" >/dev/null 2>&1 || true
+        fi
+      done < <(otool_dependencies "$dep_path")
+    done < <(find "$RES_BIN_DIR" "$RES_LIB_DIR" -type f -print)
+
+    if [[ -s "$new_copy_roots_file" ]]; then
+      new_copy_roots=()
+      while IFS= read -r new_root; do
+        [[ -n "$new_root" ]] || continue
+        new_copy_roots+=("$new_root")
+      done < "$new_copy_roots_file"
+      bundle_macho_dependencies "${new_copy_roots[@]}"
+      pass_changed=1
+    fi
+
+    rm -f "$new_copy_roots_file"
+
+    if (( pass_changed == 0 )); then
+      break
+    fi
+  done
+}
+
+verify_bundled_media_tools() {
+  local tool label
+  local tmp_dir stderr_file
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/backchannel-toolcheck.XXXXXX")"
+  trap 'rm -rf "$tmp_dir"' RETURN
+
+  for label in ffmpeg ffprobe; do
+    tool="$RES_BIN_DIR/$label"
+    stderr_file="$tmp_dir/$label.err"
+    if ! "$tool" -version >/dev/null 2>"$stderr_file"; then
+      echo "Error: bundled $label failed self-check." >&2
+      cat "$stderr_file" >&2
+      exit 1
+    fi
+  done
+
+  rm -rf "$tmp_dir"
+  trap - RETURN
 }
 
 normalize_bundled_library_install_names() {
@@ -844,6 +911,7 @@ codesign --verify --verbose=2 "$APP_DIR"
 codesign --verify --verbose=2 "$APP_BIN"
 codesign --verify --verbose=2 "$RES_BIN_DIR/ffmpeg"
 codesign --verify --verbose=2 "$RES_BIN_DIR/ffprobe"
+verify_bundled_media_tools
 
 echo "App bundle ready:"
 echo "  $APP_DIR"
