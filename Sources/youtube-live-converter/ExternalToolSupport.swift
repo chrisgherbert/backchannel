@@ -75,7 +75,7 @@ enum ManagedComponentKind: String, CaseIterable, Identifiable, Codable {
     var displayName: String {
         switch self {
         case .ytDlp:
-            return "Managed yt-dlp Runtime"
+            return "Managed Python Source Runtime"
         case .deno:
             return "JavaScript Runtime"
         }
@@ -363,7 +363,7 @@ enum ExternalToolResolver {
         var logLines: [String] = []
 
         guard let ytDlp = resolveManagedToolBestEffort(.ytDlp, logLines: &logLines) else {
-            logLines.append("[app] Managed yt-dlp is required. Open Settings > Tools and install managed support.")
+            logLines.append("[app] Managed Python source runtime is required. Open Settings > Tools and install managed support.")
             return nil
         }
 
@@ -377,7 +377,7 @@ enum ExternalToolResolver {
         var logLines: [String] = []
 
         guard let ytDlp = resolveManagedToolBestEffort(.ytDlp, logLines: &logLines) else {
-            logLines.append("[app] Managed yt-dlp is required. Open Settings > Tools and install managed support.")
+            logLines.append("[app] Managed Python source runtime is required. Open Settings > Tools and install managed support.")
             return ExternalToolResolution(toolchain: nil, logLines: logLines)
         }
 

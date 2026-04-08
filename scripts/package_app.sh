@@ -833,7 +833,7 @@ fi
 normalize_bundled_library_install_names
 
 echo "Bundled:"
-echo "  yt-dlp: managed outside the app bundle"
+echo "  python source runtime (yt-dlp + Streamlink): managed outside the app bundle"
 echo "  ffmpeg: $FFMPEG_PATH"
 echo "  ffprobe: $FFPROBE_PATH"
 echo "  deno: managed outside the app bundle"

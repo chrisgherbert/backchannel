@@ -10,20 +10,11 @@ enum OutputType: String, CaseIterable, Identifiable {
 enum EncodeMode: String, CaseIterable, Identifiable {
     case copy = "Stream Copy"
     case transcode = "High Compatibility"
-    case experimentalDirectRTMP = "Experimental Direct RTMP"
 
     var id: String { rawValue }
 
     var usesCompatibilityPipeline: Bool {
         self != .copy
-    }
-
-    var requiresRTMPOutput: Bool {
-        self == .experimentalDirectRTMP
-    }
-
-    var usesDirectRTMPExperimentalPipeline: Bool {
-        self == .experimentalDirectRTMP
     }
 }
 
@@ -70,7 +61,7 @@ struct ParsedStatus {
     var outputState = "Idle"
     var lastAppEvent = "No activity yet"
     var lastFFmpegEvent = "No activity yet"
-    var lastYtDlpEvent = "No activity yet"
+    var lastSourceEvent = "No activity yet"
     var lastError = ""
     var reconnectDelay = ""
     var ffmpegTime = ""

@@ -7,11 +7,11 @@ struct ToolsSettingsPane: View {
         ScrollView {
             Form {
                 Section("Bundled Tools") {
-                    Text("These ship inside the app. Managed support takes precedence when an installed managed version is available.")
+                    Text("These ship inside the app bundle. Managed source/runtime components are shown in the section below.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 
-                    ForEach(externalTools.bundledStatuses) { status in
+                    ForEach(externalTools.bundledStatuses.filter(\.kind.bundledByDefault)) { status in
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
                                 Text(status.kind.displayName)
@@ -37,7 +37,7 @@ struct ToolsSettingsPane: View {
                 }
 
                 Section("Managed Support") {
-                    Text("Back Channel can install and maintain a fast-start Python runtime for yt-dlp, Streamlink, and other support components in Application Support without asking the user to manage runtimes manually.")
+                    Text("Back Channel can install and maintain a fast-start Python source runtime for yt-dlp and Streamlink, plus other support components in Application Support, without asking you to manage runtimes manually.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
 

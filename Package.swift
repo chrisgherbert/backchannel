@@ -8,27 +8,10 @@ let package = Package(
     platforms: [
         .macOS(.v13)
     ],
-    dependencies: [
-        .package(
-            url: "https://github.com/HaishinKit/HaishinKit.swift.git",
-            revision: "6ff1395755f89975b53e511f54ae78c79ee8576e"
-        )
-    ],
     targets: [
-        .systemLibrary(
-            name: "CFFmpeg",
-            pkgConfig: "libavformat",
-            providers: [
-                .brew(["ffmpeg"])
-            ]
-        ),
         .executableTarget(
             name: "youtube-live-converter",
-            dependencies: [
-                "CFFmpeg",
-                .product(name: "HaishinKit", package: "HaishinKit.swift"),
-                .product(name: "RTMPHaishinKit", package: "HaishinKit.swift")
-            ]
+            dependencies: []
         ),
         .testTarget(
             name: "youtube-live-converterTests",

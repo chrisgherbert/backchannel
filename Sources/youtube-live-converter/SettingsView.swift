@@ -375,8 +375,6 @@ struct SettingsView: View {
             return .compatible
         case .copy:
             return .streamCopy
-        case .experimentalDirectRTMP:
-            return .compatible
         }
     }
 
@@ -397,9 +395,6 @@ struct SettingsView: View {
     private func sanitizeDefaults() {
         if defaultEncodeModeRaw == "Stream Copy (Paced)" {
             defaultEncodeModeRaw = EncodeMode.copy.rawValue
-        }
-        if defaultEncodeModeRaw == EncodeMode.experimentalDirectRTMP.rawValue {
-            defaultEncodeModeRaw = EncodeMode.transcode.rawValue
         }
         if !bufferOptions.contains(defaultBufferSeconds) {
             defaultBufferSeconds = 30

@@ -22,13 +22,13 @@ struct HelpView: View {
                     StepRow(number: 2, text: "Wait for source info to load automatically, then verify title/thumbnail.")
                     StepRow(number: 3, text: "Select RTMP or HLS output and set destination fields.")
                     StepRow(number: 4, text: "Choose Compatible mode for most production use.")
-                    StepRow(number: 5, text: "Click Start and wait for buffer fill before playback checks.")
+                    StepRow(number: 5, text: "Click Start and verify output playback. RTMP Compatible mode starts directly without DVR buffer fill.")
                 }
 
                 HelpSection(title: "Recommended Defaults") {
                     Bullet("Use Compatible mode unless you specifically need pass-through.")
-                    Bullet("Use a buffer delay (15s to 30s) for better continuity on live sources.")
-                    Bullet("Keep disk-backed buffering enabled for long sessions.")
+                    Bullet("For RTMP Compatible mode, leave buffer-focused expectations behind: it uses Streamlink plus single-stage FFmpeg resync/transcode instead of staged DVR delay.")
+                    Bullet("Use buffer delay and disk-backed buffering only on workflows that still use the DVR path.")
                     Bullet("Use presets to avoid endpoint typos between sessions.")
                 }
 
@@ -74,8 +74,6 @@ struct HelpView: View {
                               --format rtmp \\
                               --rtmp-url \"rtmp://127.0.0.1/live\" \\
                               --mode compatible \\
-                              --buffer-seconds 15 \\
-                              --disk-buffer true \\
                               --auto-start
                             """
                         )
@@ -93,7 +91,7 @@ struct HelpView: View {
 
                     Bullet("Use GUI once to validate source and destination, then move repeat runs to CLI.")
                     Bullet("Use Compatible mode for the most predictable ingest behavior.")
-                    Bullet("Use a buffer delay (15s to 30s) when source delivery is uneven.")
+                    Bullet("For RTMP Compatible mode, Streamlink handles source acquisition and FFmpeg handles the single-stage resync/transcode path.")
                     Bullet("Keep one log file per run for easier troubleshooting and comparison.")
                 }
             }

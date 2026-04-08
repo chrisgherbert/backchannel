@@ -653,11 +653,13 @@ struct ContentView: View {
             statusRow("Output Time", pipeline.parsedStatus.ffmpegTime.isEmpty ? "-" : pipeline.parsedStatus.ffmpegTime)
             statusRow("Output Bitrate", pipeline.parsedStatus.ffmpegBitrate.isEmpty ? "-" : pipeline.parsedStatus.ffmpegBitrate)
             statusRow("Output Speed", pipeline.parsedStatus.ffmpegSpeed.isEmpty ? "-" : pipeline.parsedStatus.ffmpegSpeed)
-            bufferStatusRow
+            if usesBufferedStartupDelay {
+                bufferStatusRow
+            }
             statusRow("A/V Offset", pipeline.parsedStatus.avSyncState)
             statusRow("App Event", pipeline.parsedStatus.lastAppEvent, truncateTail: true)
             statusRow("FFmpeg Event", pipeline.parsedStatus.lastFFmpegEvent, truncateTail: true)
-            statusRow("Source Event", pipeline.parsedStatus.lastYtDlpEvent, truncateTail: true)
+            statusRow("Source Event", pipeline.parsedStatus.lastSourceEvent, truncateTail: true)
             statusRow("Last Error", pipeline.parsedStatus.lastError.isEmpty ? "None" : pipeline.parsedStatus.lastError, truncateTail: true)
         }
     }
@@ -672,7 +674,9 @@ struct ContentView: View {
             }
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 2), spacing: 8) {
-                healthMetricCard(pipeline.parsedStatus.health.buffer)
+                if usesBufferedStartupDelay {
+                    healthMetricCard(pipeline.parsedStatus.health.buffer)
+                }
                 healthMetricCard(pipeline.parsedStatus.health.timeline)
                 healthMetricCard(pipeline.parsedStatus.health.video)
                 healthMetricCard(pipeline.parsedStatus.health.speed)
@@ -945,8 +949,6 @@ struct ContentView: View {
             return "Editing compatible DVR-to-live output settings."
         case .copy:
             return "Editing stream copy settings."
-        case .experimentalDirectRTMP:
-            return "Editing compatible DVR-to-live output settings."
         }
     }
 
@@ -987,17 +989,11 @@ struct ContentView: View {
     }
 
     private var outputValidationMessage: String? {
-        if config.encodeMode.requiresRTMPOutput && config.outputType != .rtmp {
-            return "Experimental Direct RTMP currently supports RTMP output only."
-        }
         if config.outputType == .hls {
             return resolvedTarget.isEmpty ? "HLS output path is required." : nil
         }
         if resolvedTarget.isEmpty {
             return "RTMP destination requires a server/app target or full URL."
-        }
-        if config.encodeMode == .experimentalDirectRTMP {
-            return DirectTSRTMPPublisher.outputTargetValidationMessage(for: resolvedTarget)
         }
         return nil
     }
@@ -1292,8 +1288,6 @@ struct ContentView: View {
         switch config.encodeMode {
         case .copy:
             return .streamCopy
-        case .experimentalDirectRTMP:
-            return .highCompatibility
         case .transcode:
             return .highCompatibility
         }
@@ -1468,7 +1462,7 @@ struct ContentView: View {
         if raw == "Stream Copy (Paced)" {
             config.encodeMode = .copy
         } else if let mode = EncodeMode(rawValue: raw) {
-            config.encodeMode = mode == .experimentalDirectRTMP ? .transcode : mode
+            config.encodeMode = mode
         }
 
         if defaults.object(forKey: AppPreferenceKeys.defaultBufferSeconds) != nil {
