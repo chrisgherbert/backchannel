@@ -1856,13 +1856,32 @@ final class StreamPipeline: ObservableObject {
         let retry = parsedStatus.reconnectDelay == "None" ? "-" : parsedStatus.reconnectDelay
         let time = parsedStatus.ffmpegTime.isEmpty ? "-" : parsedStatus.ffmpegTime
         let speed = parsedStatus.ffmpegSpeed.isEmpty ? "-" : parsedStatus.ffmpegSpeed
-        let percent = Int((max(0.0, min(1.0, parsedStatus.bufferProgress)) * 100).rounded())
-        let line = "[cli] src=\(parsedStatus.sourceState) | out=\(parsedStatus.outputState) | buffer=\(cliProgressBar(progress: parsedStatus.bufferProgress)) \(percent)% | time=\(time) | speed=\(speed) | retry=\(retry)"
+        let line = "[cli] src=\(parsedStatus.sourceState) | out=\(parsedStatus.outputState) | buffer=\(cliBufferSummary()) | time=\(time) | speed=\(speed) | retry=\(retry)"
         if force || line != lastCliStatusLine {
             lastCliStatusLine = line
             fputs(line + "\n", stdout)
             fflush(stdout)
         }
+    }
+
+    private func cliBufferSummary() -> String {
+        let state = parsedStatus.bufferState
+        let normalized = state.lowercased()
+
+        if normalized.hasPrefix("not used") {
+            return "-"
+        }
+
+        if normalized == "stopped" {
+            return "-"
+        }
+
+        if normalized == "off" || normalized.hasPrefix("off ") {
+            return "off"
+        }
+
+        let percent = Int((max(0.0, min(1.0, parsedStatus.bufferProgress)) * 100).rounded())
+        return "\(cliProgressBar(progress: parsedStatus.bufferProgress)) \(percent)%"
     }
 
     private func cliProgressBar(progress: Double) -> String {
