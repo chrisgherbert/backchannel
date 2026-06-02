@@ -519,7 +519,7 @@ final class StreamPipeline: ObservableObject {
                 appendLog("[app] Failed to create yt-dlp temp directory: \(error.localizedDescription)")
             }
 
-            var ytDlpArguments = ["--no-part", "--no-progress"]
+            var ytDlpArguments = ["--ignore-config", "--no-part", "--no-progress"]
             if let deno = paths.deno {
                 ytDlpArguments += ["--js-runtimes", "deno:\(deno.path)"]
             }
@@ -2959,7 +2959,7 @@ final class StreamPipeline: ObservableObject {
         }
 
         // Single request path for initial source data (same style as CLI).
-        var args = ["--skip-download", "--no-warnings", "--no-playlist"]
+        var args = ["--ignore-config", "--skip-download", "--no-warnings", "--no-playlist"]
         args += DownloadAuthenticationSettings.load().ytDLPArguments
         args += [
             "--print", "title=%(title)s",
@@ -3508,7 +3508,7 @@ private extension StreamPipeline {
         ytDlp: URL,
         timeoutSeconds: TimeInterval
     ) async -> (preview: StreamPreview?, message: String) {
-        var args = ["--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist"]
+        var args = ["--ignore-config", "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist"]
         args += [
             sourceURL
         ]

@@ -481,6 +481,10 @@ enum ExternalToolResolver {
             environment["CURL_CA_BUNDLE"] = certBundle.path
         }
 
+        // Keep the managed Python runtime isolated from user/system Python packages.
+        environment["PYTHONNOUSERSITE"] = "1"
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment.removeValue(forKey: "PYTHONHOME")
         environment["DENO_TLS_CA_STORE"] = "system"
         return environment
     }
