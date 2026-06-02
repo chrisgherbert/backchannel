@@ -14,6 +14,14 @@ LEGACY_CONFIG_FILE="$ROOT_DIR/.release.env"
 CONFIG_FILE="$DEFAULT_CONFIG_FILE"
 SKIP_BUILD=0
 
+ENV_APP_SHORT_VERSION="${APP_SHORT_VERSION:-}"
+ENV_APP_BUILD_VERSION="${APP_BUILD_VERSION:-}"
+ENV_APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-}"
+ENV_APP_EXECUTABLE_NAME="${APP_EXECUTABLE_NAME:-}"
+ENV_APP_BUNDLE_ID="${APP_BUNDLE_ID:-}"
+ENV_ZIP_NAME="${ZIP_NAME:-}"
+ENV_APP_PATH="${APP_PATH:-}"
+
 usage() {
   cat <<USAGE
 Usage: scripts/notarize_release.sh [--skip-build] [--config /path/to/release.env]
@@ -54,6 +62,28 @@ set -a
 # shellcheck disable=SC1090
 source "$CONFIG_FILE"
 set +a
+
+if [[ -n "$ENV_APP_SHORT_VERSION" ]]; then
+  APP_SHORT_VERSION="$ENV_APP_SHORT_VERSION"
+fi
+if [[ -n "$ENV_APP_BUILD_VERSION" ]]; then
+  APP_BUILD_VERSION="$ENV_APP_BUILD_VERSION"
+fi
+if [[ -n "$ENV_APP_DISPLAY_NAME" ]]; then
+  APP_DISPLAY_NAME="$ENV_APP_DISPLAY_NAME"
+fi
+if [[ -n "$ENV_APP_EXECUTABLE_NAME" ]]; then
+  APP_EXECUTABLE_NAME="$ENV_APP_EXECUTABLE_NAME"
+fi
+if [[ -n "$ENV_APP_BUNDLE_ID" ]]; then
+  APP_BUNDLE_ID="$ENV_APP_BUNDLE_ID"
+fi
+if [[ -n "$ENV_ZIP_NAME" ]]; then
+  ZIP_NAME="$ENV_ZIP_NAME"
+fi
+if [[ -n "$ENV_APP_PATH" ]]; then
+  APP_PATH="$ENV_APP_PATH"
+fi
 
 if [[ -z "${DEV_ID_APP:-}" && -n "${SIGNING_IDENTITY:-}" ]]; then
   DEV_ID_APP="$SIGNING_IDENTITY"

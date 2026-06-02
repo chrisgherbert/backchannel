@@ -7,6 +7,13 @@ YTDLP_ENTITLEMENTS="$ROOT_DIR/scripts/entitlements.ytdlp.plist"
 DENO_ENTITLEMENTS="$ROOT_DIR/scripts/entitlements.deno.plist"
 NOTARIZE="${NOTARIZE:-1}"
 
+ENV_APP_SHORT_VERSION="${APP_SHORT_VERSION:-}"
+ENV_APP_BUILD_VERSION="${APP_BUILD_VERSION:-}"
+ENV_APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-}"
+ENV_APP_EXECUTABLE_NAME="${APP_EXECUTABLE_NAME:-}"
+ENV_APP_BUNDLE_ID="${APP_BUNDLE_ID:-}"
+ENV_APP_PATH="${APP_PATH:-}"
+
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Error: release config not found: $CONFIG_FILE" >&2
   echo "Create it from: $ROOT_DIR/.release.env.example" >&2
@@ -16,6 +23,25 @@ fi
 set -a
 source "$CONFIG_FILE"
 set +a
+
+if [[ -n "$ENV_APP_SHORT_VERSION" ]]; then
+  APP_SHORT_VERSION="$ENV_APP_SHORT_VERSION"
+fi
+if [[ -n "$ENV_APP_BUILD_VERSION" ]]; then
+  APP_BUILD_VERSION="$ENV_APP_BUILD_VERSION"
+fi
+if [[ -n "$ENV_APP_DISPLAY_NAME" ]]; then
+  APP_DISPLAY_NAME="$ENV_APP_DISPLAY_NAME"
+fi
+if [[ -n "$ENV_APP_EXECUTABLE_NAME" ]]; then
+  APP_EXECUTABLE_NAME="$ENV_APP_EXECUTABLE_NAME"
+fi
+if [[ -n "$ENV_APP_BUNDLE_ID" ]]; then
+  APP_BUNDLE_ID="$ENV_APP_BUNDLE_ID"
+fi
+if [[ -n "$ENV_APP_PATH" ]]; then
+  APP_PATH="$ENV_APP_PATH"
+fi
 
 require_var() {
   local name="$1"
