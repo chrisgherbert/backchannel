@@ -18,12 +18,11 @@ CONFIG_FILE="$DEFAULT_CONFIG_FILE"
 
 VERSION=""
 BUILD_NUMBER=""
-SKIP_NOTARIZE=0
 NOTES_FILE=""
 
 usage() {
   cat <<USAGE
-Usage: scripts/github_release.sh --version X.Y.Z [--build-number N] [--skip-notarize] [--notes-file path]
+Usage: scripts/github_release.sh --version X.Y.Z [--build-number N] [--notes-file path]
 USAGE
 }
 
@@ -40,8 +39,8 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --skip-notarize)
-      SKIP_NOTARIZE=1
-      shift
+      echo "Error: app releases must be notarized. Resolve notarization before publishing." >&2
+      exit 2
       ;;
     --notes-file)
       [[ $# -ge 2 ]] || { echo "Error: --notes-file requires value" >&2; exit 2; }
@@ -78,15 +77,17 @@ APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-Back Channel}"
 SAFE_APP_NAME="${APP_DISPLAY_NAME// /-}"
 ZIP_NAME="${ZIP_NAME:-${SAFE_APP_NAME}.zip}"
 SOURCE_ZIP="$ROOT_DIR/dist/$ZIP_NAME"
+APP_PATH="$ROOT_DIR/dist/${APP_DISPLAY_NAME}.app"
 MANAGED_SUPPORT_DIR="$ROOT_DIR/dist/managed-support"
 TARGET_COMMIT="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
-if [[ "$SKIP_NOTARIZE" -eq 0 ]]; then
-  env \
-    APP_SHORT_VERSION="$VERSION" \
-    APP_BUILD_VERSION="${BUILD_NUMBER:-}" \
-    "$NOTARIZE_SCRIPT"
-fi
+env \
+  APP_SHORT_VERSION="$VERSION" \
+  APP_BUILD_VERSION="${BUILD_NUMBER:-}" \
+  "$NOTARIZE_SCRIPT"
+
+echo "==> Verifying notarized app acceptance"
+spctl --assess --type execute --verbose=4 "$APP_PATH"
 
 [[ -f "$SOURCE_ZIP" ]] || {
   echo "Error: source zip not found: $SOURCE_ZIP" >&2
