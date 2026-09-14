@@ -119,7 +119,22 @@ else
   fi
 fi
 
-gh release upload "$TAG" "${UPLOAD_ASSETS[@]}" --clobber
+# Publish the manifest only after all referenced payloads are available.
+# An interrupted upload must not advertise a package users cannot download.
+PAYLOAD_ASSETS=()
+MANIFEST_ASSETS=()
+for asset_path in "${UPLOAD_ASSETS[@]}"; do
+  case "$(basename "$asset_path")" in
+    backchannel-managed-support.json|backchannel-managed-support.json.sha256)
+      MANIFEST_ASSETS+=("$asset_path")
+      ;;
+    *)
+      PAYLOAD_ASSETS+=("$asset_path")
+      ;;
+  esac
+done
+gh release upload "$TAG" "${PAYLOAD_ASSETS[@]}" --clobber
+gh release upload "$TAG" "${MANIFEST_ASSETS[@]}" --clobber
 
 PUBLISHED_ASSETS=()
 while IFS= read -r published_asset; do

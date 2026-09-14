@@ -22,6 +22,16 @@ Back Channel is a macOS app for turning livestream URLs into RTMP or HLS outputs
 
 The marketing/documentation site deploys automatically through GitHub Actions when changes under `website/` are pushed to `main`.
 
+## Browser Cookies
+
+In Settings, find **Browser Cookies**, choose **Use Browser Cookies**, and select Chrome, Brave, Safari, Firefox, or Edge. Open the source site in that browser and sign in first. The setting applies to source information and streaming, including Streamlink RTMP output, the next time you start.
+
+Cookies are imported automatically using the browser profile selected by yt-dlp. Streamlink receives them in memory; no manual export or saved cookie file is needed. macOS may request Keychain access for Chromium browsers. Safari may require Full Disk Access under System Settings > Privacy & Security. If import fails, streaming stops with guidance instead of repeatedly retrying.
+
+Browser cookies do not guarantee that YouTube will lift an HTTP 429 block. Complete any browser challenge on the same connection and wait before retrying.
+
+When updating the managed Python runtime, run `scripts/tests/test_streamlink_browser_cookies.py` with that runtime's Python. It checks the real Streamlink CLI using synthetic cookies without reading browser data or making network requests.
+
 ## Release Checklist
 
 1. Ensure standalone `deno` exists for managed support payloads.

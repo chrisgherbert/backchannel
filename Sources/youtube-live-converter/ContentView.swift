@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var upcomingWatcherStatus = ""
     @State private var upcomingWatcherNextCheckAt: Date?
     @State private var showManagedSupportSetupSheet = false
+    @State private var showBrowserCookieSettings = false
     @AppStorage("show_inspector") private var showInspector = true
     @AppStorage("auto_start_when_live_enabled") private var autoStartWhenLiveEnabled = false
     @AppStorage(AppPreferenceKeys.managedSupportSetupDismissedVersion) private var managedSupportSetupDismissedVersion = ""
@@ -146,6 +147,9 @@ struct ContentView: View {
         }
         .onReceive(externalTools.$managedSupportAvailability) { _ in
             maybePresentManagedSupportSetup()
+        }
+        .sheet(isPresented: $showBrowserCookieSettings) {
+            BrowserCookieSettingsSheet()
         }
         .sheet(isPresented: $showManagedSupportSetupSheet) {
             ManagedSupportSetupSheet(
@@ -636,7 +640,7 @@ struct ContentView: View {
             .padding(.bottom, 4)
 
             if selectedPanel == .status {
-                statusPanel
+                ScrollView { statusPanel }
             } else {
                 advancedPanel
             }
@@ -647,6 +651,15 @@ struct ContentView: View {
     private var statusPanel: some View {
         VStack(alignment: .leading, spacing: 8) {
             streamHealthPanel
+            statusRow("Source tool", pipeline.sourceRecovery.sourceToolLabel)
+            SourceRecoveryPanel(recovery: pipeline.sourceRecovery,
+                openBrowser: {
+                    if let url = URL(string: config.sourceURL), ["https", "http"].contains(url.scheme?.lowercased() ?? "") {
+                        NSWorkspace.shared.open(url)
+                    }
+                },
+                openCookieSettings: { showBrowserCookieSettings = true },
+                retry: { startStream() })
             statusRow("Source", pipeline.parsedStatus.sourceState)
             statusRow("Output", pipeline.parsedStatus.outputState)
             statusRow("Reconnect", pipeline.parsedStatus.reconnectDelay.isEmpty ? "None" : pipeline.parsedStatus.reconnectDelay)
@@ -1106,6 +1119,9 @@ struct ContentView: View {
     }
 
     private var footerPrimaryStateText: String {
+        if pipeline.sourceRecovery.phase == .switching || pipeline.sourceRecovery.phase == .trying {
+            return "Recovering"
+        }
         let source = pipeline.parsedStatus.sourceState.lowercased()
         let output = pipeline.parsedStatus.outputState.lowercased()
         let status = pipeline.status.lowercased()

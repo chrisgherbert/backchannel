@@ -35,6 +35,7 @@ final class StreamPipeline: ObservableObject {
     private var logMonitoringEnabled = true
     private var cliLogMirroringEnabled = false
     private var forceSoftwareEncoderForSession = false
+    @Published private(set) var sourceRecovery = StreamSourceRecovery()
     private var freezeRestartTimestamps: [Date] = []
     private var bufferCountdownTask: Task<Void, Never>?
     private var previewRequestID = 0
@@ -114,6 +115,7 @@ final class StreamPipeline: ObservableObject {
             }
 
             self.forceSoftwareEncoderForSession = false
+            self.sourceRecovery = StreamSourceRecovery()
             self.freezeRestartTimestamps = []
             self.pendingReprimeAfterRestart = false
             self.startupReprimeActive = false
@@ -127,6 +129,7 @@ final class StreamPipeline: ObservableObject {
     }
 
     func stop() {
+        sourceRecovery.stopped()
         startRequestID += 1
         shouldKeepRunning = false
         generation += 1
@@ -482,11 +485,14 @@ final class StreamPipeline: ObservableObject {
         let usesStreamlinkRemux = usesStreamlinkSupervisorRemuxPipeline(for: config)
         let usesStreamlinkTranscode = usesStreamlinkSupervisorTranscodePipeline(for: config)
         let sourceProcess = Process()
-        let sourceLabel = usesStreamlinkSupervisor ? "streamlink" : "yt-dlp"
+        let usesStreamlinkSource = usesStreamlinkSupervisor && !sourceRecovery.usesYtDlp
+        let sourceLabel = usesStreamlinkSource ? "streamlink" : "yt-dlp"
+        let authentication = DownloadAuthenticationSettings.load()
+        sourceRecovery.launched(tool: sourceLabel, browser: authentication.mode == .browserCookies ? authentication.browserSource.title : nil)
         let sourceToolDescription: String
 
         let ffmpegToolsDir = paths.ffmpeg.deletingLastPathComponent().path
-        if usesStreamlinkSupervisor {
+        if usesStreamlinkSource {
             guard let streamlink = paths.streamlink else {
                 appendLog("[app] Streamlink is required for RTMP rebroadcast. Update managed support in Settings > Tools.")
                 parsedStatus.lastError = "Streamlink runtime missing"
@@ -496,13 +502,31 @@ final class StreamPipeline: ObservableObject {
                 return
             }
             sourceProcess.executableURL = streamlink.executableURL
-            sourceProcess.arguments = streamlink.arguments(appending: [
+            let streamArguments = [
                 "--stdout",
                 "--hls-live-restart",
                 "--stream-segment-threads", "3",
                 config.sourceURL,
                 "best"
-            ])
+            ]
+            if authentication.mode == .browserCookies && streamlink.argumentsPrefix != ["-m", "streamlink"] {
+                    stop()
+                    status = "Browser Cookies Unavailable"
+                    parsedStatus.lastError = "Update managed support in Settings > Tools to use browser cookies for streaming."
+                    appendLog("[app] \(parsedStatus.lastError)")
+                    return
+            }
+            if streamlink.argumentsPrefix == ["-m", "streamlink"] {
+                sourceProcess.arguments = StreamlinkBrowserCookies.arguments(
+                    browser: authentication.mode == .browserCookies ? authentication.browserSource : nil,
+                    streamArguments: streamArguments
+                )
+                if authentication.mode == .browserCookies {
+                    appendLog("[app] Using browser cookies from \(authentication.browserSource.title) for streaming.")
+                }
+            } else {
+                sourceProcess.arguments = streamlink.arguments(appending: streamArguments)
+            }
             sourceProcess.environment = paths.environment
             sourceToolDescription = streamlink.launchDescription
         } else {
@@ -520,6 +544,10 @@ final class StreamPipeline: ObservableObject {
             }
 
             var ytDlpArguments = ["--ignore-config", "--no-part", "--no-progress"]
+            if sourceRecovery.usesYtDlp {
+                ytDlpArguments += StreamSourceRecovery.ytDlpArguments
+                appendLog("[app] Using yt-dlp source fallback with the existing FFmpeg output stage.")
+            }
             if let deno = paths.deno {
                 ytDlpArguments += ["--js-runtimes", "deno:\(deno.path)"]
             }
@@ -647,24 +675,24 @@ final class StreamPipeline: ObservableObject {
                 isRunning = true
                 status = "Running"
                 parsedStatus.sourceState = "Streaming Source"
-                parsedStatus.outputState = usesStreamlinkSupervisor ? "Publishing" : "Running"
+                parsedStatus.outputState = sourceRecovery.usesYtDlp ? "Recovering" : "Connecting"
                 if usesStreamlinkRemux {
-                    appendLog("[app] Pipeline started (Streamlink supervisor remux active).")
+                    appendLog("[app] Pipeline started (\(sourceLabel) supervisor remux active).")
                 } else if usesStreamlinkTranscode {
-                    appendLog("[app] Pipeline started (Streamlink supervisor transcode active).")
+                    appendLog("[app] Pipeline started (\(sourceLabel) supervisor transcode active).")
                 } else {
                     appendLog("[app] Pipeline started.")
                 }
             }
 
-            appendLog("[app] Using \(usesStreamlinkSupervisor ? "streamlink" : "yt-dlp"): \(sourceToolDescription)")
+            appendLog("[app] Using \(sourceLabel): \(sourceToolDescription)")
             appendLog("[app] Using ffmpeg: \(paths.ffmpeg.path)")
             appendLog("[app] Using ffprobe: \(paths.ffprobe.path)")
             appendSessionConfigurationLog(config)
             if usesStreamlinkRemux {
-                appendLog("[app] RTMP rebroadcast: Streamlink supervision with FFmpeg remuxing (-c copy). A/V processing options are not applied on this path.")
+                appendLog("[app] RTMP rebroadcast: \(sourceLabel) supervision with FFmpeg remuxing (-c copy). A/V processing options are not applied on this path.")
             } else if usesStreamlinkTranscode {
-                appendLog("[app] RTMP rebroadcast: Streamlink supervision with a single FFmpeg resync/transcode stage.")
+                appendLog("[app] RTMP rebroadcast: \(sourceLabel) supervision with a single FFmpeg resync/transcode stage.")
             }
             if isCatchUpActive() {
                 let remaining = max(1, Int(catchUpExpiresAt.timeIntervalSinceNow.rounded()))
@@ -675,7 +703,7 @@ final class StreamPipeline: ObservableObject {
                 let modeLabel = "High compatibility"
                 appendLog("[app] \(modeLabel) video encoder: \(encoder)")
                 if usesStreamlinkTranscode {
-                    appendLog("[app] High compatibility publish path: Streamlink -> FFmpeg decode/resync/transcode -> publish.")
+                    appendLog("[app] High compatibility publish path: \(sourceLabel) -> FFmpeg decode/resync/transcode -> publish.")
                 } else {
                     appendLog("[app] High compatibility normalizer stage: enabled (normalize -> staged playlist -> publish).")
                 }
@@ -944,7 +972,7 @@ final class StreamPipeline: ObservableObject {
                             self.lastPublishStartedAt = Date()
                             self.highSpeedSince = Date.distantPast
                             self.publisherRestartScheduled = false
-                            self.parsedStatus.outputState = "Publishing"
+                            self.parsedStatus.outputState = "Connecting"
                             self.startupReprimeActive = false
                             self.appendLog("[app] Startup buffer filled. Publishing to destination.")
                             self.refreshStreamHealth(now: Date())
@@ -1032,6 +1060,11 @@ final class StreamPipeline: ObservableObject {
 
     private func handleTermination(generation: Int, source: String, status: Int32) {
         guard generation == self.generation else { return }
+        if restartScheduled, source == "ffmpeg" { return }
+        if source == "yt-dlp", sourceRecovery.phase == .trying, status != 0 {
+            failSourceRecovery(message: "yt-dlp exited before output started (status \(status)).")
+            return
+        }
         bufferCountdownTask?.cancel()
         bufferCountdownTask = nil
         Task { @MainActor in
@@ -1108,6 +1141,7 @@ final class StreamPipeline: ObservableObject {
         let reasonLabel = restartReasonLabel(reason)
 
         status = "Reconnecting (\(Int(delay))s)"
+        parsedStatus.outputState = sourceRecovery.usesYtDlp ? "Recovering" : "Connecting"
         parsedStatus.reconnectDelay = "\(Int(delay))s"
         appendLog("[app] Restarting pipeline in \(Int(delay))s (reason: \(reasonLabel)).")
 
@@ -1184,7 +1218,7 @@ final class StreamPipeline: ObservableObject {
                 self.ffmpegProcess = publisher
                 self.lastPublishStartedAt = Date()
                 self.highSpeedSince = Date.distantPast
-                self.parsedStatus.outputState = "Publishing"
+                self.parsedStatus.outputState = "Connecting"
                 self.appendLog("[app] Publisher restarted from staged playlist.")
                 self.refreshStreamHealth(now: Date())
             } catch {
@@ -1674,7 +1708,7 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func ingestLogChunk(_ chunk: String, source: String, key: String) {
+    func ingestLogChunk(_ chunk: String, source: String, key: String) {
         let existing = pendingLogChunkBySource[key] ?? ""
         let combined = existing + chunk
         let parts = combined.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
@@ -1691,6 +1725,7 @@ final class StreamPipeline: ObservableObject {
         for index in 0..<completeCount {
             let raw = String(parts[index]).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !raw.isEmpty else { continue }
+            if handleSourceStartupFailure(raw, source: source) { return }
             appendLog("[\(source)] \(normalizedLogPayload(raw))")
         }
     }
@@ -1703,7 +1738,59 @@ final class StreamPipeline: ObservableObject {
             return
         }
         pendingLogChunkBySource[key] = ""
+        if handleSourceStartupFailure(remainder, source: source) { return }
         appendLog("[\(source)] \(normalizedLogPayload(remainder))")
+    }
+
+    private func handleSourceStartupFailure(_ message: String, source: String) -> Bool {
+        guard source == "streamlink" || source == "yt-dlp" else { return false }
+        let lower = message.lowercased()
+        if sourceRecovery.observe(message: message, source: source, sourceURL: currentConfig?.sourceURL ?? "") {
+            parsedStatus.outputState = "Recovering"
+            appendLog("[app] Streamlink could not resolve this YouTube source. Switching to yt-dlp on the next restart, using the same browser cookie setting.")
+        }
+        if source == "yt-dlp", sourceRecovery.phase == .trying, lower.hasPrefix("error:") {
+            failSourceRecovery(message: normalizedLogPayload(message))
+            return true
+        }
+        if source == "streamlink", lower.hasPrefix("error: browser cookie import failed.") {
+            stop()
+            appendLog("[\(source)] \(normalizedLogPayload(message))")
+            status = "Browser Cookies Unavailable"
+            parsedStatus.sourceState = "Cookie Import Failed"
+            parsedStatus.reconnectDelay = "None"
+            parsedStatus.lastError = message
+            flushPendingUiLogs()
+            return true
+        }
+        guard lower.contains("429 client error") ||
+              lower.contains("http error 429") ||
+              lower.contains("429 too many requests") ||
+              lower.contains("429: too many requests") else { return false }
+
+        // Invalidate queued termination callbacks and reconnect tasks before they
+        // can replace the source error with FFmpeg's empty-input failure.
+        stop()
+        appendLog("[\(source)] \(normalizedLogPayload(message))")
+        let explanation = "Source rate-limited requests (HTTP 429). Automatic retries stopped. Wait before starting again; open the source URL in your browser to check access."
+        appendLog("[app] \(explanation)")
+        status = "Source Rate Limited (429)"
+        parsedStatus.sourceState = "Rate Limited (429)"
+        parsedStatus.reconnectDelay = "None"
+        parsedStatus.lastError = explanation
+        flushPendingUiLogs()
+        return true
+    }
+
+    private func failSourceRecovery(message: String) {
+        stop()
+        sourceRecovery.failed(message: message)
+        status = "Source Unavailable"
+        parsedStatus.sourceState = "Both Source Tools Failed"
+        parsedStatus.reconnectDelay = "None"
+        parsedStatus.lastError = message
+        appendLog("[app] Both source tools failed. Automatic retries stopped. \(message)")
+        refreshStreamHealth(now: Date())
     }
 
     private func resetPerLaunchState(config: StreamConfig) {
@@ -1814,6 +1901,9 @@ final class StreamPipeline: ObservableObject {
 
     private func shouldAlwaysSurfaceToolMessage(_ message: String) -> Bool {
         let lower = message.lowercased()
+        if message.hasPrefix("[streamlink] Browser cookies imported from ") {
+            return true
+        }
         if lower.contains("error:") || lower.contains(" error") || lower.contains("failed") {
             return true
         }
@@ -1957,12 +2047,22 @@ final class StreamPipeline: ObservableObject {
         }
     }
 
-    private func parseStatus(from message: String) {
+    func parseStatus(from message: String) {
         let source = eventSource(for: message)
         let isFrameStatsLine = message.contains("frame=") &&
             (message.contains("[ffmpeg]") || message.contains("[yt-dlp]"))
         let now = Date()
-        defer { refreshStreamHealth(now: now) }
+        var outputAdvanced = false
+        defer {
+            if outputAdvanced {
+                parsedStatus.outputState = "Publishing"
+                if sourceRecovery.phase == .trying {
+                    sourceRecovery.outputStarted()
+                    parsedStatus.lastError = "None"
+                }
+            }
+            refreshStreamHealth(now: now)
+        }
         updateDiagnosticSignals(from: message, now: now)
         if !isFrameStatsLine {
             updateSourceEvent(source: source, message: message, now: now, throttleFrameLines: false)
@@ -1983,6 +2083,7 @@ final class StreamPipeline: ObservableObject {
                     lastFfmpegProgressSeconds = progressSeconds
                     lastFfmpegProgressAt = now
                     hasSeenFfmpegProgress = true
+                    outputAdvanced = true
                     stallRecoveryTriggered = false
                     freezeRecoveryTriggered = false
                 }
@@ -2017,7 +2118,7 @@ final class StreamPipeline: ObservableObject {
             lastStatsParseUpdate = now
             if parsedStatus.bufferState.contains("Filling") || bufferExhausted {
                 parsedStatus.outputState = "Buffering"
-            } else {
+            } else if hasSeenFfmpegProgress {
                 parsedStatus.outputState = "Publishing"
             }
             parsedStatus.ffmpegTime = capture(regex: Self.ffmpegTimeRegex, in: message)
@@ -2144,6 +2245,7 @@ final class StreamPipeline: ObservableObject {
                     lastFfmpegProgressSeconds = progressSeconds
                     lastFfmpegProgressAt = now
                     hasSeenFfmpegProgress = true
+                    outputAdvanced = true
                     if outputFreezeActive {
                         outputFreezeActive = false
                         let freezeDuration = max(0, now.timeIntervalSince(outputFreezeStartedAt))
@@ -2455,7 +2557,7 @@ final class StreamPipeline: ObservableObject {
             return
         }
 
-        parsedStatus.outputState = "Publishing"
+        parsedStatus.outputState = hasSeenFfmpegProgress ? "Publishing" : "Connecting"
         if targetDelay <= 0 {
             parsedStatus.bufferState = "Live (no delay)"
             parsedStatus.bufferProgress = 1.0
@@ -2470,6 +2572,10 @@ final class StreamPipeline: ObservableObject {
     }
 
     private func refreshStreamHealth(now: Date) {
+        if sourceRecovery.phase == .failed {
+            parsedStatus.health = StreamHealthSnapshot(overall: .critical, summary: "Source Error")
+            return
+        }
         guard let config = currentConfig else {
             parsedStatus.health = StreamHealthSnapshot()
             return
@@ -2565,10 +2671,13 @@ final class StreamPipeline: ObservableObject {
             speedMetric = healthMetric("Speed", detail: "Awaiting speed", level: .warning)
         }
 
-        let overall = [bufferMetric.level, timelineMetric.level, videoMetric.level, speedMetric.level].max() ?? .neutral
+        var overall = [bufferMetric.level, timelineMetric.level, videoMetric.level, speedMetric.level].max() ?? .neutral
         let summary: String
         if !isRunning {
             summary = "Idle"
+        } else if !hasSeenFfmpegProgress && !isBuffering {
+            summary = sourceRecovery.usesYtDlp ? "Recovering" : "Connecting"
+            overall = sourceRecovery.usesYtDlp ? .warning : .neutral
         } else if bufferExhausted {
             summary = "Buffer Exhausted"
         } else if outputFreezeActive {

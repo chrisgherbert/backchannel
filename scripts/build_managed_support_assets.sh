@@ -128,6 +128,10 @@ ytdlp_version() {
   "$1" -m yt_dlp --version | head -n 1 | tr -d '[:space:]'
 }
 
+streamlink_version() {
+  "$1" -m streamlink --version | awk '{print $NF}' | tr -d '[:space:]'
+}
+
 deno_version() {
   "$1" --version | awk 'NR==1 {print $2}' | tr -d '[:space:]'
 }
@@ -171,6 +175,9 @@ prepare_python_runtime() {
     ${YTDLP_EXTRA_PACKAGES:-$DEFAULT_YTDLP_EXTRA_PACKAGES}
 
   "$python_bin" -m yt_dlp --version >/dev/null
+  "$python_bin" -m streamlink --version >/dev/null
+  "$python_bin" -m pip check
+  "$python_bin" "$ROOT_DIR/scripts/tests/test_streamlink_browser_cookies.py"
 }
 
 make_component_archive_from_directory() {
@@ -245,10 +252,12 @@ PYTHON_BIN="$PYTHON_RUNTIME_DIR/python/bin/python3"
 PYTHON_VERSION="$(python_runtime_version "$PYTHON_BIN")"
 PYTHON_VERSION_LABEL="Python ${PYTHON_VERSION}"
 YTDLP_VERSION="$(ytdlp_version "$PYTHON_BIN")"
+STREAMLINK_VERSION="$(streamlink_version "$PYTHON_BIN")"
+PYTHON_VERSION_LABEL="${PYTHON_VERSION_LABEL} / Streamlink ${STREAMLINK_VERSION}"
 DENO_VERSION="$(deno_version "$DENO_BINARY")"
 
-YTDLP_COMPONENT_VERSION="py${PYTHON_VERSION}+yt${YTDLP_VERSION}"
-YTDLP_ASSET_NAME="backchannel-managed-ytdlp-runtime-macos-arm64-py${PYTHON_VERSION}-yt${YTDLP_VERSION}.zip"
+YTDLP_COMPONENT_VERSION="py${PYTHON_VERSION}+yt${YTDLP_VERSION}+sl${STREAMLINK_VERSION}"
+YTDLP_ASSET_NAME="backchannel-managed-ytdlp-runtime-macos-arm64-py${PYTHON_VERSION}-yt${YTDLP_VERSION}-sl${STREAMLINK_VERSION}.zip"
 DENO_ASSET_NAME="backchannel-managed-deno-macos-arm64-v${DENO_VERSION}.zip"
 
 YTDLP_ZIP="$(make_component_archive_from_directory "yt-dlp" "$PYTHON_RUNTIME_DIR/python" "$YTDLP_ASSET_NAME" "$STAGE_DIR")"

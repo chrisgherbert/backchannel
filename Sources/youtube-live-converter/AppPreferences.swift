@@ -73,7 +73,8 @@ enum BrowserCookiesSource: String, CaseIterable, Identifiable {
 }
 
 enum DownloadAuthenticationCopy {
-    static let helpText = "Use yt-dlp’s browser cookie import to access an existing signed-in session when needed. Back Channel does not display or store cookie values."
+    static let helpText = "Use your browser’s existing session for streaming and source information. Sign in to the source site in the selected browser first. Cookies are imported automatically when starting; no manual export is needed. Back Channel does not display cookie values or keep an exported cookie file."
+    static let permissionHelpText = "macOS may ask for Keychain access for Chrome, Brave, or Edge. Safari may require Full Disk Access in System Settings > Privacy & Security. Changes apply the next time you start a stream."
 }
 
 struct DownloadAuthenticationSettings: Equatable {
